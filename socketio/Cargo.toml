@@ -1,0 +1,21 @@
+[package]
+name = "socketio"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dev-dependencies]
+actix-ws = "0.2.5"
+dashmap = "5.5.3"
+actix-web = "4.3.1"
+actix-http = "3.4.0"
+actix-service = "2.0.2"
+serde = { version = "1.0.183", features = ["derive"] } 
+engineio = { path = "../engineio" } 
+actix-server = "2.3.0"
+axum ="0.6.20"
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
