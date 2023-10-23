@@ -13,6 +13,7 @@ impl <T:Transport, S:Stream> AsyncEngineInner<T,S> {
 }
 
 
+// WHERE Stream items can be converted into TRANSPORT events
 impl <T:Transport, S:Stream<Item = U>, U:Into<T::Event>> Stream for AsyncEngineInner<T,S> 
 where T: std::marker::Unpin,
       S: std::marker::Unpin,

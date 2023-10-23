@@ -6,6 +6,9 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use serde_json::json;
 
+type PollChannelSenderMap = DashMap<Sid, mpsc::Sender<LongPollEvent>>;
+type PollChannelReceiverMap = DashMap<Sid, tokio::sync::Mutex<mpsc::Receiver<Payload>>>;
+
 #[cfg(feature = "actix")]
 impl From<actix_ws::Message> for WebsocketEvent {
     fn from(value: actix_ws::Message) -> Self {
@@ -43,6 +46,12 @@ struct SessionInfo {
     eio: u8,
     sid: Option<Sid> 
 }
+
+// THE EMITTER shouldn't care about transport 
+// at the USER LEVEL its just a byte array 
+
+// EMITTER takes ENGINE LEVEL events 
+// SO ITS TX SENDER<PAYLOAD>
 
 #[cfg(feature = "actix")]
 pub enum Emitter {
@@ -100,16 +109,15 @@ where F:  Fn(AsyncEngine, Emitter) -> (),
     return web::Bytes::from(res.to_string());
 }
 
-async fn create_sio_poll<F>(query: web::Query<SessionInfo>, state:std::sync::Arc<WorkerState>, handler:F)-> Either<HttpResponse,web::Bytes> 
+
+async fn create_sio_poll<F>(query: web::Query<SessionInfo>, readers: std::sync::Arc<PollChannelReceiverMap>, writers: std::sync::Arc<PollChannelSenderMap>, handler:F)-> Either<HttpResponse,web::Bytes> 
 where F:  Fn(AsyncEngine, Emitter) -> (),
 {
+    // THIS CHANNEL IS FOR CLIENT EVENTS, we buffer them and let engine stream consume 
     let engine = Engine::new_longpoll();
     let (tx, rx) = tokio::sync::mpsc::channel(10);
-    state.event_senders.insert(engine.session,tx);
 
-    let (etx, erx) = tokio::sync::mpsc::channel(10);
-    state.engine_output.insert(engine.session, erx.into());
-
+    writers.insert(engine.session, tx.clone());
     let config = SessionConfig::default();
     let res = json!({
       "sid": engine.session,
@@ -119,14 +127,20 @@ where F:  Fn(AsyncEngine, Emitter) -> (),
       "maxPayload": config.max_payload
     });
 
+    // THIS CHANNEL IS FOR SERVER EMITTED EVENTS, we BUFFRER THEM FOR NEXT POLL...
+    // IDEALLY WE SHOULD SEND THEM INTO ENGINE AS WELL ??
+    let (tx, out_rx) = tokio::sync::mpsc::channel(10);
+    readers.insert(engine.session, out_rx.into());
+    // WE DONT KEEP REF TO EMITTER, WE JUST NEED THE RECEIVER END 
+    let s = Emitter::POLL(tx.clone());
     let sio = AsyncEngine::POLL(AsyncEngineInner::new(engine, rx.into()));
-    let s = Emitter::POLL(etx.clone());
 
     handler(sio,s);
 
     return Either::Right(web::Bytes::from(res.to_string()))
 }
-    
+
+// LONG POLL POST 
 async fn post_sio(query: web::Query<SessionInfo>, state:std::sync::Arc<WorkerState>, body: web::Bytes) -> HttpResponse {
     match query.sid.as_ref().and_then(|sid| state.event_senders.get(sid)){
        None => HttpResponse::NotFound().finish(),
@@ -137,14 +151,19 @@ async fn post_sio(query: web::Query<SessionInfo>, state:std::sync::Arc<WorkerSta
     }
 }
 
-async fn get_sio(query: web::Query<SessionInfo>, state:std::sync::Arc<WorkerState>) -> impl Responder {
-    match state.engine_output.get_mut(&query.sid.unwrap()) {
+// LONG POLL GET 
+async fn get_sio(query: web::Query<SessionInfo>, rx:&PollChannelReceiverMap ) -> impl Responder {
+    match rx.get_mut(&query.sid.unwrap()) {
        Some(rx) => {
            match rx.try_lock() {
                Ok(mut rx) => {
                    match rx.recv().await {
+                       // the channel closes... so we close polls 
+                       // TODO: Delete LONG POLL 
                        None => Either::Left(HttpResponse::Ok().finish()),
                        //Some(out) => Either::Right(bytes)
+                       // Receive a message, send it back 
+                       // TODO: BATCH / BUFFER Messages before sending back ...
                        Some(out) => { 
                             match out { 
                                 Payload::Message(m) => Either::Right(web::Json(m)),
@@ -160,56 +179,80 @@ async fn get_sio(query: web::Query<SessionInfo>, state:std::sync::Arc<WorkerStat
    }
 }
 
-pub fn socket_io<F>(path:&str, callback: F) -> Resource
+// Actix Service for accepting LONG POLL reqs and WS ? 
+pub fn socket_io<F>(path:actix_web::Resource, callback: F) -> Resource
 where F: Fn(AsyncEngine, Emitter) -> () + Clone + 'static
 {
-    // Private state for service
     let state = std::sync::Arc::new(WorkerState::new());
-    let s1 = state.clone();
-    let s2 = state.clone();
-    let s3 = state.clone();
 
-    let c1 = callback.clone();
-    let c2 = callback.clone();
+    // TODO: RENAME PLEASE
 
-    web::resource(path)
-    .route(
-        web::route()
-        .guard(guard::Get())
-        .guard(guard::fn_guard(|ctx| {
-            ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
-        }))
-        .to(move |session: web::Query<SessionInfo>| { 
-            let s = s1.clone();
-            async move { get_sio(session, s.clone()).await }}
+
+    let path = {
+        let callback = callback.clone();
+        path.route(
+            web::route()
+            .guard(guard::Get())
+            .guard(guard::fn_guard(|ctx| {
+                ctx.head().headers().get("Upgrade").is_some_and(|v| v == "websocket")
+            }))
+            .to(move |req: HttpRequest, body: web::Payload| { 
+                let callback = callback.clone();
+                async move { create_sio_ws(req,body, callback).await }}
+            )
         )
-    )
-    .route(
-        web::route()
-        .guard(guard::Get())
-        .guard(guard::fn_guard(|ctx| {
-            ctx.head().headers().get("Upgrade").is_some_and(|v| v == "websocket")
-        }))
-        .to(move |req: HttpRequest, body: web::Payload| { 
-            let f = c1.clone();
-            async move { create_sio_ws(req,body, f).await }}
+    };
+
+
+    
+    // DashMap<Sid, mpsc::Sender<LongPollEvent>>
+    let poll_input: std::sync::Arc<PollChannelSenderMap> = DashMap::new().into();
+
+    // DashMap<Sid, tokio::sync::Mutex<mpsc::Receiver<Payload>>>;
+    let poll_output: std::sync::Arc<PollChannelReceiverMap> = DashMap::new().into();
+
+    // LONG POLL GET 
+    let path = { 
+        let channels = poll_output.clone();
+        path.route(
+            web::route()
+            .guard(guard::Get())
+            .guard(guard::fn_guard(|ctx| {
+                ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
+            }))
+            .to(move |session: web::Query<SessionInfo>| { 
+                let c = channels.clone();
+                async move { get_sio(session, &c).await }}
+            )
         )
-    )
-    .route(
-        web::route()
-        .guard(guard::Get())
-        .to(move |session: web::Query<SessionInfo>| { 
-            let s = s2.clone();
-            let f = c2.clone();
-            async move { create_sio_poll(session, s.clone(), f).await }}
+    };
+
+    let path = {
+        let poll_output = poll_output.clone();
+        let poll_input = poll_input.clone();
+        let callback = callback.clone();
+        path.route(
+            web::route()
+            .guard(guard::Get())
+            .to(move |session: web::Query<SessionInfo>| { 
+                let poll_input = poll_input.clone();
+                let poll_output = poll_output.clone();
+                let callback = callback.clone();
+                async move { create_sio_poll(session, poll_output, poll_input, callback).await }}
+            )
         )
-    )
-    .route(
-        web::route()
-        .guard(guard::Post())
-        .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
-            let s = s3.clone();
-            async move { post_sio(session, s.clone(), body).await }}
+    };
+
+    let path = { 
+        let state = state.clone();
+        path.route(
+            web::route()
+            .guard(guard::Post())
+            .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
+                let s = state.clone();
+                async move { post_sio(session, s.clone(), body).await }}
+            )
         )
-    )
+    };
+    return path
 }

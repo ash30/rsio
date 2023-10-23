@@ -18,7 +18,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(|| 
            App::new()
            .wrap(Logger::default())
-           .service(socket_io("sio", on_connection))
+           .service(socket_io(actix_web::Resource::new("/sio"), on_connection))
         )
         .workers(1)
         .bind(("127.0.0.1", 8080))?
