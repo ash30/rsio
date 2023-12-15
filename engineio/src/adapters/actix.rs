@@ -110,7 +110,7 @@ where F:  Fn(AsyncEngine, Emitter) -> (),
 }
 
 
-async fn create_sio_poll<F>(query: web::Query<SessionInfo>, readers: std::sync::Arc<PollChannelReceiverMap>, writers: std::sync::Arc<PollChannelSenderMap>, handler:F)-> Either<HttpResponse,web::Bytes> 
+async fn create_sio_poll<F>(query: web::Query<SessionInfo>, readers: &PollChannelReceiverMap, writers: &PollChannelSenderMap, handler:F)-> Either<HttpResponse,web::Bytes> 
 where F:  Fn(AsyncEngine, Emitter) -> (),
 {
     // THIS CHANNEL IS FOR CLIENT EVENTS, we buffer them and let engine stream consume 
@@ -141,8 +141,8 @@ where F:  Fn(AsyncEngine, Emitter) -> (),
 }
 
 // LONG POLL POST 
-async fn post_sio(query: web::Query<SessionInfo>, state:std::sync::Arc<WorkerState>, body: web::Bytes) -> HttpResponse {
-    match query.sid.as_ref().and_then(|sid| state.event_senders.get(sid)){
+async fn post_sio(query: web::Query<SessionInfo>, map:&PollChannelSenderMap, body: web::Bytes) -> HttpResponse {
+    match query.sid.as_ref().and_then(|sid| map.get(sid)){
        None => HttpResponse::NotFound().finish(),
        Some(tx) => {
             tx.send(LongPollEvent::POST(body.into())).await;
@@ -183,10 +183,6 @@ async fn get_sio(query: web::Query<SessionInfo>, rx:&PollChannelReceiverMap ) ->
 pub fn socket_io<F>(path:actix_web::Resource, callback: F) -> Resource
 where F: Fn(AsyncEngine, Emitter) -> () + Clone + 'static
 {
-    let state = std::sync::Arc::new(WorkerState::new());
-
-    // TODO: RENAME PLEASE
-
 
     let path = {
         let callback = callback.clone();
@@ -204,7 +200,6 @@ where F: Fn(AsyncEngine, Emitter) -> () + Clone + 'static
     };
 
 
-    
     // DashMap<Sid, mpsc::Sender<LongPollEvent>>
     let poll_input: std::sync::Arc<PollChannelSenderMap> = DashMap::new().into();
 
@@ -213,7 +208,7 @@ where F: Fn(AsyncEngine, Emitter) -> () + Clone + 'static
 
     // LONG POLL GET 
     let path = { 
-        let channels = poll_output.clone();
+        let poll_output = poll_output.clone();
         path.route(
             web::route()
             .guard(guard::Get())
@@ -221,8 +216,8 @@ where F: Fn(AsyncEngine, Emitter) -> () + Clone + 'static
                 ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
             }))
             .to(move |session: web::Query<SessionInfo>| { 
-                let c = channels.clone();
-                async move { get_sio(session, &c).await }}
+                let poll_output = poll_output.clone();
+                async move { get_sio(session, &poll_output).await }}
             )
         )
     };
@@ -238,19 +233,19 @@ where F: Fn(AsyncEngine, Emitter) -> () + Clone + 'static
                 let poll_input = poll_input.clone();
                 let poll_output = poll_output.clone();
                 let callback = callback.clone();
-                async move { create_sio_poll(session, poll_output, poll_input, callback).await }}
+                async move { create_sio_poll(session, &poll_output, &poll_input, callback).await }}
             )
         )
     };
 
     let path = { 
-        let state = state.clone();
+        let poll_input = poll_input.clone();
         path.route(
             web::route()
             .guard(guard::Post())
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
-                let s = state.clone();
-                async move { post_sio(session, s.clone(), body).await }}
+                let poll_input = poll_input.clone();
+                async move { post_sio(session, &poll_input, body).await }}
             )
         )
     };
