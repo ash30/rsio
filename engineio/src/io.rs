@@ -1,5 +1,14 @@
 use futures_util::Stream;
+use std::fmt;
+
 use crate::engine::*;
+
+
+pub trait NewConnectionService {
+    // TODO: WHY does it need to be static ??
+    fn new_connection<S:Stream + 'static >(&self, stream:S);
+}
+
 
 pub struct AsyncEngineInner<T:Transport, S:Stream>  {
     rx:S,
@@ -43,4 +52,80 @@ where T: std::marker::Unpin,
         return res
     }
 }
+
+// ==============================
+
+use dashmap::DashMap;
+use tokio::sync::mpsc;
+use tokio::time::Duration;
+
+
+use crate::*;
+
+#[derive(Debug)]
+pub enum SessionError {
+    UnknownSession,
+    SessionClosed,
+    MultipleInflightPollRequest,
+    SessionUnresponsive,
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+pub type Result<T> = std::result::Result<T,SessionError>;
+
+// ================
+
+pub async fn poll_session(
+    sid:Option<uuid::Uuid>,
+    sessions:&DashMap<Sid, tokio::sync::Mutex<mpsc::Receiver<Payload>>>) -> Result<proto::Payload>{
+    
+    let sid = sid.ok_or(SessionError::UnknownSession)?;
+    let session = sessions.get_mut(&sid).ok_or(SessionError::UnknownSession)?;
+
+    // We have to assign guard here OTHERWISE, as a temp, it will be released AFTER session
+    // which it relies on. By binding it, we force its scope to be non temp
+    //
+    // https://stackoverflow.com/questions/53586321/why-do-i-get-does-not-live-long-enough-in-a-return-value
+    //
+    // https://stackoverflow.com/questions/65972165/why-is-the-temporary-is-part-of-an-expression-at-the-end-of-a-block-an-error
+    //
+    let x = if let Ok(mut rx) = session.try_lock() {
+        let events = rx.recv().await.ok_or(SessionError::SessionClosed)?;
+        return Ok(events)
+    }
+    else {
+        Err(SessionError::MultipleInflightPollRequest)
+    }; x
+}
+
+pub async fn post_session(
+    sid: Option<uuid::Uuid>,
+    body: Vec<u8>,
+    sessions:&DashMap<Sid, mpsc::Sender<LongPollEvent>>) -> Result<()> {
+
+    let sid = sid.ok_or(SessionError::UnknownSession)?;
+    let session = sessions.get(&sid).ok_or(SessionError::UnknownSession)?;
+
+    let res = session.send_timeout(LongPollEvent::POST(body), Duration::from_millis(1000) ).await;
+    // TODO: Look into Send Errors
+    return res.map_err(|e| match e {
+        mpsc::error::SendTimeoutError::Closed(..) => SessionError::SessionClosed,
+        mpsc::error::SendTimeoutError::Timeout(..) => SessionError::SessionUnresponsive
+    })
+}
+
+
+pub fn create_session() -> (Sid, AsyncEngineInner<LongPoll, impl Stream<Item = LongPollEvent>>, mpsc::Sender<LongPollEvent>) {
+    let eng = Engine::new_longpoll();
+    let sid = eng.session;
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let sio = AsyncEngineInner::new(eng, tokio_stream::wrappers::ReceiverStream::new(rx)); 
+    return (sid, sio, tx)
+}
+
 
