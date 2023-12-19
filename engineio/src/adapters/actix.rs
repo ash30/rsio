@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use actix_web::{guard, web, HttpRequest,  HttpResponse, Either, Responder, Resource};
+use actix_web::{guard, web, HttpResponse, Resource};
 use crate::*;
-use futures_util::Stream;
 use dashmap::DashMap;
 
 use tokio::sync::mpsc;
@@ -11,11 +10,9 @@ use serde_json::json;
 type PollChannelSenderMap = DashMap<Sid, mpsc::Sender<LongPollEvent>>;
 type PollChannelReceiverMap = DashMap<Sid, tokio::sync::Mutex<mpsc::Receiver<Payload>>>;
 
-
 pub use crate::io::AsyncEngineInner;
 pub use crate::io::NewConnectionService;
 
-#[cfg(feature = "actix")]
 impl From<actix_ws::Message> for WebsocketEvent {
     fn from(value: actix_ws::Message) -> Self {
         Self::Ping
@@ -29,34 +26,12 @@ impl From<actix_ws::Message> for WebsocketEvent {
 //    }
 //}
 
-
-#[cfg(feature = "actix")]
-struct WorkerState { 
-    event_senders: DashMap<Sid, mpsc::Sender<LongPollEvent>>,
-    engine_output: DashMap<Sid, tokio::sync::Mutex<mpsc::Receiver<Payload>>>,
-}
-
-#[cfg(feature = "actix")]
-impl WorkerState {
-    pub fn new() -> Self {
-        return Self { event_senders:DashMap::new(), engine_output:DashMap::new() } 
-    }
-}
-
-#[cfg(feature = "actix")]
 #[derive(serde::Deserialize)]
 struct SessionInfo {
     eio: u8,
     sid: Option<Sid> 
 }
 
-// THE EMITTER shouldn't care about transport 
-// at the USER LEVEL its just a byte array 
-
-// EMITTER takes ENGINE LEVEL events 
-// SO ITS TX SENDER<PAYLOAD>
-
-#[cfg(feature = "actix")]
 impl actix_web::ResponseError for SessionError{
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
@@ -70,15 +45,11 @@ impl actix_web::ResponseError for SessionError{
 
 }
 
-
-
-#[cfg(feature = "actix")]
 pub enum Emitter {
     WS(actix_ws::Session) ,
     POLL(mpsc::Sender<Payload>)
 }
 
-#[cfg(feature = "actix")]
 impl Emitter {
     pub async fn emit(&mut self, msg:Vec<u8>) {
         match self {
@@ -112,8 +83,6 @@ impl Emitter {
 
 // Actix Service for accepting LONG POLL reqs and WS ? 
 pub fn socket_io<F>(path:actix_web::Resource, callback: F) -> Resource
-//where F: Fn(impl Stream) -> () + Clone + 'static,
-//      S: Stream<Item = Vec<u8>>
 where F: NewConnectionService + 'static
 {
 
@@ -166,14 +135,12 @@ where F: NewConnectionService + 'static
     let path = {
         let longpoll_readers = longpoll_readers.clone();
         let longpoll_senders = longpoll_senders.clone();
-        //let callback = callback.clone();
         path.route(
             web::route()
             .guard(guard::Get())
             .to(move |session: web::Query<SessionInfo>| { 
                 let longpoll_senders = longpoll_senders.clone();
                 let longpoll_readers = longpoll_readers.clone();
-               // let callback = callback.clone();
                 let client = client.clone();
 
                 let (sid,engine,tx) = create_session();
