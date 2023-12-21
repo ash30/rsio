@@ -1,102 +1,78 @@
 use std::{collections::VecDeque, u8};
 pub use crate::proto::*;
 
-pub type Sid = uuid::Uuid;
-pub enum Error {}
-
-pub enum Output {
-    Send(Payload),
-    Receive(Payload),
-    TransportChange(TransportState),
-    Pending
+pub enum Participant <T> {
+    Client(T),
+    Server(T)
 }
 
-pub struct Engine<T>  { 
+impl <T> From<Participant<T>> for Participant<Payload> 
+where T:Into<Payload> + TransportEvent
+{
+    fn from(value: Participant<T>) -> Self {
+        match value {
+            Participant::Client(v) => Participant::Client(v.into()),
+            Participant::Server(v) => Participant::Server(v.into())
+
+        }
+    }
+}
+
+pub struct Engine  { 
     pub session:Sid,
-    transport:T,
-    output:VecDeque<Output>
+    output:VecDeque<Participant<Payload>>
 }
 
-impl Engine<LongPoll> {
-    pub fn new_longpoll() -> Self {
-        return Self { 
-            session:uuid::Uuid::new_v4(), 
-            transport:LongPoll {},
-            output:VecDeque::new() 
-        } 
-    }
-}
-impl Engine<Websocket> {
-    pub fn new_ws() -> Self {
-        return Self { 
-            session:uuid::Uuid::new_v4(),
-            transport:Websocket {},
-            output:VecDeque::new()  
-        } 
-    }
-}
-
-impl <T:Transport> Engine<T>  
+impl Engine  
 { 
-    pub fn poll_output(&mut self) -> Output { 
-        self.output.pop_front().unwrap_or(Output::Pending)
+    pub fn new() -> Self {
+        return Self { 
+            session: uuid::Uuid::new_v4(),
+            output: VecDeque::new()
+        }
     }
 
-    pub fn consume_transport_event(&mut self, e:T::Event){ 
-        self.transport.consume(e, &mut self.output)
-    }
-}
-
-
-pub trait Transport {
-    type Event;
-
-    fn upgrades() -> Option<EngineKind> { 
-       None
+    pub fn poll_output(&mut self) -> Option<Participant<Payload>> { 
+        self.output.pop_front()
     }
 
-    fn consume(&mut self, event:Self::Event, buf: &mut VecDeque<Output>) {
+    pub fn consume_transport_event<T:TransportEvent>(&mut self, event:Participant<T>){ 
+        // TODO: Implement state checking
+        let payload = event.into();
+        self.output.push_front(payload)
     }
 }
 
-pub struct LongPoll {} 
+// Marker Trait 
+pub trait TransportEvent: Into<Payload> {}
+impl TransportEvent for LongPollEvent {}
+impl TransportEvent for WebsocketEvent {}
 
 pub enum LongPollEvent {
     GET, 
     POST(Vec<u8>)
 }
 
-impl Transport for LongPoll { 
-    type Event = LongPollEvent;
-
-    fn upgrades() -> Option<EngineKind> {
-        Some(EngineKind::WS)
-    }
-
-    fn consume(&mut self, event:Self::Event, buf: &mut VecDeque<Output>) {
-        match event {
-            LongPollEvent::GET => {},
-            LongPollEvent::POST(msg) => {
-                buf.push_back(Output::Receive(Payload::Message(msg)))
-            }
+impl From<LongPollEvent> for Payload {
+    fn from(value: LongPollEvent) -> Self {
+        match value {
+            LongPollEvent::POST(p) => Payload::Message(p),
+            LongPollEvent::GET => Payload::Ping,
         }
     }
 }
 
-pub struct Websocket {
-}
 pub enum WebsocketEvent {
     Ping,
     Pong
 }
 
-impl Transport for Websocket { 
-    type Event = WebsocketEvent;
-
-    fn consume(&mut self, event:Self::Event, buf: &mut VecDeque<Output>) {
-        
+impl From<WebsocketEvent> for Payload {
+    fn from(value: WebsocketEvent) -> Self {
+        match value {
+            WebsocketEvent::Ping => Payload::Ping,
+            WebsocketEvent::Pong => Payload::Pong
+        }
     }
-    
-        
 }
 

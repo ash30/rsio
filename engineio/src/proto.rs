@@ -1,3 +1,6 @@
+pub type Sid = uuid::Uuid;
+
+
 pub enum EngineKind {
     WS,
     LongPoll

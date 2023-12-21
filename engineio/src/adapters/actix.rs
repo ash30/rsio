@@ -1,17 +1,12 @@
 use std::sync::Arc;
 
-use actix_web::{guard, web, HttpResponse, Resource};
+use actix_web::{guard, web, HttpResponse, Resource, Route};
+use tokio_stream::StreamExt;
 use crate::*;
 use dashmap::DashMap;
-
-use tokio::sync::mpsc;
 use serde_json::json;
 
-type PollChannelSenderMap = DashMap<Sid, mpsc::Sender<LongPollEvent>>;
-type PollChannelReceiverMap = DashMap<Sid, tokio::sync::Mutex<mpsc::Receiver<Payload>>>;
-
-pub use crate::io::AsyncEngineInner;
-pub use crate::io::NewConnectionService;
+use super::common::{LongPollRouter, SessionError, NewConnectionService};
 
 impl From<actix_ws::Message> for WebsocketEvent {
     fn from(value: actix_ws::Message) -> Self {
@@ -45,20 +40,6 @@ impl actix_web::ResponseError for SessionError{
 
 }
 
-pub enum Emitter {
-    WS(actix_ws::Session) ,
-    POLL(mpsc::Sender<Payload>)
-}
-
-impl Emitter {
-    pub async fn emit(&mut self, msg:Vec<u8>) {
-        match self {
-            Self::POLL(rx) => rx.send(Payload::Message(msg)).await.unwrap(),
-            Self::WS(session) => session.text("").await.unwrap()
-        }
-    }
-}
-
 //async fn create_sio_ws<F>(req: HttpRequest, body: web::Payload, handler:F)-> impl Responder 
 //where F:  Fn(AsyncEngine, Emitter) -> (),
 //{
@@ -85,34 +66,57 @@ impl Emitter {
 pub fn socket_io<F>(path:actix_web::Resource, callback: F) -> Resource
 where F: NewConnectionService + 'static
 {
-
-    //let path = {
-    //    let callback = callback.clone();
-    //    path.route(
-    //        web::route()
-    //        .guard(guard::Get())
-    //        .guard(guard::fn_guard(|ctx| {
-    //            ctx.head().headers().get("Upgrade").is_some_and(|v| v == "websocket")
-    //        }))
-    //        .to(move |req: HttpRequest, body: web::Payload| { 
-    //            let callback = callback.clone();
-    //            async move { create_sio_ws(req,body, callback).await }}
-    //        )
-    //    )
-    //};
-
-
-    // DashMap<Sid, mpsc::Sender<LongPollEvent>>
-    let longpoll_senders: std::sync::Arc<PollChannelSenderMap> = DashMap::new().into();
-
-    // DashMap<Sid, tokio::sync::Mutex<mpsc::Receiver<Payload>>>;
-    let longpoll_readers: std::sync::Arc<PollChannelReceiverMap> = DashMap::new().into();
-
     let client = Arc::new(callback);
+
+    // WS 
+    let path = {
+        path.route(
+            web::route()
+            .guard(guard::Get())
+            .guard(guard::fn_guard(|ctx| {
+                ctx.head().headers().get("Upgrade").is_some_and(|v| v == "websocket")
+            }))
+            .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
+                let client = client.clone();
+                let (response, session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
+                tokio::spawn(async move {
+                while let Some(Ok(msg)) = msg_stream.next().await {
+                }
+
+                });
+
+                let (client_tx, client_rx) = tokio::sync::mpsc::channel(10);
+                let (server_tx, server_rx) = tokio::sync::mpsc::channel(10);
+
+                // NOTIFY CONSUMER
+               // <F as NewConnectionService>::new_connection(
+               //     &client,
+               //     client_event_stream.filter_map(
+               //         |p| if let Payload::Message(data) = p { Some(data) } else { None } 
+               //     ),
+               //     |data| { server_tx.send(LongPollEvent::POST(data)); }
+               // );
+
+                let config = SessionConfig::default();
+                async move { 
+                    let res = json!({
+                      "sid": sid,
+                      "upgrades": ["websocket"],
+                      "pingInterval": config.ping_interval,
+                      "pingTimeout": config.ping_timeout,
+                      "maxPayload": config.max_payload
+                    });
+                    web::Bytes::from(res.to_string()) 
+                }
+            }
+            )
+        )
+    };
+    let longpoll = Arc::new(LongPollRouter::new());
 
     // LONG POLL GET 
     let path = { 
-        let longpoll_readers = longpoll_readers.clone();
+        let router = longpoll.clone();
         path.route(
             web::route()
             .guard(guard::Get())
@@ -120,9 +124,9 @@ where F: NewConnectionService + 'static
                 ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
             }))
             .to(move |session: web::Query<SessionInfo>| { 
-                let longpoll_readers = longpoll_readers.clone();
+                let router = router.clone();
                 async move {
-                    let res = poll_session(session.sid, &longpoll_readers).await?;
+                    let res = router.poll_session(session.sid).await?;
                     match res {
                         Payload::Message(m) => Ok::<web::Json<Vec<u8>>, SessionError>(web::Json(m)),
                         _ => Ok(web::Json(vec![]))
@@ -133,21 +137,33 @@ where F: NewConnectionService + 'static
     };
 
     let path = {
-        let longpoll_readers = longpoll_readers.clone();
-        let longpoll_senders = longpoll_senders.clone();
+        let router = longpoll.clone();
         path.route(
             web::route()
             .guard(guard::Get())
             .to(move |session: web::Query<SessionInfo>| { 
-                let longpoll_senders = longpoll_senders.clone();
-                let longpoll_readers = longpoll_readers.clone();
+                let router = router.clone();
                 let client = client.clone();
 
-                let (sid,engine,tx) = create_session();
-                let config = SessionConfig::default();
-                longpoll_senders.insert(sid, tx);
+                let (client_tx, client_rx) = tokio::sync::mpsc::channel(10);
+                let (server_tx, server_rx) = tokio::sync::mpsc::channel(10);
+                let (sid, client_event_stream, server_event_rx) = create_poll_session(
+                    tokio_stream::wrappers::ReceiverStream::new(client_rx),
+                    tokio_stream::wrappers::ReceiverStream::new(server_rx)
+                );        
+                router.writers.insert(sid, client_tx);
+                router.readers.insert(sid, server_event_rx.into());
 
-                <F as NewConnectionService>::new_connection(&client, engine);
+                // NOTIFY CONSUMER
+                <F as NewConnectionService>::new_connection(
+                    &client,
+                    client_event_stream.filter_map(
+                        |p| if let Payload::Message(data) = p { Some(data) } else { None } 
+                    ),
+                    |data| { server_tx.send(LongPollEvent::POST(data)); }
+                );
+
+                let config = SessionConfig::default();
                 async move { 
                     let res = json!({
                       "sid": sid,
@@ -164,14 +180,14 @@ where F: NewConnectionService + 'static
     };
 
     let path = { 
-        let longpoll_senders = longpoll_senders.clone();
+        let router = longpoll.clone();
         path.route(
             web::route()
             .guard(guard::Post())
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
-                let longpoll_senders = longpoll_senders.clone();
+                let router = router.clone();
                 async move { 
-                    post_session(session.sid, body.into(), &longpoll_senders).await?;
+                    router.post_session(session.sid, body.into()).await?;
                     Ok::<HttpResponse, SessionError>(HttpResponse::Ok().finish())
                 }
             }
@@ -180,3 +196,4 @@ where F: NewConnectionService + 'static
     };
     return path
 }
+
