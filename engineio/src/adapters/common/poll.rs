@@ -19,7 +19,7 @@ impl LongPollRouter {
         }
     }
 
-    pub async fn poll_session(&self, sid:Option<uuid::Uuid>) -> Result<Payload> {
+    pub async fn poll(&self, sid:Option<uuid::Uuid>) -> Result<Payload> {
         let sid = sid.ok_or(TransportError::UnknownSession)?;
         let session = self.readers.get(&sid).ok_or(TransportError::UnknownSession)?;
 
@@ -39,8 +39,7 @@ impl LongPollRouter {
         }; x
     }
 
-    pub async fn post_session(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<()> {
-
+    pub async fn post(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<()> {
         let sid = sid.ok_or(TransportError::UnknownSession)?;
         let session = self.writers.get(&sid).ok_or(TransportError::UnknownSession)?;
 

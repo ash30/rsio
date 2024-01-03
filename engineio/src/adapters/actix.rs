@@ -171,7 +171,7 @@ where F: NewConnectionService + 'static
             .to(move |session: web::Query<SessionInfo>| { 
                 let router = router.clone();
                 async move {
-                    let res = router.poll_session(session.sid).await?;
+                    let res = router.poll(session.sid).await?;
                     match res {
                         Payload::Message(m) => Ok::<web::Json<Vec<u8>>, TransportError>(web::Json(m)),
                         _ => Ok(web::Json(vec![]))
@@ -229,7 +229,7 @@ where F: NewConnectionService + 'static
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
                 let router = router.clone();
                 async move { 
-                    router.post_session(session.sid, body.into()).await?;
+                    router.post(session.sid, body.into()).await?;
                     Ok::<HttpResponse, TransportError>(HttpResponse::Ok().finish())
                 }
             }
