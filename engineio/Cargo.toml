@@ -20,6 +20,7 @@ tokio-stream = { version = "0.1.14", optional = true }
 # Actix Integration 
 actix-web = { version = "4.4.0", optional = true }
 actix-ws = { version = "0.2.5", optional = true }
+actix-rt = { optional = true }
 
 [dev-dependencies]
 # Examples Shared 
@@ -32,7 +33,7 @@ actix-rt = "2.9.0"
 [features]
 default = ["actix"]
 async = ["dep:tokio", "dep:tokio-stream", "dep:futures-util"]
-actix = ["dep:actix-ws", "dep:actix-web", "async"]
+actix = ["dep:actix-ws", "dep:actix-web", "dep:actix-rt", "async"]
 
 [[example]]
 name = "actix"

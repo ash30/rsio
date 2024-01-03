@@ -1,40 +1,14 @@
-
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
-use futures_util::Stream;
-use std::fmt;
-use crate::*;
-
-pub trait NewConnectionService {
-    fn new_connection<S:Stream<Item=Vec<u8>> + 'static, F:Fn(Vec<u8>)>(&self, stream:S, emit:F);
-}
-
-// ================
-
-#[derive(Debug)]
-pub enum SessionError {
-    UnknownSession,
-    SessionClosed,
-    MultipleInflightPollRequest,
-    SessionUnresponsive,
-}
-
-impl fmt::Display for SessionError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-pub type Result<T> = std::result::Result<T,SessionError>;
-
-// ================
+use crate::engine::{Sid, Payload, LongPollEvent};
+use super::session::{Result, SessionError};
 
 pub struct LongPollRouter {
     pub readers:DashMap<Sid, Mutex<mpsc::Receiver<Payload>>>,
-    pub writers:DashMap<Sid, mpsc::Sender<LongPollEvent>>
+    pub writers:DashMap<Sid, mpsc::Sender<Payload>>
 }
 
 impl LongPollRouter {
@@ -45,7 +19,7 @@ impl LongPollRouter {
         }
     }
 
-    pub async fn poll_session(&self, sid:Option<uuid::Uuid>) -> Result<proto::Payload> {
+    pub async fn poll_session(&self, sid:Option<uuid::Uuid>) -> Result<Payload> {
         let sid = sid.ok_or(SessionError::UnknownSession)?;
         let session = self.readers.get(&sid).ok_or(SessionError::UnknownSession)?;
 
@@ -70,7 +44,9 @@ impl LongPollRouter {
         let sid = sid.ok_or(SessionError::UnknownSession)?;
         let session = self.writers.get(&sid).ok_or(SessionError::UnknownSession)?;
 
-        let res = session.send_timeout(LongPollEvent::POST(body), Duration::from_millis(1000) ).await;
+        let res = session
+            .send_timeout(LongPollEvent::POST(body).into(), Duration::from_millis(1000) ).await;
+
         return res.map_err(|e| match e {
             mpsc::error::SendTimeoutError::Closed(..) => SessionError::SessionClosed,
             mpsc::error::SendTimeoutError::Timeout(..) => SessionError::SessionUnresponsive

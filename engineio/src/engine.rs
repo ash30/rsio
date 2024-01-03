@@ -6,6 +6,16 @@ pub enum Participant <T> {
     Server(T)
 }
 
+impl<T> Participant<T> {
+
+    fn value(&self) -> &T {
+        match self {
+            Participant::Client(t) => t,
+            Participant::Server(t) => t
+        }
+    }
+}
+
 impl <T> From<Participant<T>> for Participant<Payload> 
 where T:Into<Payload> + TransportEvent
 {
@@ -36,7 +46,7 @@ impl Engine
         self.output.pop_front()
     }
 
-    pub fn consume_transport_event<T:TransportEvent>(&mut self, event:Participant<T>){ 
+    pub fn consume_transport_event(&mut self, event:Participant<Payload>){ 
         // TODO: Implement state checking
         let payload = event.into();
         self.output.push_front(payload)

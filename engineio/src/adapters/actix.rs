@@ -1,12 +1,15 @@
 use std::sync::Arc;
-
-use actix_web::{guard, web, HttpResponse, Resource, Route};
 use tokio_stream::StreamExt;
-use crate::*;
-use dashmap::DashMap;
 use serde_json::json;
+use actix_web::{guard, web, HttpResponse, Resource};
+use actix_ws::Message;
 
-use super::common::{LongPollRouter, SessionError, NewConnectionService};
+use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload };
+use crate::io::create_session;
+use super::common::{ LongPollRouter, SessionError };
+
+pub use super::common::NewConnectionService;
+pub use super::common::Emitter;
 
 impl From<actix_ws::Message> for WebsocketEvent {
     fn from(value: actix_ws::Message) -> Self {
@@ -70,6 +73,7 @@ where F: NewConnectionService + 'static
 
     // WS 
     let path = {
+        let client = client.clone();
         path.route(
             web::route()
             .guard(guard::Get())
@@ -79,23 +83,66 @@ where F: NewConnectionService + 'static
             .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
                 let client = client.clone();
                 let (response, session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
-                tokio::spawn(async move {
-                while let Some(Ok(msg)) = msg_stream.next().await {
-                }
 
+                println!("baz 1");
+
+
+                let (sid,io) = create_session();
+                let (client_tx, client_rx) = io.0; 
+                let (server_tx, mut server_rx) = io.1;
+
+                actix_rt::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            ingress = msg_stream.next() => {
+                                let payload = match ingress {
+                                    Some(Ok(m)) => {
+                                        match m {
+                                            Message::Ping(bytes) => Payload::Ping,
+                                            Message::Pong(bytes) => Payload::Pong,
+                                            // TODO: 
+                                            Message::Text(s) => Payload::Message(s.to_string().as_bytes().to_vec()),
+                                            Message::Binary(bytes) => Payload::Message(bytes.to_vec()),
+                                            Message::Close(bytes) => break,
+                                            Message::Continuation(bytes) => Payload::Ping,
+                                            Message::Nop =>  Payload::Ping,
+                                            _ => break,
+                                        }
+                                    },
+                                    _ => break
+                                };
+
+                                if let Err(_e) = client_tx.send(payload).await {
+                                    break
+                                }
+                            }
+
+                            engress = server_rx.recv() => {
+                                match engress {
+                                    Some(p) => {
+                                        match p {
+                                            Payload::Close => break,
+                                            _ => {}
+                                        }
+                                    },
+                                    None =>  {}
+                                }
+                            }
+                        }
+                    }
+                    let _ = session.close(None).await;
+                    server_rx.close();
+                    drop(client_tx);
                 });
 
-                let (client_tx, client_rx) = tokio::sync::mpsc::channel(10);
-                let (server_tx, server_rx) = tokio::sync::mpsc::channel(10);
-
-                // NOTIFY CONSUMER
-               // <F as NewConnectionService>::new_connection(
-               //     &client,
-               //     client_event_stream.filter_map(
-               //         |p| if let Payload::Message(data) = p { Some(data) } else { None } 
-               //     ),
-               //     |data| { server_tx.send(LongPollEvent::POST(data)); }
-               // );
+                <F as NewConnectionService>::new_connection(
+                    &client,
+                    tokio_stream::wrappers::ReceiverStream::new(client_rx)
+                    .filter_map(
+                        |p| if let Payload::Message(data) = p { Some(data) } else { None } 
+                    ),
+                    Emitter { tx: server_tx }
+                );
 
                 let config = SessionConfig::default();
                 async move { 
@@ -125,7 +172,9 @@ where F: NewConnectionService + 'static
             }))
             .to(move |session: web::Query<SessionInfo>| { 
                 let router = router.clone();
+                println!("Spam 1");
                 async move {
+                    println!("SPam 2");
                     let res = router.poll_session(session.sid).await?;
                     match res {
                         Payload::Message(m) => Ok::<web::Json<Vec<u8>>, SessionError>(web::Json(m)),
@@ -138,29 +187,31 @@ where F: NewConnectionService + 'static
 
     let path = {
         let router = longpoll.clone();
+        let client = client.clone();
         path.route(
             web::route()
             .guard(guard::Get())
             .to(move |session: web::Query<SessionInfo>| { 
+                println!("here 1");
+
                 let router = router.clone();
                 let client = client.clone();
 
-                let (client_tx, client_rx) = tokio::sync::mpsc::channel(10);
-                let (server_tx, server_rx) = tokio::sync::mpsc::channel(10);
-                let (sid, client_event_stream, server_event_rx) = create_poll_session(
-                    tokio_stream::wrappers::ReceiverStream::new(client_rx),
-                    tokio_stream::wrappers::ReceiverStream::new(server_rx)
-                );        
+                let (sid,io) = create_session();
+                let (client_tx, client_rx) = io.0; 
+                let (server_tx, server_rx) = io.1;
+                
                 router.writers.insert(sid, client_tx);
-                router.readers.insert(sid, server_event_rx.into());
+                router.readers.insert(sid, server_rx.into());
 
                 // NOTIFY CONSUMER
                 <F as NewConnectionService>::new_connection(
                     &client,
-                    client_event_stream.filter_map(
+                    tokio_stream::wrappers::ReceiverStream::new(client_rx)
+                    .filter_map(
                         |p| if let Payload::Message(data) = p { Some(data) } else { None } 
                     ),
-                    |data| { server_tx.send(LongPollEvent::POST(data)); }
+                    Emitter { tx: server_tx }
                 );
 
                 let config = SessionConfig::default();
@@ -185,6 +236,8 @@ where F: NewConnectionService + 'static
             web::route()
             .guard(guard::Post())
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
+
+                println!("foo 1");
                 let router = router.clone();
                 async move { 
                     router.post_session(session.sid, body.into()).await?;

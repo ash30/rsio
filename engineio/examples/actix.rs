@@ -1,21 +1,20 @@
 use actix_web::{middleware::Logger, App, HttpServer };
-use engineio::adapters::actix::{ socket_io, NewConnectionService };
+use engineio::adapters::actix::{ socket_io, NewConnectionService, Emitter };
 use futures_util::StreamExt;
 use futures_util::Stream;
 use futures_util::pin_mut;
 
 struct NewConnectionManager {}
 impl NewConnectionService for NewConnectionManager {
-
-    fn new_connection<S:Stream + 'static, F:Fn(Vec<u8>)>(&self, stream:S, emit:F) {
-        
+    fn new_connection<S:Stream<Item=Vec<u8>> + 'static>(&self, stream:S, emit:Emitter) {
         actix_rt::spawn(async move {
             pin_mut!(stream);
             while let Some(v) = stream.next().await {
-                emit(v);
+                let _ = emit.send(engineio::Payload::Message(v)).await;
             }
         });
     }
+
 }
 
 #[actix_web::main]

@@ -1,48 +1,56 @@
-use futures_util::{Stream, pin_mut};
-use std::fmt;
-
-use crate::engine::*;
-
-// ==============================
-
-use tokio_stream::StreamExt;
-use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::Receiver;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::mpsc::Sender;
 
-pub fn create_poll_session<S1,S2,T>(client_events:S1, server_events:S2 ) -> (Sid, impl Stream<Item = Payload>,  Receiver<Payload>)
-where S1: Stream<Item = T> + Send + 'static,
-      S2: Stream<Item = T> + Send + 'static,
-      T: TransportEvent + Send,
-{
-    let (client_forward_tx, client_forward_rx) = tokio::sync::mpsc::channel(10);
-    let (server_forward_tx, server_forward_rx) = tokio::sync::mpsc::channel(10);
+use crate::engine::{Sid, Payload, Engine, Participant} ;
+
+type ForwardingChannel<T> = (Sender<T>, Receiver<T> );
+pub struct SessionIO<T>(pub ForwardingChannel<T>,pub ForwardingChannel<T>);
+
+pub fn create_session() -> (Sid,SessionIO<Payload>) {
+
     let mut engine = Engine::new();
     let sid = engine.session;
 
+    let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+    let (server_sent_tx, mut server_sent_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+
+    let (client_forward_tx, client_forward_rx) = tokio::sync::mpsc::channel(10);
+    let (server_forward_tx, server_forward_rx) = tokio::sync::mpsc::channel(10);
+
     tokio::spawn(async move {
-        let events = client_events.
-            map(|v| Participant::Client(v))
-            .merge(
-                server_events.map(|v| Participant::Server(v))
-            );
+        loop {
+            let input = tokio::select! {
+                v1 = client_sent_rx.recv() => v1.and_then(|p| Some(Participant::Client(p))),
+                v2 = server_sent_rx.recv() => v2.and_then(|p| Some(Participant::Server(p)))
+            };
 
-        pin_mut!(events);
-
-        while let Some(v) = events.next().await {
-            // for each received transport event, pass it up to consumer 
-            engine.consume_transport_event(v);
-            let res:std::result::Result<(), SendError<Payload>> = loop {
+            if let Some(res) = input {
+                engine.consume_transport_event(res);
                 let err = match engine.poll_output() {
-                    None => break Ok(()),
+                    None => Ok(()),
                     Some(Participant::Client(p)) => client_forward_tx.send(p).await,
                     Some(Participant::Server(p)) => server_forward_tx.send(p).await
                 };
-                if let Err(..) = err { break err } 
-            };
-            if let Err(..) = res { break } 
-        }
+
+                if let Err(_e) = err { break } 
+            }
+            else {
+                break // one of the input channels has closed 
+            }
+        };
+        // CLOSE INPUTS and outputs
+        client_sent_rx.close();
+        server_sent_rx.close();
+        drop(server_forward_tx);
+        drop(client_forward_tx);
     });
 
-    (sid, ReceiverStream::new(client_forward_rx), server_forward_rx)
-}   
+    let io = SessionIO(
+        (client_sent_tx, client_forward_rx),
+        (server_sent_tx, server_forward_rx),
+    );
+
+    return (sid,io);
+}
+
+
