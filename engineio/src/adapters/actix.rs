@@ -137,10 +137,7 @@ where F: NewConnectionService + 'static
 
                 <F as NewConnectionService>::new_connection(
                     &client,
-                    tokio_stream::wrappers::ReceiverStream::new(client_rx)
-                    .filter_map(
-                        |p| if let Payload::Message(data) = p { Some(data) } else { None } 
-                    ),
+                    tokio_stream::wrappers::ReceiverStream::new(client_rx),
                     Emitter { tx: server_tx }
                 );
 
@@ -204,10 +201,7 @@ where F: NewConnectionService + 'static
                 // NOTIFY CONSUMER
                 <F as NewConnectionService>::new_connection(
                     &client,
-                    tokio_stream::wrappers::ReceiverStream::new(client_rx)
-                    .filter_map(
-                        |p| if let Payload::Message(data) = p { Some(data) } else { None } 
-                    ),
+                    tokio_stream::wrappers::ReceiverStream::new(client_rx),
                     Emitter { tx: server_tx }
                 );
 
