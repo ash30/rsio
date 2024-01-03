@@ -82,10 +82,7 @@ where F: NewConnectionService + 'static
             }))
             .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
                 let client = client.clone();
-                let (response, session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
-
-                println!("baz 1");
-
+                let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
 
                 let (sid,io) = create_session();
                 let (client_tx, client_rx) = io.0; 
@@ -95,6 +92,7 @@ where F: NewConnectionService + 'static
                     loop {
                         tokio::select! {
                             ingress = msg_stream.next() => {
+                                println!("baz 2");
                                 let payload = match ingress {
                                     Some(Ok(m)) => {
                                         match m {
@@ -118,12 +116,14 @@ where F: NewConnectionService + 'static
                             }
 
                             engress = server_rx.recv() => {
+                                println!("baz 3");
                                 match engress {
                                     Some(p) => {
                                         match p {
                                             Payload::Close => break,
-                                            _ => {}
-                                        }
+                                            Payload::Message(p) => session.text(std::str::from_utf8(&p).unwrap()).await,
+                                            _ => Result::Ok(()),
+                                        };
                                     },
                                     None =>  {}
                                 }
@@ -153,7 +153,8 @@ where F: NewConnectionService + 'static
                       "pingTimeout": config.ping_timeout,
                       "maxPayload": config.max_payload
                     });
-                    web::Bytes::from(res.to_string()) 
+                    
+                    response
                 }
             }
             )
@@ -172,9 +173,7 @@ where F: NewConnectionService + 'static
             }))
             .to(move |session: web::Query<SessionInfo>| { 
                 let router = router.clone();
-                println!("Spam 1");
                 async move {
-                    println!("SPam 2");
                     let res = router.poll_session(session.sid).await?;
                     match res {
                         Payload::Message(m) => Ok::<web::Json<Vec<u8>>, SessionError>(web::Json(m)),
@@ -192,8 +191,6 @@ where F: NewConnectionService + 'static
             web::route()
             .guard(guard::Get())
             .to(move |session: web::Query<SessionInfo>| { 
-                println!("here 1");
-
                 let router = router.clone();
                 let client = client.clone();
 
@@ -236,8 +233,6 @@ where F: NewConnectionService + 'static
             web::route()
             .guard(guard::Post())
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
-
-                println!("foo 1");
                 let router = router.clone();
                 async move { 
                     router.post_session(session.sid, body.into()).await?;
