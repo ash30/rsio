@@ -6,7 +6,7 @@ use actix_ws::Message;
 
 use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload };
 use crate::io::create_session;
-use super::common::{ LongPollRouter, SessionError };
+use super::common::{ LongPollRouter, TransportError };
 
 pub use super::common::NewConnectionService;
 pub use super::common::Emitter;
@@ -30,7 +30,7 @@ struct SessionInfo {
     sid: Option<Sid> 
 }
 
-impl actix_web::ResponseError for SessionError{
+impl actix_web::ResponseError for TransportError{
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
             _ => actix_web::http::StatusCode::NOT_FOUND
@@ -173,7 +173,7 @@ where F: NewConnectionService + 'static
                 async move {
                     let res = router.poll_session(session.sid).await?;
                     match res {
-                        Payload::Message(m) => Ok::<web::Json<Vec<u8>>, SessionError>(web::Json(m)),
+                        Payload::Message(m) => Ok::<web::Json<Vec<u8>>, TransportError>(web::Json(m)),
                         _ => Ok(web::Json(vec![]))
                     }
                 }
@@ -230,7 +230,7 @@ where F: NewConnectionService + 'static
                 let router = router.clone();
                 async move { 
                     router.post_session(session.sid, body.into()).await?;
-                    Ok::<HttpResponse, SessionError>(HttpResponse::Ok().finish())
+                    Ok::<HttpResponse, TransportError>(HttpResponse::Ok().finish())
                 }
             }
             )

@@ -1,9 +1,9 @@
 mod poll;
-mod session;
+mod transport;
 mod emitter;
 mod handlers;
 
 pub use handlers::*;
 pub use emitter::*;
-pub use session::*;
+pub use transport::*;
 pub use poll::*;
