@@ -1,18 +1,18 @@
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-
 use crate::engine::{Sid, Payload, Engine, Participant} ;
+use crate::proto::TransportError;
 
-type ForwardingChannel<T> = (Sender<T>, Receiver<T> );
-pub struct SessionIO<T>(pub ForwardingChannel<T>,pub ForwardingChannel<T>);
+type ForwardingChannel<T,E> = (Sender<Result<T,E>>, Receiver<T> );
+pub struct SessionIO<T,E>(pub ForwardingChannel<T,E>,pub ForwardingChannel<T,E>);
 
-pub fn create_session() -> (Sid,SessionIO<Payload>) {
+pub fn create_session() -> (Sid,SessionIO<Payload,TransportError>) {
 
     let mut engine = Engine::new();
     let sid = engine.session;
 
-    let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<Payload>(10);
-    let (server_sent_tx, mut server_sent_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+    let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<Result<Payload,TransportError>>(10);
+    let (server_sent_tx, mut server_sent_rx) = tokio::sync::mpsc::channel::<Result<Payload,TransportError>>(10);
 
     let (client_forward_tx, client_forward_rx) = tokio::sync::mpsc::channel(10);
     let (server_forward_tx, server_forward_rx) = tokio::sync::mpsc::channel(10);

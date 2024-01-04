@@ -1,6 +1,5 @@
 use futures_util::Stream;
 use crate::Payload;
-
 use super::emitter::Emitter;
 
 pub trait NewConnectionService {

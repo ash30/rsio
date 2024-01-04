@@ -6,10 +6,9 @@ use actix_ws::Message;
 
 use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload };
 use crate::io::create_session;
-use super::common::{ LongPollRouter, TransportError };
-
-pub use super::common::NewConnectionService;
-pub use super::common::Emitter;
+use crate::proto::TransportError;
+use super::common::LongPollRouter;
+pub use super::common::{ NewConnectionService, Emitter };
 
 impl From<actix_ws::Message> for WebsocketEvent {
     fn from(value: actix_ws::Message) -> Self {
@@ -92,7 +91,6 @@ where F: NewConnectionService + 'static
                     loop {
                         tokio::select! {
                             ingress = msg_stream.next() => {
-                                println!("baz 2");
                                 let payload = match ingress {
                                     Some(Ok(m)) => {
                                         match m {
@@ -110,17 +108,16 @@ where F: NewConnectionService + 'static
                                     _ => break
                                 };
 
-                                if let Err(_e) = client_tx.send(payload).await {
+                                if let Err(_e) = client_tx.send(Ok(payload)).await {
                                     break
                                 }
                             }
 
                             engress = server_rx.recv() => {
-                                println!("baz 3");
                                 match engress {
                                     Some(p) => {
                                         match p {
-                                            Payload::Close => break,
+                                            Payload::Close(..) => break,
                                             Payload::Message(p) => session.text(std::str::from_utf8(&p).unwrap()).await,
                                             _ => Result::Ok(()),
                                         };

@@ -1,5 +1,6 @@
-pub type Sid = uuid::Uuid;
+use std::fmt;
 
+pub type Sid = uuid::Uuid;
 
 pub enum EngineKind {
     WS,
@@ -12,9 +13,23 @@ pub enum TransportState {
     Closed
 }
 
+#[derive(Debug)]
+pub enum TransportError {
+    UnknownSession,
+    SessionClosed,
+    MultipleInflightPollRequest,
+    SessionUnresponsive,
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
 pub enum Payload {
     Open,
-    Close,
+    Close(Option<TransportError>),
     Ping,
     Pong,
     Message(Vec<u8>),

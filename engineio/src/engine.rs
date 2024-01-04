@@ -46,11 +46,15 @@ impl Engine
         self.output.pop_front()
     }
 
-    pub fn consume_transport_event(&mut self, event:Participant<Payload>){ 
+    pub fn consume_transport_event(&mut self, event:Participant<Result<Payload,TransportError>>){ 
         // TODO: Implement state checking
-        let payload = event.into();
-        self.output.push_front(payload)
+        match event {
+            Participant::Client(Ok(p)) => self.output.push_front(Participant::Client(p)),
+            Participant::Server(Ok(p)) => self.output.push_front(Participant::Server(p)),
+            _ => {}
+        }
     }
+
 }
 
 // Marker Trait 

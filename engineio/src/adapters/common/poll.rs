@@ -1,14 +1,13 @@
 use dashmap::DashMap;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
 use crate::engine::{Sid, Payload, LongPollEvent};
-use super::transport::{Result, TransportError};
+use crate::proto::TransportError;
 
 pub struct LongPollRouter {
     pub readers:DashMap<Sid, Mutex<mpsc::Receiver<Payload>>>,
-    pub writers:DashMap<Sid, mpsc::Sender<Payload>>
+    pub writers:DashMap<Sid, mpsc::Sender<Result<Payload,TransportError>>>
 }
 
 impl LongPollRouter {
@@ -19,7 +18,7 @@ impl LongPollRouter {
         }
     }
 
-    pub async fn poll(&self, sid:Option<uuid::Uuid>) -> Result<Payload> {
+    pub async fn poll(&self, sid:Option<uuid::Uuid>) -> Result<Payload,TransportError> {
         let sid = sid.ok_or(TransportError::UnknownSession)?;
         let session = self.readers.get(&sid).ok_or(TransportError::UnknownSession)?;
 
@@ -39,12 +38,12 @@ impl LongPollRouter {
         }; x
     }
 
-    pub async fn post(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<()> {
+    pub async fn post(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<(),TransportError> {
         let sid = sid.ok_or(TransportError::UnknownSession)?;
         let session = self.writers.get(&sid).ok_or(TransportError::UnknownSession)?;
 
         let res = session
-            .send_timeout(LongPollEvent::POST(body).into(), Duration::from_millis(1000) ).await;
+            .send_timeout(Ok(LongPollEvent::POST(body).into()), Duration::from_millis(1000) ).await;
 
         return res.map_err(|e| match e {
             mpsc::error::SendTimeoutError::Closed(..) => TransportError::SessionClosed,
