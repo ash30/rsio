@@ -10,6 +10,9 @@ pub struct LongPollRouter {
     pub writers:DashMap<Sid, mpsc::Sender<Result<Payload,TransportError>>>
 }
 
+use tokio::time::timeout;
+
+
 impl LongPollRouter {
     pub fn new() -> Self {
         return Self { 
@@ -30,8 +33,11 @@ impl LongPollRouter {
         // https://stackoverflow.com/questions/65972165/why-is-the-temporary-is-part-of-an-expression-at-the-end-of-a-block-an-error
         //
         let x = if let Ok(mut rx) = session.try_lock() {
-            let events = rx.recv().await.ok_or(TransportError::SessionClosed)?;
-            return Ok(events)
+            return match timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(events)) => Ok(events),
+                Ok(None) => Err(TransportError::SessionClosed),
+                Err(..) => Ok(Payload::Message(vec![]))
+            }
         }
         else {
             Err(TransportError::MultipleInflightPollRequest)
