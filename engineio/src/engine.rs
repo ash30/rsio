@@ -1,36 +1,25 @@
 use std::{collections::VecDeque, u8};
 pub use crate::proto::*;
 
-pub enum Participant <T> {
-    Client(T),
-    Server(T)
+pub enum Participant {
+    Client,
+    Server
 }
 
-impl<T> Participant<T> {
-
-    fn value(&self) -> &T {
-        match self {
-            Participant::Client(t) => t,
-            Participant::Server(t) => t
-        }
-    }
-}
-
-impl <T> From<Participant<T>> for Participant<Payload> 
-where T:Into<Payload> + TransportEvent
-{
-    fn from(value: Participant<T>) -> Self {
-        match value {
-            Participant::Client(v) => Participant::Client(v.into()),
-            Participant::Server(v) => Participant::Server(v.into())
-
-        }
-    }
+enum PollingState {
+    Inactive,
+    Active,
+    Continuous
 }
 
 pub struct Engine  { 
     pub session:Sid,
-    output:VecDeque<Participant<Payload>>
+    output:VecDeque<EngineOutput>,
+
+    // Engine State
+    transport: TransportState,
+    polling: PollingState
+
 }
 
 impl Engine  
@@ -38,20 +27,56 @@ impl Engine
     pub fn new() -> Self {
         return Self { 
             session: uuid::Uuid::new_v4(),
-            output: VecDeque::new()
+            output: VecDeque::new(),
+            transport: TransportState::Connected,
+            polling: PollingState::Inactive
         }
     }
 
-    pub fn poll_output(&mut self) -> Option<Participant<Payload>> { 
+    pub fn poll_output(&mut self) -> Option<EngineOutput> { 
         self.output.pop_front()
     }
+    
+    pub fn consume(&mut self, data:EngineInput) {
+        match (data, &self.transport, &self.polling) {
+            
+            // Copnnection + Errors
+            (_, TransportState::Closed, _) => {
+                // Should we return some sort of result here??
+            },
 
-    pub fn consume_transport_event(&mut self, event:Participant<Result<Payload,TransportError>>){ 
-        // TODO: Implement state checking
-        match event {
-            Participant::Client(Ok(p)) => self.output.push_front(Participant::Client(p)),
-            Participant::Server(Ok(p)) => self.output.push_front(Participant::Server(p)),
-            _ => {}
+            (EngineInput::Error,_,_) => {
+
+            },
+
+            // PollingState
+            (EngineInput::PollStart, _, PollingState::Inactive) => {
+                self.polling = PollingState::Active;
+                self.output.push_back(EngineOutput::Pending)
+            },
+            
+            (EngineInput::PollStart, _, _) => {
+                self.transport = TransportState::Closed;
+                self.output.push_back(EngineOutput::Closed(Some(EngineError::InvalidPollRequest)))
+            },
+
+            (EngineInput::PollEnd, _, _ ) => {
+                self.polling = PollingState::Inactive;
+            }
+
+            // Payloads
+            (EngineInput::Data(_,Payload::Close(_)),_, _) => {
+                self.transport = TransportState::Closed;
+                self.output.push_back(EngineOutput::Closed(None));
+            },
+
+            (EngineInput::Data(Participant::Client, p),_,_) => {
+                self.output.push_back(EngineOutput::Data(Participant::Client, p));
+            }
+
+            (EngineInput::Data(Participant::Server, p),_,_) => {
+                self.output.push_back(EngineOutput::Data(Participant::Server, p));
+            }
         }
     }
 

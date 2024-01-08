@@ -1,27 +1,44 @@
 use std::fmt;
+use std::error;
+
+use crate::Participant;
+
 
 pub type Sid = uuid::Uuid;
 
 pub enum EngineKind {
-    WS,
-    LongPoll
+    Continuous,
+    Poll
 }
 
 pub enum TransportState { 
     Connected,
-    Disconnected,
     Closed
 }
 
+pub enum EngineInput {
+    Error,
+    PollStart,
+    PollEnd,
+    Data(Participant, Payload),
+}
+
+pub enum EngineOutput {
+    Pending,
+    Data(Participant, Payload),
+    Closed(Option<EngineError>)
+
+}
+
 #[derive(Debug)]
-pub enum TransportError {
+pub enum EngineError {
     UnknownSession,
-    SessionClosed,
-    MultipleInflightPollRequest,
+    SessionAlreadyClosed,
+    InvalidPollRequest,
     SessionUnresponsive,
 }
 
-impl fmt::Display for TransportError {
+impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self)
     }
@@ -29,7 +46,7 @@ impl fmt::Display for TransportError {
 
 pub enum Payload {
     Open,
-    Close(Option<TransportError>),
+    Close(Option<EngineError>),
     Ping,
     Pong,
     Message(Vec<u8>),

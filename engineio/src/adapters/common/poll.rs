@@ -2,12 +2,13 @@ use dashmap::DashMap;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
-use crate::engine::{Sid, Payload, LongPollEvent};
-use crate::proto::TransportError;
+use crate::{EngineInput, Participant};
+use crate::engine::{Sid, Payload};
+use crate::proto::EngineError;
 
 pub struct LongPollRouter {
     pub readers:DashMap<Sid, Mutex<mpsc::Receiver<Payload>>>,
-    pub writers:DashMap<Sid, mpsc::Sender<Result<Payload,TransportError>>>
+    pub writers:DashMap<Sid, mpsc::Sender<EngineInput>>
 }
 
 use tokio::time::timeout;
@@ -21,9 +22,9 @@ impl LongPollRouter {
         }
     }
 
-    pub async fn poll(&self, sid:Option<uuid::Uuid>) -> Result<Payload,TransportError> {
-        let sid = sid.ok_or(TransportError::UnknownSession)?;
-        let session = self.readers.get(&sid).ok_or(TransportError::UnknownSession)?;
+    pub async fn poll(&self, sid:Option<uuid::Uuid>) -> Result<Payload,EngineError> {
+        let sid = sid.ok_or(EngineError::UnknownSession)?;
+        let session = self.readers.get(&sid).ok_or(EngineError::UnknownSession)?;
 
         // We have to assign guard here OTHERWISE, as a temp, it will be released AFTER session
         // which it relies on. By binding it, we force its scope to be non temp
@@ -35,25 +36,25 @@ impl LongPollRouter {
         let x = if let Ok(mut rx) = session.try_lock() {
             return match timeout(Duration::from_secs(10), rx.recv()).await {
                 Ok(Some(events)) => Ok(events),
-                Ok(None) => Err(TransportError::SessionClosed),
+                Ok(None) => Err(EngineError::SessionAlreadyClosed),
                 Err(..) => Ok(Payload::Message(vec![]))
             }
         }
         else {
-            Err(TransportError::MultipleInflightPollRequest)
+            Err(EngineError::InvalidPollRequest)
         }; x
     }
 
-    pub async fn post(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<(),TransportError> {
-        let sid = sid.ok_or(TransportError::UnknownSession)?;
-        let session = self.writers.get(&sid).ok_or(TransportError::UnknownSession)?;
+    pub async fn post(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<(),EngineError> {
+        let sid = sid.ok_or(EngineError::UnknownSession)?;
+        let tx = self.writers.get(&sid).ok_or(EngineError::UnknownSession)?;
 
-        let res = session
-            .send_timeout(Ok(LongPollEvent::POST(body).into()), Duration::from_millis(1000) ).await;
+
+        let res = tx.send_timeout(EngineInput::Data(Participant::Client,Payload::Message(body)), Duration::from_millis(1000) ).await;
 
         return res.map_err(|e| match e {
-            mpsc::error::SendTimeoutError::Closed(..) => TransportError::SessionClosed,
-            mpsc::error::SendTimeoutError::Timeout(..) => TransportError::SessionUnresponsive
+            mpsc::error::SendTimeoutError::Closed(..) => EngineError::SessionAlreadyClosed,
+            mpsc::error::SendTimeoutError::Timeout(..) => EngineError::SessionUnresponsive
         })
     }
 }

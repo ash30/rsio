@@ -4,9 +4,10 @@ use serde_json::json;
 use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::Message;
 
-use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload };
+use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload, Participant };
 use crate::io::create_session;
-use crate::proto::TransportError;
+use crate::proto::EngineError;
+use crate::proto::EngineInput;
 use super::common::LongPollRouter;
 pub use super::common::{ NewConnectionService, Emitter };
 
@@ -29,7 +30,7 @@ struct SessionInfo {
     sid: Option<Sid> 
 }
 
-impl actix_web::ResponseError for TransportError{
+impl actix_web::ResponseError for EngineError{
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
             _ => actix_web::http::StatusCode::NOT_FOUND
@@ -108,7 +109,7 @@ where F: NewConnectionService + 'static
                                     _ => break
                                 };
 
-                                if let Err(_e) = client_tx.send(Ok(payload)).await {
+                                if let Err(_e) = client_tx.send(EngineInput::Data(Participant::Client,payload)).await {
                                     break
                                 }
                             }
@@ -170,7 +171,7 @@ where F: NewConnectionService + 'static
                 async move {
                     let res = router.poll(session.sid).await?;
                     match res {
-                        Payload::Message(m) => Ok::<web::Json<Vec<u8>>, TransportError>(web::Json(m)),
+                        Payload::Message(m) => Ok::<web::Json<Vec<u8>>, EngineError>(web::Json(m)),
                         _ => Ok(web::Json(vec![]))
                     }
                 }
@@ -227,7 +228,7 @@ where F: NewConnectionService + 'static
                 let router = router.clone();
                 async move { 
                     router.post(session.sid, body.into()).await?;
-                    Ok::<HttpResponse, TransportError>(HttpResponse::Ok().finish())
+                    Ok::<HttpResponse, EngineError>(HttpResponse::Ok().finish())
                 }
             }
             )
