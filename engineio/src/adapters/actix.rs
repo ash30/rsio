@@ -5,7 +5,7 @@ use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::Message;
 
 use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload, Participant };
-use crate::io::create_session;
+use crate::io::create_session_async;
 use crate::proto::EngineError;
 use crate::proto::EngineInput;
 use super::common::LongPollRouter;
@@ -84,7 +84,7 @@ where F: NewConnectionService + 'static
                 let client = client.clone();
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
 
-                let (sid,io) = create_session();
+                let (sid,io) = create_session_async();
                 let (client_tx, client_rx) = io.0; 
                 let (server_tx, mut server_rx) = io.1;
 
@@ -170,6 +170,7 @@ where F: NewConnectionService + 'static
                 let router = router.clone();
                 async move {
                     let res = router.poll(session.sid).await?;
+                    let output = res.iter().fold(init, f)
                     match res {
                         Payload::Message(m) => Ok::<web::Json<Vec<u8>>, EngineError>(web::Json(m)),
                         _ => Ok(web::Json(vec![]))
@@ -189,7 +190,7 @@ where F: NewConnectionService + 'static
                 let router = router.clone();
                 let client = client.clone();
 
-                let (sid,io) = create_session();
+                let (sid,io) = create_session_async();
                 let (client_tx, client_rx) = io.0; 
                 let (server_tx, server_rx) = io.1;
                 
@@ -199,7 +200,7 @@ where F: NewConnectionService + 'static
                 // NOTIFY CONSUMER
                 <F as NewConnectionService>::new_connection(
                     &client,
-                    tokio_stream::wrappers::ReceiverStream::new(client_rx),
+                    tokio_stream::wrappers::BroadcastStream::new(client_rx),
                     Emitter { tx: server_tx }
                 );
 

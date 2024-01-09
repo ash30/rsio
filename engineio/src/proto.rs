@@ -1,5 +1,6 @@
 use std::fmt;
 use std::error;
+use std::time::Duration;
 
 use crate::Participant;
 
@@ -17,20 +18,21 @@ pub enum TransportState {
 }
 
 pub enum EngineInput {
+    NOP,
+    Close(Participant),
     Error,
-    PollStart,
-    PollEnd,
+    Poll,
     Data(Participant, Payload),
 }
 
 pub enum EngineOutput {
-    Pending,
+    Pending(Duration),
     Data(Participant, Payload),
     Closed(Option<EngineError>)
 
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EngineError {
     UnknownSession,
     SessionAlreadyClosed,
@@ -44,6 +46,7 @@ impl fmt::Display for EngineError {
     }
 }
 
+#[derive(Clone)]
 pub enum Payload {
     Open,
     Close(Option<EngineError>),
@@ -53,6 +56,7 @@ pub enum Payload {
     Upgrade,
     Noop
 }
+
 
 pub struct SessionConfig { 
     pub ping_interval: u32,

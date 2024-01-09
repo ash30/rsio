@@ -1,5 +1,7 @@
+use std::sync::mpsc::TryRecvError;
+
 use dashmap::DashMap;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, broadcast};
 use tokio::time::Duration;
 
 use crate::{EngineInput, Participant};
@@ -7,7 +9,7 @@ use crate::engine::{Sid, Payload};
 use crate::proto::EngineError;
 
 pub struct LongPollRouter {
-    pub readers:DashMap<Sid, Mutex<mpsc::Receiver<Payload>>>,
+    pub readers:DashMap<Sid, broadcast::Receiver<Payload>>,
     pub writers:DashMap<Sid, mpsc::Sender<EngineInput>>
 }
 
@@ -22,27 +24,20 @@ impl LongPollRouter {
         }
     }
 
-    pub async fn poll(&self, sid:Option<uuid::Uuid>) -> Result<Payload,EngineError> {
+    pub async fn poll(&self, sid:Option<uuid::Uuid>) -> Result<Vec<Payload>,EngineError> {
         let sid = sid.ok_or(EngineError::UnknownSession)?;
-        let session = self.readers.get(&sid).ok_or(EngineError::UnknownSession)?;
-
-        // We have to assign guard here OTHERWISE, as a temp, it will be released AFTER session
-        // which it relies on. By binding it, we force its scope to be non temp
-        //
-        // https://stackoverflow.com/questions/53586321/why-do-i-get-does-not-live-long-enough-in-a-return-value
-        //
-        // https://stackoverflow.com/questions/65972165/why-is-the-temporary-is-part-of-an-expression-at-the-end-of-a-block-an-error
-        //
-        let x = if let Ok(mut rx) = session.try_lock() {
-            return match timeout(Duration::from_secs(10), rx.recv()).await {
-                Ok(Some(events)) => Ok(events),
-                Ok(None) => Err(EngineError::SessionAlreadyClosed),
-                Err(..) => Ok(Payload::Message(vec![]))
-            }
+        let mut session_rx = self.readers.get_mut(&sid).ok_or(EngineError::UnknownSession)?;
+        let session_tx = self.writers.get(&sid).ok_or(EngineError::UnknownSession)?;
+        let res = session_tx.send(EngineInput::Poll).await;
+        let mut body = vec![];
+        loop {
+            match session_rx.recv().await {
+                Err(..) => break,
+                Ok(Payload::Noop) => break,
+                Ok(p) => {body.push(p);}
+            };
         }
-        else {
-            Err(EngineError::InvalidPollRequest)
-        }; x
+        return Ok(body);
     }
 
     pub async fn post(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<(),EngineError> {
