@@ -3,6 +3,7 @@ use tokio_stream::StreamExt;
 use serde_json::json;
 use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::Message;
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload, Participant };
 use crate::io::create_session_async;
@@ -116,26 +117,52 @@ where F: NewConnectionService + 'static
 
                             engress = server_rx.recv() => {
                                 match engress {
-                                    Some(p) => {
-                                        match p {
-                                            Payload::Close(..) => break,
-                                            Payload::Message(p) => session.text(std::str::from_utf8(&p).unwrap()).await,
-                                            _ => Result::Ok(()),
-                                        };
+                                    Ok(Payload::Close(..)) => {
+                                        break
                                     },
-                                    None =>  {}
+
+                                    Ok(Payload::Message(p)) => {
+                                        session.text(std::str::from_utf8(&p).unwrap()).await;
+                                    },
+
+                                    Ok(Payload::Ping) => {
+                                        session.ping(b"").await;
+                                    },
+
+                                    Ok(Payload::Pong) => {
+                                        session.pong(b"").await;
+                                    },
+
+                                    Ok(Payload::Open) => {
+                                        // TODO:
+                                    },
+
+                                    Ok(Payload::Noop) => {
+                                    },
+
+                                    Ok(Payload::Upgrade) => {
+
+                                    },
+
+                                    Err(RecvError::Closed) => {
+
+                                    },
+
+                                    Err(RecvError::Lagged(_)) => {
+
+                                    }
                                 }
                             }
                         }
                     }
                     let _ = session.close(None).await;
-                    server_rx.close();
+                    drop(server_rx);
                     drop(client_tx);
                 });
 
                 <F as NewConnectionService>::new_connection(
                     &client,
-                    tokio_stream::wrappers::ReceiverStream::new(client_rx),
+                    tokio_stream::wrappers::BroadcastStream::new(client_rx),
                     Emitter { tx: server_tx }
                 );
 
@@ -170,11 +197,9 @@ where F: NewConnectionService + 'static
                 let router = router.clone();
                 async move {
                     let res = router.poll(session.sid).await?;
-                    let output = res.iter().fold(init, f)
-                    match res {
-                        Payload::Message(m) => Ok::<web::Json<Vec<u8>>, EngineError>(web::Json(m)),
-                        _ => Ok(web::Json(vec![]))
-                    }
+
+                    //TODO: We need to seriaise the polled output
+                   Ok::<&str,EngineError>( "Hello world!")
                 }
             })
         )
