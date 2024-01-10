@@ -1,6 +1,7 @@
 use std::fmt;
 use std::error;
 use std::time::Duration;
+use std::u8;
 
 use crate::Participant;
 
@@ -55,6 +56,27 @@ pub enum Payload {
     Message(Vec<u8>),
     Upgrade,
     Noop
+}
+
+
+impl Payload{
+    pub fn as_bytes(&self) -> Vec<u8>{
+        let (prefix, data) = match &self{
+            Payload::Open => ("0", None),
+            Payload::Close(..) => ("1", None),
+            Payload::Ping => ("2", None),
+            Payload::Pong => ("3", None),
+            Payload::Message(p) => ("4", Some(p)),
+            Payload::Upgrade => ("5",None),
+            Payload::Noop => ("6",None),
+        };
+
+        let mut b = prefix.as_bytes().to_owned();
+        if let Some(data) = data {
+            b = [b,data.clone()].concat();
+        }
+        return b
+    }
 }
 
 

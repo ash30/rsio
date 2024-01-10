@@ -197,9 +197,12 @@ where F: NewConnectionService + 'static
                 let router = router.clone();
                 async move {
                     let res = router.poll(session.sid).await?;
-
-                    //TODO: We need to seriaise the polled output
-                   Ok::<&str,EngineError>( "Hello world!")
+                    let seperator = "\x1e";
+                    let b:Vec<u8>= res.iter().map(|p| vec![p.as_bytes(), seperator.as_bytes().to_owned() ].concat()).fold(vec![], |a,b| {
+                        a.into_iter()
+                            .chain(b.into_iter()).collect()
+                    });
+                    Ok::<Vec<u8>,EngineError>(b)
                 }
             })
         )
