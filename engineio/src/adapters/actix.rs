@@ -27,6 +27,7 @@ impl From<actix_ws::Message> for WebsocketEvent {
 
 #[derive(serde::Deserialize)]
 struct SessionInfo {
+    #[serde(alias = "EIO")]
     eio: u8,
     sid: Option<Sid> 
 }
