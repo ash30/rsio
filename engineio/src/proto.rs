@@ -8,22 +8,20 @@ use crate::Participant;
 
 pub type Sid = uuid::Uuid;
 
-pub enum EngineKind {
-    Continuous,
-    Poll
-}
 
 pub enum TransportState { 
+    New,
     Connected,
     Closed
 }
 
 pub enum EngineInput {
-    NOP,
+    New(Option<TransportConfig>),
     Close(Participant),
-    Error,
-    Poll,
     Data(Participant, Payload),
+    Poll,
+    Error,
+    NOP
 }
 
 pub enum EngineOutput {
@@ -35,6 +33,7 @@ pub enum EngineOutput {
 
 #[derive(Debug, Clone)]
 pub enum EngineError {
+    Generic,
     UnknownSession,
     SessionAlreadyClosed,
     InvalidPollRequest,
@@ -47,9 +46,12 @@ impl fmt::Display for EngineError {
     }
 }
 
+use serde::{Deserialize, Serialize};
+
+
 #[derive(Clone)]
 pub enum Payload {
-    Open,
+    Open(Vec<u8>),
     Close(Option<EngineError>),
     Ping,
     Pong,
@@ -60,13 +62,13 @@ pub enum Payload {
 
 
 impl Payload{
-    pub fn as_bytes(&self) -> Vec<u8>{
+    pub fn as_bytes(&self, sid:Sid) -> Vec<u8>{
         let (prefix, data) = match &self{
-            Payload::Open => ("0", None),
+            Payload::Open(data) => ("0", Some(data.to_owned())),
             Payload::Close(..) => ("1", None),
             Payload::Ping => ("2", None),
             Payload::Pong => ("3", None),
-            Payload::Message(p) => ("4", Some(p)),
+            Payload::Message(p) => ("4", Some(p.to_owned())),
             Payload::Upgrade => ("5",None),
             Payload::Noop => ("6",None),
         };
@@ -79,14 +81,14 @@ impl Payload{
     }
 }
 
-
-pub struct SessionConfig { 
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct TransportConfig { 
     pub ping_interval: u32,
     pub ping_timeout: u32,
     pub max_payload: u32
 }
 
-impl Default for SessionConfig {
+impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             ping_interval:25000,

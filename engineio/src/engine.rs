@@ -33,7 +33,7 @@ impl Engine
             session: uuid::Uuid::new_v4(),
             output: VecDeque::new(),
             poll_buffer: VecDeque::new(),
-            transport: TransportState::Connected,
+            transport: TransportState::New,
             polling: PollingState::Inactive { lastPoll: None },
             poll_timeout: Duration::from_secs(30*10),
             poll_duration: Duration::from_secs(30),
@@ -71,20 +71,40 @@ impl Engine
 
 
         match (data, &self.transport, &self.polling) {
-            
             // Copnnection + Errors
             (_, TransportState::Closed, _) => {
                 // Should we return some sort of result here??
             },
 
-            (EngineInput::Error,_,_) => {
+            (EngineInput::New(config),TransportState::New, _) => {
+                let config = config.unwrap_or(TransportConfig::default());
+                let upgrades = if let PollingState::Continuous = self.polling { vec![] } else { vec!["websocket"] };
+                let data = serde_json::json!({
+                    "upgrades": upgrades,
+                    "maxPayload": config.max_payload,
+                    "pingInterval": config.ping_interval,
+                    "pingTimeout": config.ping_timeout,
+                    "sid":  self.session
+                });
+                self.output.push_back(
+                    EngineOutput::Data(
+                        Participant::Server, Payload::Open(serde_json::to_vec(&data).unwrap())
+                    )
+                )
+            },
 
+            (EngineInput::New(..), _, _) => {
+                // SHOULD WE RETURN AN ERROR ??
             },
 
             (EngineInput::Close(..),_,_) => {
                    self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                    self.output.push_back(EngineOutput::Closed(None));
                    self.transport = TransportState::Closed;
+            },
+
+            (EngineInput::Error,_,_) => {
+
             },
 
             // PollingState

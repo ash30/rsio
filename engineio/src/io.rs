@@ -8,9 +8,10 @@ use crate::engine::{Sid, Payload, Engine, Participant} ;
 
 type ForwardingChannel<IN,OUT> = (Sender<IN>, Receiver<OUT>);
 
-pub fn create_session_async() -> (Sid, (ForwardingChannel<EngineInput, Payload>, ForwardingChannel<EngineInput, Payload>)) {
 
-    let mut engine = Engine::new();
+pub fn create_session_async(mut engine:Engine) -> (Sid, (ForwardingChannel<EngineInput, Payload>, ForwardingChannel<EngineInput, Payload>)) {
+
+    //let mut engine = Engine::new();
     let sid = engine.session;
 
     let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<EngineInput>(10);

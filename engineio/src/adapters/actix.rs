@@ -5,7 +5,8 @@ use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::Message;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::engine::{Sid, WebsocketEvent, SessionConfig, Payload, Participant };
+use crate::EngineOutput;
+use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
 use crate::io::create_session_async;
 use crate::proto::EngineError;
 use crate::proto::EngineInput;
@@ -35,6 +36,7 @@ struct SessionInfo {
 impl actix_web::ResponseError for EngineError{
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
+            EngineError::Generic => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             _ => actix_web::http::StatusCode::NOT_FOUND
         }
     }
@@ -68,7 +70,7 @@ impl actix_web::ResponseError for EngineError{
 //}
 
 // Actix Service for accepting LONG POLL reqs and WS ? 
-pub fn socket_io<F>(path:actix_web::Resource, callback: F) -> Resource
+pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: F) -> Resource
 where F: NewConnectionService + 'static
 {
     let client = Arc::new(callback);
@@ -86,7 +88,10 @@ where F: NewConnectionService + 'static
                 let client = client.clone();
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
 
-                let (sid,io) = create_session_async();
+                let mut engine = crate::engine::Engine::new();
+                engine.consume(EngineInput::New(Some(TransportConfig::default())), std::time::Instant::now());
+
+                let (sid,io) = create_session_async(engine);
                 let (client_tx, client_rx) = io.0; 
                 let (server_tx, mut server_rx) = io.1;
 
@@ -134,7 +139,7 @@ where F: NewConnectionService + 'static
                                         session.pong(b"").await;
                                     },
 
-                                    Ok(Payload::Open) => {
+                                    Ok(Payload::Open(data)) => {
                                         // TODO:
                                     },
 
@@ -167,7 +172,7 @@ where F: NewConnectionService + 'static
                     Emitter { tx: server_tx }
                 );
 
-                let config = SessionConfig::default();
+                let config = TransportConfig::default();
                 async move { 
                     let res = json!({
                       "sid": sid,
@@ -197,9 +202,10 @@ where F: NewConnectionService + 'static
             .to(move |session: web::Query<SessionInfo>| { 
                 let router = router.clone();
                 async move {
+                    let sid = session.sid.ok_or(EngineError::UnknownSession)?;
                     let res = router.poll(session.sid).await?;
                     let seperator = "\x1e";
-                    let b:Vec<u8>= res.iter().map(|p| vec![p.as_bytes(), seperator.as_bytes().to_owned() ].concat()).fold(vec![], |a,b| {
+                    let b:Vec<u8>= res.iter().map(|p| vec![p.as_bytes(sid), seperator.as_bytes().to_owned() ].concat()).fold(vec![], |a,b| {
                         a.into_iter()
                             .chain(b.into_iter()).collect()
                     });
@@ -212,37 +218,43 @@ where F: NewConnectionService + 'static
     let path = {
         let router = longpoll.clone();
         let client = client.clone();
+        let config = config.clone();
         path.route(
             web::route()
             .guard(guard::Get())
             .to(move |session: web::Query<SessionInfo>| { 
                 let router = router.clone();
                 let client = client.clone();
+                let config = config.clone();
+                async move {
+                    let mut engine = crate::engine::Engine::new();
+                    engine.consume(EngineInput::New(Some(config)), std::time::Instant::now());
 
-                let (sid,io) = create_session_async();
-                let (client_tx, client_rx) = io.0; 
-                let (server_tx, server_rx) = io.1;
-                
-                router.writers.insert(sid, client_tx);
-                router.readers.insert(sid, server_rx.into());
+                    let res = loop {
+                        match engine.poll_output() {
+                            EngineOutput::Data(Participant::Server, payload) => {
+                                if let Payload::Open(..) = payload { break Some(payload) } 
+                            }
+                            _ => {}
+                        };
+                        break None;
+                    }.ok_or(EngineError::Generic)?;
 
-                // NOTIFY CONSUMER
-                <F as NewConnectionService>::new_connection(
-                    &client,
-                    tokio_stream::wrappers::BroadcastStream::new(client_rx),
-                    Emitter { tx: server_tx }
-                );
+                    let (sid,io) = create_session_async(engine);
+                    let (client_tx, client_rx) = io.0; 
+                    let (server_tx, server_rx) = io.1;
 
-                let config = SessionConfig::default();
-                async move { 
-                    let res = json!({
-                      "sid": sid,
-                      "upgrades": ["websocket"],
-                      "pingInterval": config.ping_interval,
-                      "pingTimeout": config.ping_timeout,
-                      "maxPayload": config.max_payload
-                    });
-                    web::Bytes::from(res.to_string()) 
+                    router.writers.insert(sid, client_tx);
+                    router.readers.insert(sid, server_rx.into());
+
+                    <F as NewConnectionService>::new_connection(
+                        &client,
+                        tokio_stream::wrappers::BroadcastStream::new(client_rx),
+                        Emitter { tx: server_tx }
+
+
+                    );
+                    Ok::<actix_web::web::Bytes, EngineError>(web::Bytes::from(res.as_bytes(sid)))
                 }
             }
             )
