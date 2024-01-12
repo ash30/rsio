@@ -205,10 +205,13 @@ where F: NewConnectionService + 'static
                     let sid = session.sid.ok_or(EngineError::UnknownSession)?;
                     let res = router.poll(session.sid).await?;
                     let seperator = "\x1e";
-                    let b:Vec<u8>= res.iter().map(|p| vec![p.as_bytes(sid), seperator.as_bytes().to_owned() ].concat()).fold(vec![], |a,b| {
+
+                    let b = res.iter().map(|p| p.as_bytes(sid)).reduce(|a,b| {
                         a.into_iter()
-                            .chain(b.into_iter()).collect()
-                    });
+                            .chain(b.into_iter())
+                            .chain(seperator.as_bytes().to_vec().into_iter())
+                            .collect()
+                    }).unwrap_or(b"".to_vec());
                     Ok::<Vec<u8>,EngineError>(b)
                 }
             })

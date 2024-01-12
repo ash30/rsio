@@ -1,5 +1,6 @@
 use std::sync::mpsc::TryRecvError;
 
+use actix_web::body;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, broadcast};
 use tokio::time::Duration;
@@ -43,14 +44,26 @@ impl LongPollRouter {
     pub async fn post(&self, sid: Option<uuid::Uuid>, body: Vec<u8>) -> Result<(),EngineError> {
         let sid = sid.ok_or(EngineError::UnknownSession)?;
         let tx = self.writers.get(&sid).ok_or(EngineError::UnknownSession)?;
+        
+        // parse messages
+        let mut buf = vec![];
+        let mut start = 0;
+        let mut iter = body.iter().enumerate();
+        while let Some(d) = iter.next() {
+            let (n,data) = d;
+            if *data == b"\x1e"[0] {
+                buf.push(&body[start..n]);
+                start = n+1;
+                println!("test1b");
+            }
+        }
+         buf.push(&body[start..body.len()]);
 
-
-        let res = tx.send_timeout(EngineInput::Data(Participant::Client,Payload::Message(body)), Duration::from_millis(1000) ).await;
-
-        return res.map_err(|e| match e {
-            mpsc::error::SendTimeoutError::Closed(..) => EngineError::SessionAlreadyClosed,
-            mpsc::error::SendTimeoutError::Timeout(..) => EngineError::SessionUnresponsive
-        })
+        for msg in buf.iter().filter(|v| v[0] == b"4"[0] ) {
+            // TODO:ollect errors...
+            let res = tx.send_timeout(EngineInput::Data(Participant::Client,Payload::Message((**msg)[1..].to_vec())), Duration::from_millis(1000) ).await;
+        }
+        Ok(())
     }
 }
 
