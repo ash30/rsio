@@ -270,7 +270,8 @@ where F: NewConnectionService + 'static
                 let router = router.clone();
                 async move { 
                     router.post(session.sid, body.into()).await?;
-                    Ok::<HttpResponse, EngineError>(HttpResponse::Ok().finish())
+                    // TODO: Test suite assumes an "ok" returned in response... 
+                    Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))
                 }
             }
             )
