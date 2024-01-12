@@ -46,6 +46,32 @@ impl fmt::Display for EngineError {
     }
 }
 
+impl fmt::Display for EngineOutput {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Pending(t) => write!(f, "wait {}", t.as_millis() ),
+            Self::Data(Participant::Server,d) => write!(f, "data - Server emit"),
+            Self::Data(Participant::Client,d) => write!(f, "data - Client Recv"),
+            Self::Closed(e) => write!(f, "close")
+        }
+    }
+}
+
+impl fmt::Display for EngineInput {
+
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let output = match self {
+            Self::NOP => "NOP",
+            Self::Poll => "POLL",
+            Self::Error => "ERR",
+            Self::New(..) => "NEW",
+            Self::Data(p,d) => "DATA",
+            Self::Close(..) => "CLOSE",
+        };
+        write!(f, "{}", output)
+    }
+}
+
 use serde::{Deserialize, Serialize};
 
 
