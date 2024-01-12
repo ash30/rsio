@@ -78,6 +78,11 @@ impl Engine
 
             (EngineInput::New(config),TransportState::New, _) => {
                 let config = config.unwrap_or(TransportConfig::default());
+            
+                // Update timeouts
+                self.poll_timeout = Duration::from_millis(config.ping_timeout.into());
+                self.poll_duration = Duration::from_millis(config.ping_interval.into());
+
                 let upgrades = if let PollingState::Continuous = self.polling { vec![] } else { vec!["websocket"] };
                 let data = serde_json::json!({
                     "upgrades": upgrades,
