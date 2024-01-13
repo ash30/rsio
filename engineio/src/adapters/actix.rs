@@ -204,15 +204,17 @@ where F: NewConnectionService + 'static
                 async move {
                     let sid = session.sid.ok_or(EngineError::UnknownSession)?;
                     let res = router.poll(session.sid).await?;
-                    let seperator = "\x1e";
+                    let res_size = res.len();
+                    let seperator = b"\x1e";
 
-                    let b = res.iter().map(|p| p.as_bytes(sid)).reduce(|a,b| {
-                        a.into_iter()
-                            .chain(b.into_iter())
-                            .chain(seperator.as_bytes().to_vec().into_iter())
-                            .collect()
-                    }).unwrap_or(b"".to_vec());
-                    Ok::<Vec<u8>,EngineError>(b)
+                    let combined = res.iter()
+                        .map(|p| p.as_bytes(sid))
+                        .enumerate()
+                        .map(|(n,b)| if res_size > 1 && n < res_size - 1{ vec![b,seperator.to_vec()].concat() } else { b } )
+                        .flat_map(|a| a )
+                        .collect();
+                        
+                    Ok::<Vec<u8>,EngineError>(combined)
                 }
             })
         )
