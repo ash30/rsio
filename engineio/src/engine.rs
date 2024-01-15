@@ -44,22 +44,29 @@ impl Engine
         }
     }
 
-    pub fn poll_output(&mut self) -> EngineOutput { 
-        return if let Some(p) = self.output.pop_front() { p } 
-        else {
-            let (duration, poll_id) = match self.polling {
-                PollingState::Active { id, start, duration } => (duration, Some(id)), 
-                PollingState::Inactive { lastPoll } => (self.poll_timeout, None),
-                PollingState::Continuous => (std::time::Duration::from_secs(60*60), None)
-            };
-            EngineOutput::Pending(duration, poll_id )
+    pub fn poll_output(&mut self) -> Option<EngineOutput> { 
+        // Let them drain output even when closed, but onced empty - forever return None
+        match (&self.transport, self.output.pop_front()) {
+            (TransportState::Closed, Some(p)) => Some(p),
+            (TransportState::Closed, None) => None,
+            (_, Some(p)) => Some(p),
+            (_, None) => {
+                let (duration, poll_id) = match self.polling {
+                    PollingState::Active { id, start, duration } => (duration, Some(id)), 
+                    PollingState::Inactive { lastPoll } => (self.poll_timeout, None),
+                    PollingState::Continuous => (std::time::Duration::from_secs(60*60), None)
+                };
+                Some(EngineOutput::Pending(duration, poll_id ))
+            }
         }
+
     }
     
     pub fn consume(&mut self, data:EngineInput, now:Instant) {
         match self.polling {
             PollingState::Inactive { lastPoll:Some(last) } => {
                 if now > (last + self.poll_timeout) {
+                    self.transport = TransportState::Closed;
                     self.output.push_back(EngineOutput::Closed(None));
                 }
             }

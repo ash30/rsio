@@ -80,15 +80,15 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                         let out = engine.poll_output();
                         dbg!(&out);
                         match out {
-                            EngineOutput::Pending(duration,id) => break Some((duration,id)),
-                            EngineOutput::Data(Participant::Client,p) => { 
+                            Some(EngineOutput::Pending(duration,id)) => break Some((duration,id)),
+                            Some(EngineOutput::Data(Participant::Client,p)) => { 
                                 let t = vec![output.as_ref(), server_recv.get(&sid)];
                                 for tx in t.into_iter().filter_map(|a| a) {
                                     tx.send(p.clone()).await;
                                 }
                                 dbg!();
                             },
-                            EngineOutput::Data(Participant::Server,p) => {
+                            Some(EngineOutput::Data(Participant::Server,p)) => {
                                 // TODO: UNWRAP 
                                 let t = vec![output.as_ref(), client_recv.get(&sid)];
                                 for tx in t.into_iter().filter_map(|a| a) {
@@ -96,7 +96,13 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                                 }
                                 dbg!();
                             },
-                            EngineOutput::Closed(..) => break None
+                            Some(EngineOutput::Closed(..)) => {
+                                // .. what todo
+                            },
+                            None => {
+                                //... what todo...
+                                break None
+                            }
                         }
                     };
                     dbg!();
