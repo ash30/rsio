@@ -21,8 +21,8 @@ pub enum EngineInput {
     New(Option<TransportConfig>, EngineKind),
     Close(Participant),
     Data(Participant, Payload),
-    Poll,
-    Listen,
+    Poll(uuid::Uuid),
+    Listen(Participant),
     Error,
     NOP
 }
@@ -36,7 +36,7 @@ pub enum EngineKind {
 
 #[derive(Debug)]
 pub enum EngineOutput {
-    Pending(Duration),
+    Pending(Duration, Option<uuid::Uuid>),
     Data(Participant, Payload),
     Closed(Option<EngineError>)
 
@@ -45,10 +45,12 @@ pub enum EngineOutput {
 #[derive(Debug, Clone)]
 pub enum EngineError {
     Generic,
+    MissingSession,
     UnknownSession,
     SessionAlreadyClosed,
     InvalidPollRequest,
     SessionUnresponsive,
+    
 }
 
 impl fmt::Display for EngineError {
@@ -60,7 +62,7 @@ impl fmt::Display for EngineError {
 impl fmt::Display for EngineOutput {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Pending(t) => write!(f, "wait {}", t.as_millis() ),
+            Self::Pending(t,..) => write!(f, "wait {}", t.as_millis() ),
             Self::Data(Participant::Server,d) => write!(f, "data - Server emit"),
             Self::Data(Participant::Client,d) => write!(f, "data - Client Recv"),
             Self::Closed(e) => write!(f, "close")
@@ -73,9 +75,9 @@ impl fmt::Display for EngineInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let output = match self {
             Self::NOP => "NOP",
-            Self::Poll => "POLL",
+            Self::Poll(..) => "POLL",
             Self::Error => "ERR",
-            Self::Listen => "LISTEN",
+            Self::Listen(..) => "LISTEN",
             Self::New(..) => "NEW",
             Self::Data(p,d) => "DATA",
             Self::Close(..) => "CLOSE",

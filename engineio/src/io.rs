@@ -50,18 +50,28 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
 
             let engine = match (&input, engines.get_mut(&sid)) {
                 (EngineInput::New(..), None) => {
-                    let e = Engine::new();
+                    let e = Engine::new(sid);
                     engines.insert(sid,e);
                     Ok(engines.get_mut(&sid).unwrap())
                 },
+
                 (EngineInput::New(..), Some(..)) => Err(EngineError::UnknownSession),
-                (EngineInput::Listen, Some(engine)) => {
-                    server_recv.insert(sid, output.clone().unwrap());
+
+                (EngineInput::Listen(participant), Some(engine)) => {
+                    match participant {
+                        Participant::Client => client_recv.insert(sid, output.clone().unwrap()),
+                        Participant::Server => server_recv.insert(sid, output.clone().unwrap()),
+                    };
                     Ok(engine)
                 }
+
                 (_, None) => Err(EngineError::UnknownSession),
+
                 (_, Some(engine)) => Ok(engine)
             };
+
+            dbg!(sid);
+            dbg!("{}",engine.is_ok());
 
             match engine {
                 Ok(engine) => {
@@ -70,33 +80,41 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                         let out = engine.poll_output();
                         dbg!(&out);
                         match out {
-                            EngineOutput::Pending(duration) => break Some(duration),
+                            EngineOutput::Pending(duration,id) => break Some((duration,id)),
                             EngineOutput::Data(Participant::Client,p) => { 
-                                // TODO: UNWRAP 
-                                let tx = server_recv.get(&sid).unwrap();
-                                let _ = tx.send(p).await;
+                                let t = vec![output.as_ref(), server_recv.get(&sid)];
+                                for tx in t.into_iter().filter_map(|a| a) {
+                                    tx.send(p.clone()).await;
+                                }
                                 dbg!();
                             },
                             EngineOutput::Data(Participant::Server,p) => {
                                 // TODO: UNWRAP 
-                                let tx = output.clone().unwrap();
-                                let _ = tx.send(p).await;
+                                let t = vec![output.as_ref(), client_recv.get(&sid)];
+                                for tx in t.into_iter().filter_map(|a| a) {
+                                    tx.send(p.clone()).await;
+                                }
                                 dbg!();
                             },
                             EngineOutput::Closed(..) => break None
                         }
                     };
                     dbg!();
-                    if let Some(wait) = wait {
+                    if let Some((wait,id)) = wait {
                         let tx = time_tx.clone();
                         tokio::spawn( async move {
                             tokio::time::sleep(wait).await; 
-                            let _ = tx.send((sid,EngineInput::NOP, None)).await;
+                            if let Some(polling_id) = id {
+                                let _ = tx.send((sid, EngineInput::Poll(polling_id),output)).await;
+                            }
+                            else {
+                                let _ = tx.send((sid,EngineInput::NOP, output)).await;
+                            }
                         });
                     }
                 },
                 Err(e) => {
-
+                    dbg!(e);
                 }
             }
         }
@@ -129,18 +147,11 @@ impl AsyncSessionIOHandle {
         return tokio_stream::wrappers::ReceiverStream::new(rx);
     }
 
-    pub async fn listen(&self, id:Sid) -> impl Stream<Item=Payload> {
+    pub async fn listen(&self, id:Sid, filter:Participant) -> impl Stream<Item=Payload> {
         dbg!();
         let (tx,rx) = tokio::sync::mpsc::channel::<Payload>(10);
-        let _ = self.client_send_tx.send((id, EngineInput::Listen, Some(tx))).await;
+        let _ = self.client_send_tx.send((id, EngineInput::Listen(filter), Some(tx))).await;
         return tokio_stream::wrappers::ReceiverStream::new(rx);
-    }
-
-    pub async fn client_poll(&self, id:Sid) -> impl Stream<Item=Payload> {
-        let (tx,rx) = tokio::sync::mpsc::channel::<Payload>(10);
-        let _ = self.client_send_tx.send((id, EngineInput::Poll, Some(tx))).await;
-        return tokio_stream::wrappers::ReceiverStream::new(rx);
-
     }
 
     pub async fn client_send(&self, id:Sid, payload:Payload) {

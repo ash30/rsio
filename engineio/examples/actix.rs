@@ -11,6 +11,7 @@ impl NewConnectionService for NewConnectionManager {
         actix_rt::spawn(async move {
             pin_mut!(stream);
             while let Some(engineio::Payload::Message(v)) = stream.next().await {
+                dbg!();
                 let _ = emit.send(engineio::Payload::Message(v)).await;
             }
         });

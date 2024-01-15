@@ -7,7 +7,6 @@ use actix_ws::Message;
 use crate::{EngineOutput, async_session_io_create, EngineInput};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
-use super::common::LongPollRouter;
 pub use super::common::{ NewConnectionService, Emitter };
 
 impl From<actix_ws::Message> for WebsocketEvent {
@@ -34,6 +33,7 @@ impl actix_web::ResponseError for EngineError{
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
             EngineError::Generic => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            EngineError::MissingSession => actix_web::http::StatusCode::BAD_REQUEST,
             _ => actix_web::http::StatusCode::NOT_FOUND
         }
     }
@@ -91,14 +91,14 @@ where F: NewConnectionService + 'static
                 async move {
                     let sid = uuid::Uuid::new_v4();
                     let mut res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
-                    let server_events_stream = io.listen(sid).await;
-                    let mut to_send = io.client_poll(sid).await;
+                    let server_events_stream = io.listen(sid, Participant::Server).await;
+                    let mut to_send = io.listen(sid, Participant::Client).await;
 
-               // <F as NewConnectionService>::new_connection(
-               //     &client,
-               //     tokio_stream::wrappers::BroadcastStream::new(client_rx),
-               //     Emitter { tx: server_tx }
-               // );
+                   <F as NewConnectionService>::new_connection(
+                       &client,
+                       server_events_stream,
+                        crate::io::AsyncSessionIOSender::new(sid,io.clone())
+                   );
 
                     actix_rt::spawn(async move {
                         loop {
@@ -126,13 +126,15 @@ where F: NewConnectionService + 'static
                                         },
                                         _ => break
                                     };
-                                    io.client_send(sid, payload);
+                                    io.client_send(sid, payload).await;
                                 }
 
                                 engress = to_send.next() => {
                                     match engress {
-                                        _ => {}
-                                    }
+                                        Some(Payload::Message(d)) => session.text(String::from_utf8(d).unwrap()).await,
+                                        _ => Ok(())
+                                        
+                                    };
                                 }
                             }
                         }
@@ -146,7 +148,6 @@ where F: NewConnectionService + 'static
             )
         )
     };
-    let longpoll = Arc::new(LongPollRouter::new());
 
     // LONG POLL GET 
     let path = { 
@@ -162,8 +163,9 @@ where F: NewConnectionService + 'static
                 let io = io.clone();
                 async move {
                     let sid = session.sid.ok_or(EngineError::UnknownSession)?;
-                    dbg!();
-                    let res:Vec<Payload> = io.client_poll(sid).await.collect().await;
+                    dbg!(&sid);
+                    let res = io.input(sid, EngineInput::Poll(uuid::Uuid::new_v4())).await.collect::<Vec<Payload>>().await;
+            
                     dbg!();
                     let res_size = res.len();
                     let seperator = b"\x1e";
@@ -194,12 +196,13 @@ where F: NewConnectionService + 'static
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
-                    let server_events_stream = io.listen(sid).await;
+                    let res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
+                    let server_events_stream = io.listen(sid, Participant::Server).await;
 
                     // GET 
                     let res_stream = res.map(
                         move |p| {
+                            dbg!(sid.clone());
                             let b = p.as_bytes(sid.clone());
                             dbg!(&b);
                             Ok::<Bytes, actix_web::Error>(Bytes::from(b))
@@ -226,7 +229,7 @@ where F: NewConnectionService + 'static
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
                 let io = io.clone();
                 async move { 
-                    let sid = session.sid.ok_or(EngineError::UnknownSession)?;
+                    let sid = session.sid.ok_or(EngineError::MissingSession)?;
 
                     let mut buf = vec![];
                     let mut start = 0;
@@ -243,13 +246,23 @@ where F: NewConnectionService + 'static
 
                     for msg in buf.iter().filter(|v| v[0] == b"4"[0] ) {
                         let p = Payload::Message((**msg)[1..].to_vec());
-                        io.client_send(sid, p);
+                        io.client_send(sid, p).await;
                     }
                     // TODO: Test suite assumes an "ok" returned in response... 
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))
                 }
             }
             )
+        )
+    };
+    
+    // Catch all - to appease clients expecting 400 not 404
+    let path = {
+        path.route(
+            web::route()
+            .to(move |session: web::Query<SessionInfo>| {
+                HttpResponse::BadRequest()
+            })
         )
     };
     return path

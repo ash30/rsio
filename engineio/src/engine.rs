@@ -11,7 +11,7 @@ pub enum Participant {
 #[derive(Debug)]
 pub enum PollingState {
     Inactive {lastPoll:Option<Instant>},
-    Active {start:Instant, duration:Duration},
+    Active {id: uuid::Uuid, start:Instant, duration:Duration},
     Continuous
 }
 
@@ -32,9 +32,9 @@ pub struct Engine  {
 
 impl Engine  
 { 
-    pub fn new() -> Self {
+    pub fn new(sid:Sid) -> Self {
         return Self { 
-            session: uuid::Uuid::new_v4(),
+            session: sid,
             output: VecDeque::new(),
             poll_buffer: VecDeque::new(),
             transport: TransportState::New,
@@ -47,24 +47,17 @@ impl Engine
     pub fn poll_output(&mut self) -> EngineOutput { 
         return if let Some(p) = self.output.pop_front() { p } 
         else {
-            let duration = match self.polling {
-                PollingState::Active { start, duration } => duration, 
-                PollingState::Inactive { lastPoll } => self.poll_timeout,
-                PollingState::Continuous => std::time::Duration::from_secs(60*60)
+            let (duration, poll_id) = match self.polling {
+                PollingState::Active { id, start, duration } => (duration, Some(id)), 
+                PollingState::Inactive { lastPoll } => (self.poll_timeout, None),
+                PollingState::Continuous => (std::time::Duration::from_secs(60*60), None)
             };
-            EngineOutput::Pending(duration)
+            EngineOutput::Pending(duration, poll_id )
         }
     }
     
     pub fn consume(&mut self, data:EngineInput, now:Instant) {
         match self.polling {
-            PollingState::Active { start, duration } => {
-                if now > (start + duration) {
-                    self.polling = PollingState::Inactive { lastPoll: Some(now) };
-                    self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-                    self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Noop))
-                }
-            },
             PollingState::Inactive { lastPoll:Some(last) } => {
                 if now > (last + self.poll_timeout) {
                     self.output.push_back(EngineOutput::Closed(None));
@@ -101,6 +94,7 @@ impl Engine
                     "pingTimeout": config.ping_timeout,
                     "sid":  self.session
                 });
+                
                 self.output.push_back(
                     EngineOutput::Data(
                         Participant::Server, Payload::Open(serde_json::to_vec(&data).unwrap())
@@ -123,20 +117,34 @@ impl Engine
             },
 
             // PollingState
-            (EngineInput::Poll, _, PollingState::Inactive { .. }) => {
+            (EngineInput::Poll(id), _, PollingState::Inactive { .. }) => {
                 // FLUSH buffer else starting polling
                 if self.poll_buffer.len() > 0 {
                    self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                    self.polling = PollingState::Inactive { lastPoll: Some(now) }
                 }
                 else {
-                    self.polling = PollingState::Active { start: now, duration: self.poll_duration };
+                    self.polling = PollingState::Active { id, start: now, duration: self.poll_duration };
                 }
             },
             
-            (EngineInput::Poll, _, _) => {
-                self.transport = TransportState::Closed;
-                self.output.push_back(EngineOutput::Closed(Some(EngineError::InvalidPollRequest)))
+            // ERROR If we receive another poll request wwhilst active and IDs don't match!!
+            (EngineInput::Poll(_id), _, PollingState::Active { id, start, duration }) => {
+                if _id != *id {
+                    self.transport = TransportState::Closed;
+                    self.output.push_back(EngineOutput::Closed(Some(EngineError::InvalidPollRequest)))
+                }
+                else {
+                    if now > (*start + *duration) {
+                        self.polling = PollingState::Inactive { lastPoll: Some(now) };
+                        self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
+                    }
+                }
+            },
+
+            (EngineInput::Poll(..), _, PollingState::Continuous) => {
+                self.polling = PollingState::Inactive { lastPoll: Some(now) };
+                self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
             },
 
             // Payloads
@@ -162,17 +170,17 @@ impl Engine
             (EngineInput::Data(Participant::Server, p),_,PollingState::Inactive { .. }) => {
                     self.poll_buffer.push_back(EngineOutput::Data(Participant::Server, p));
             }
-            (EngineInput::Data(Participant::Server, p),_,PollingState::Active { start, duration }) => {
+            (EngineInput::Data(Participant::Server, p),_,PollingState::Active { id, start, duration }) => {
                     self.poll_buffer.push_back(EngineOutput::Data(Participant::Server, p));
-                    self.polling = PollingState::Active { start: *start, duration: *duration.min(&Duration::from_secs(1)) }
+                    self.polling = PollingState::Active { id:*id, start: *start, duration: *duration.min(&Duration::from_secs(1)) }
             }
-
+            
             // NOP
             (EngineInput::NOP, _, _) => {
 
             },
 
-            (EngineInput::Listen, _, _ ) => {}
+            (EngineInput::Listen(..), _, _ ) => {}
 
         }
     }
