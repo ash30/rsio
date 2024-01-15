@@ -4,6 +4,7 @@ use std::time::Duration;
 use std::u8;
 
 use crate::Participant;
+use crate::PollingState;
 
 
 pub type Sid = uuid::Uuid;
@@ -15,16 +16,25 @@ pub enum TransportState {
     Closed
 }
 
+#[derive(Debug)]
 pub enum EngineInput {
-    New(Option<TransportConfig>),
+    New(Option<TransportConfig>, EngineKind),
     Close(Participant),
     Data(Participant, Payload),
     Poll,
+    Listen,
     Error,
     NOP
 }
 
+#[derive(Debug)]
+pub enum EngineKind {
+    Poll,
+    Continuous
+}
 
+
+#[derive(Debug)]
 pub enum EngineOutput {
     Pending(Duration),
     Data(Participant, Payload),
@@ -65,6 +75,7 @@ impl fmt::Display for EngineInput {
             Self::NOP => "NOP",
             Self::Poll => "POLL",
             Self::Error => "ERR",
+            Self::Listen => "LISTEN",
             Self::New(..) => "NEW",
             Self::Data(p,d) => "DATA",
             Self::Close(..) => "CLOSE",
@@ -76,7 +87,7 @@ impl fmt::Display for EngineInput {
 use serde::{Deserialize, Serialize};
 
 
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub enum Payload {
     Open(Vec<u8>),
     Close(Option<EngineError>),
@@ -108,7 +119,7 @@ impl Payload{
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct TransportConfig { 
     pub ping_interval: u32,
     pub ping_timeout: u32,

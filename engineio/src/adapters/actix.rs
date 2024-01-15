@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use actix_web::web::Bytes;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::Message;
 
-use crate::{EngineOutput, async_session_io_create};
+use crate::{EngineOutput, async_session_io_create, EngineInput};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 use super::common::LongPollRouter;
@@ -89,7 +90,8 @@ where F: NewConnectionService + 'static
 
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let server_events_stream = io.new(sid).await;
+                    let mut res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
+                    let server_events_stream = io.listen(sid).await;
                     let mut to_send = io.client_poll(sid).await;
 
                // <F as NewConnectionService>::new_connection(
@@ -101,6 +103,12 @@ where F: NewConnectionService + 'static
                     actix_rt::spawn(async move {
                         loop {
                             tokio::select! {
+                                Some(start) = res.next() => {
+                                    dbg!();
+                                    let p = start.as_bytes(sid);
+                                    session.text(String::from_utf8(p).unwrap()).await;
+                                },
+
                                 ingress = msg_stream.next() => {
                                     let payload = match ingress {
                                         Some(Ok(m)) => {
@@ -130,6 +138,8 @@ where F: NewConnectionService + 'static
                         }
                         let _ = session.close(None).await;
                     });
+
+
                     response
                 }
             }
@@ -184,13 +194,24 @@ where F: NewConnectionService + 'static
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let server_events_stream = io.new(sid).await;
+                    let mut res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
+                    let server_events_stream = io.listen(sid).await;
+
+                    // GET 
+                    let res_stream = res.map(
+                        move |p| {
+                            let b = p.as_bytes(sid.clone());
+                            dbg!(&b);
+                            Ok::<Bytes, actix_web::Error>(Bytes::from(b))
+                        }
+                    )
+                    .take(1);
                     <F as NewConnectionService>::new_connection(
                         &client,
                         server_events_stream,
                         crate::io::AsyncSessionIOSender::new(sid,io)
                     );
-                    Ok::<actix_web::web::Bytes, EngineError>(web::Bytes::from(vec![]))
+                    HttpResponse::Ok().streaming(res_stream)
                 }
             }
             )

@@ -1,10 +1,14 @@
 use std::{collections::VecDeque, u8, time::{Instant, Duration}};
 pub use crate::proto::*;
 
+
+#[derive(Debug)]
 pub enum Participant {
     Client,
     Server
 } 
+
+#[derive(Debug)]
 pub enum PollingState {
     Inactive {lastPoll:Option<Instant>},
     Active {start:Instant, duration:Duration},
@@ -76,12 +80,16 @@ impl Engine
                 // Should we return some sort of result here??
             },
 
-            (EngineInput::New(config),TransportState::New, _) => {
+            (EngineInput::New(config, kind),TransportState::New, _) => {
                 let config = config.unwrap_or(TransportConfig::default());
             
                 // Update timeouts
                 self.poll_timeout = Duration::from_millis(config.ping_timeout.into());
                 self.poll_duration = Duration::from_millis(config.ping_interval.into());
+                self.polling = match kind {
+                    EngineKind::Continuous => PollingState::Continuous,
+                    EngineKind::Poll => PollingState::Inactive { lastPoll: Some(now) }
+                };
 
                 println!("interval: {}", self.poll_duration.as_millis());
 
@@ -137,11 +145,17 @@ impl Engine
                 self.output.push_back(EngineOutput::Closed(None));
             },
 
+            (EngineInput::Data(Participant::Client, Payload::Upgrade), _, _) => {
+                self.polling = PollingState::Continuous;
+            },
+
             (EngineInput::Data(Participant::Client, p),_,_) => {
                 self.output.push_back(EngineOutput::Data(Participant::Client, p));
-            }
+            },
 
             // Buffer server emitted events depending on polling state
+            
+             
             (EngineInput::Data(Participant::Server, p),_,PollingState::Continuous) => {
                     self.output.push_back(EngineOutput::Data(Participant::Server, p));
             }
@@ -157,6 +171,8 @@ impl Engine
             (EngineInput::NOP, _, _) => {
 
             },
+
+            (EngineInput::Listen, _, _ ) => {}
 
         }
     }
