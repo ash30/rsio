@@ -1,15 +1,11 @@
 use std::sync::Arc;
 use tokio_stream::StreamExt;
-use serde_json::json;
 use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::Message;
-use tokio::sync::broadcast::error::RecvError;
 
-use crate::EngineOutput;
+use crate::{EngineOutput, async_session_io_create};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
-use crate::io::create_session_async;
 use crate::proto::EngineError;
-use crate::proto::EngineInput;
 use super::common::LongPollRouter;
 pub use super::common::{ NewConnectionService, Emitter };
 
@@ -74,10 +70,12 @@ pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: 
 where F: NewConnectionService + 'static
 {
     let client = Arc::new(callback);
+    let io = async_session_io_create();
 
     // WS 
     let path = {
         let client = client.clone();
+        let io = io.clone();
         path.route(
             web::route()
             .guard(guard::Get())
@@ -86,102 +84,52 @@ where F: NewConnectionService + 'static
             }))
             .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
                 let client = client.clone();
+                let io = io.clone();
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
 
-                let mut engine = crate::engine::Engine::new();
-                engine.consume(EngineInput::New(Some(TransportConfig::default())), std::time::Instant::now());
+                async move {
+                    let sid = uuid::Uuid::new_v4();
+                    let server_events_stream = io.new(sid).await;
+                    let mut to_send = io.client_poll(sid).await;
 
-                let (sid,io) = create_session_async(engine);
-                let (client_tx, client_rx) = io.0; 
-                let (server_tx, mut server_rx) = io.1;
+               // <F as NewConnectionService>::new_connection(
+               //     &client,
+               //     tokio_stream::wrappers::BroadcastStream::new(client_rx),
+               //     Emitter { tx: server_tx }
+               // );
 
-                actix_rt::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            ingress = msg_stream.next() => {
-                                let payload = match ingress {
-                                    Some(Ok(m)) => {
-                                        match m {
-                                            Message::Ping(bytes) => Payload::Ping,
-                                            Message::Pong(bytes) => Payload::Pong,
-                                            // TODO: 
-                                            Message::Text(s) => Payload::Message(s.to_string().as_bytes().to_vec()),
-                                            Message::Binary(bytes) => Payload::Message(bytes.to_vec()),
-                                            Message::Close(bytes) => break,
-                                            Message::Continuation(bytes) => Payload::Ping,
-                                            Message::Nop =>  Payload::Ping,
-                                            _ => break,
-                                        }
-                                    },
-                                    _ => break
-                                };
-
-                                if let Err(_e) = client_tx.send(EngineInput::Data(Participant::Client,payload)).await {
-                                    break
+                    actix_rt::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                ingress = msg_stream.next() => {
+                                    let payload = match ingress {
+                                        Some(Ok(m)) => {
+                                            match m {
+                                                Message::Ping(bytes) => Payload::Ping,
+                                                Message::Pong(bytes) => Payload::Pong,
+                                                // TODO: 
+                                                Message::Text(s) => Payload::Message(s.to_string().as_bytes().to_vec()),
+                                                Message::Binary(bytes) => Payload::Message(bytes.to_vec()),
+                                                Message::Close(bytes) => break,
+                                                Message::Continuation(bytes) => Payload::Ping,
+                                                Message::Nop =>  Payload::Ping,
+                                                _ => break,
+                                            }
+                                        },
+                                        _ => break
+                                    };
+                                    io.client_send(sid, payload);
                                 }
-                            }
 
-                            engress = server_rx.recv() => {
-                                match engress {
-                                    Ok(Payload::Close(..)) => {
-                                        break
-                                    },
-
-                                    Ok(Payload::Message(p)) => {
-                                        session.text(std::str::from_utf8(&p).unwrap()).await;
-                                    },
-
-                                    Ok(Payload::Ping) => {
-                                        session.ping(b"").await;
-                                    },
-
-                                    Ok(Payload::Pong) => {
-                                        session.pong(b"").await;
-                                    },
-
-                                    Ok(Payload::Open(data)) => {
-                                        // TODO:
-                                    },
-
-                                    Ok(Payload::Noop) => {
-                                    },
-
-                                    Ok(Payload::Upgrade) => {
-
-                                    },
-
-                                    Err(RecvError::Closed) => {
-
-                                    },
-
-                                    Err(RecvError::Lagged(_)) => {
-
+                                engress = to_send.next() => {
+                                    match engress {
+                                        _ => {}
                                     }
                                 }
                             }
                         }
-                    }
-                    let _ = session.close(None).await;
-                    drop(server_rx);
-                    drop(client_tx);
-                });
-
-                <F as NewConnectionService>::new_connection(
-                    &client,
-                    tokio_stream::wrappers::BroadcastStream::new(client_rx),
-                    Emitter { tx: server_tx }
-                );
-
-                let config = TransportConfig::default();
-                async move { 
-                    let res = json!({
-                      "sid": sid,
-                      "upgrades": ["websocket"],
-                      "pingInterval": config.ping_interval,
-                      "pingTimeout": config.ping_timeout,
-                      "maxPayload": config.max_payload
+                        let _ = session.close(None).await;
                     });
-                    
                     response
                 }
             }
@@ -192,7 +140,7 @@ where F: NewConnectionService + 'static
 
     // LONG POLL GET 
     let path = { 
-        let router = longpoll.clone();
+        let io = io.clone();
         path.route(
             web::route()
             .guard(guard::Get())
@@ -200,10 +148,13 @@ where F: NewConnectionService + 'static
                 ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
             }))
             .to(move |session: web::Query<SessionInfo>| { 
-                let router = router.clone();
+                dbg!();
+                let io = io.clone();
                 async move {
                     let sid = session.sid.ok_or(EngineError::UnknownSession)?;
-                    let res = router.poll(session.sid).await?;
+                    dbg!();
+                    let res:Vec<Payload> = io.client_poll(sid).await.collect().await;
+                    dbg!();
                     let res_size = res.len();
                     let seperator = b"\x1e";
 
@@ -221,45 +172,25 @@ where F: NewConnectionService + 'static
     };
 
     let path = {
-        let router = longpoll.clone();
+        let io = io.clone();
         let client = client.clone();
         let config = config.clone();
         path.route(
             web::route()
             .guard(guard::Get())
             .to(move |session: web::Query<SessionInfo>| { 
-                let router = router.clone();
+                let io = io.clone();
                 let client = client.clone();
                 let config = config.clone();
                 async move {
-                    let mut engine = crate::engine::Engine::new();
-                    engine.consume(EngineInput::New(Some(config)), std::time::Instant::now());
-
-                    let res = loop {
-                        match engine.poll_output() {
-                            EngineOutput::Data(Participant::Server, payload) => {
-                                if let Payload::Open(..) = payload { break Some(payload) } 
-                            }
-                            _ => {}
-                        };
-                        break None;
-                    }.ok_or(EngineError::Generic)?;
-
-                    let (sid,io) = create_session_async(engine);
-                    let (client_tx, client_rx) = io.0; 
-                    let (server_tx, server_rx) = io.1;
-
-                    router.writers.insert(sid, client_tx);
-                    router.readers.insert(sid, server_rx.into());
-
+                    let sid = uuid::Uuid::new_v4();
+                    let server_events_stream = io.new(sid).await;
                     <F as NewConnectionService>::new_connection(
                         &client,
-                        tokio_stream::wrappers::BroadcastStream::new(client_rx),
-                        Emitter { tx: server_tx }
-
-
+                        server_events_stream,
+                        crate::io::AsyncSessionIOSender::new(sid,io)
                     );
-                    Ok::<actix_web::web::Bytes, EngineError>(web::Bytes::from(res.as_bytes(sid)))
+                    Ok::<actix_web::web::Bytes, EngineError>(web::Bytes::from(vec![]))
                 }
             }
             )
@@ -267,14 +198,32 @@ where F: NewConnectionService + 'static
     };
 
     let path = { 
-        let router = longpoll.clone();
+        let io = io.clone();
         path.route(
             web::route()
             .guard(guard::Post())
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
-                let router = router.clone();
+                let io = io.clone();
                 async move { 
-                    router.post(session.sid, body.into()).await?;
+                    let sid = session.sid.ok_or(EngineError::UnknownSession)?;
+
+                    let mut buf = vec![];
+                    let mut start = 0;
+                    let mut iter = body.iter().enumerate();
+                    while let Some(d) = iter.next() {
+                        let (n,data) = d;
+                        if *data == b"\x1e"[0] {
+                            buf.push(&body[start..n]);
+                            start = n+1;
+                            println!("test1b");
+                        }
+                    }
+                     buf.push(&body[start..body.len()]);
+
+                    for msg in buf.iter().filter(|v| v[0] == b"4"[0] ) {
+                        let p = Payload::Message((**msg)[1..].to_vec());
+                        io.client_send(sid, p);
+                    }
                     // TODO: Test suite assumes an "ok" returned in response... 
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))
                 }

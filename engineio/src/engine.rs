@@ -34,7 +34,7 @@ impl Engine
             output: VecDeque::new(),
             poll_buffer: VecDeque::new(),
             transport: TransportState::New,
-            polling: PollingState::Inactive { lastPoll: None },
+            polling: PollingState::Inactive { lastPoll: Some(Instant::now()) },
             poll_timeout: Duration::from_secs(30*10),
             poll_duration: Duration::from_secs(30),
         }
@@ -82,6 +82,8 @@ impl Engine
                 // Update timeouts
                 self.poll_timeout = Duration::from_millis(config.ping_timeout.into());
                 self.poll_duration = Duration::from_millis(config.ping_interval.into());
+
+                println!("interval: {}", self.poll_duration.as_millis());
 
                 let upgrades = if let PollingState::Continuous = self.polling { vec![] } else { vec!["websocket"] };
                 let data = serde_json::json!({

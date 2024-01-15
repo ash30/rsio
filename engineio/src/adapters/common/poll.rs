@@ -32,12 +32,14 @@ impl LongPollRouter {
         let res = session_tx.send(EngineInput::Poll).await;
         let mut body = vec![];
         loop {
+            println!("foo");
             match session_rx.recv().await {
                 Err(..) => break,
                 Ok(Payload::Noop) => break,
                 Ok(p) => {body.push(p);}
             };
         }
+            println!("foo2");
         return Ok(body);
     }
 

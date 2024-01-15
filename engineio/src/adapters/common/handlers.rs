@@ -5,5 +5,5 @@ use crate::Payload;
 use super::emitter::Emitter;
 
 pub trait NewConnectionService {
-    fn new_connection<S:Stream<Item=Result<Payload,BroadcastStreamRecvError>> + 'static>(&self, stream:S, emit:Emitter);
+    fn new_connection<S:Stream<Item=Payload>+ 'static>(&self, stream:S, emit:Emitter);
 }
