@@ -63,9 +63,9 @@ impl Engine
     }
     
     pub fn consume(&mut self, data:EngineInput, now:Instant) {
-        match self.polling {
-            PollingState::Inactive { lastPoll:Some(last) } => {
-                if now > (last + self.poll_timeout) {
+        match (&self.transport, &self.polling) {
+            (TransportState::Connected, PollingState::Inactive { lastPoll:Some(last) }) => {
+                if now > (*last + self.poll_timeout) {
                     self.transport = TransportState::Closed;
                     self.output.push_back(EngineOutput::Closed(None));
                 }
@@ -90,6 +90,7 @@ impl Engine
                     EngineKind::Continuous => PollingState::Continuous,
                     EngineKind::Poll => PollingState::Inactive { lastPoll: Some(now) }
                 };
+                self.transport = TransportState::Connected;
 
                 println!("interval: {}", self.poll_duration.as_millis());
 

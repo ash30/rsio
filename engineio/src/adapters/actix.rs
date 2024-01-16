@@ -2,7 +2,7 @@ use std::sync::Arc;
 use actix_web::web::Bytes;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
-use actix_ws::Message;
+use actix_ws::{Message, CloseReason};
 
 use crate::{EngineOutput, async_session_io_create, EngineInput};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
@@ -91,8 +91,8 @@ where F: NewConnectionService + 'static
                 async move {
                     let sid = uuid::Uuid::new_v4();
                     let mut res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
-                    let server_events_stream = io.listen(sid, Participant::Server).await;
-                    let mut to_send = io.listen(sid, Participant::Client).await;
+                    let server_events_stream = io.input(sid, EngineInput::Listen(Participant::Server)).await;
+                    let mut to_send = io.input(sid, EngineInput::Listen(Participant::Client)).await;
 
                    <F as NewConnectionService>::new_connection(
                        &client,
@@ -103,7 +103,7 @@ where F: NewConnectionService + 'static
                     actix_rt::spawn(async move {
                         loop {
                             tokio::select! {
-                                Some(start) = res.next() => {
+                                Some(Ok(start)) = res.next() => {
                                     dbg!();
                                     let p = start.as_bytes(sid);
                                     session.text(String::from_utf8(p).unwrap()).await;
@@ -121,17 +121,17 @@ where F: NewConnectionService + 'static
                                                 Message::Close(bytes) => break,
                                                 Message::Continuation(bytes) => Payload::Ping,
                                                 Message::Nop =>  Payload::Ping,
-                                                _ => break,
                                             }
                                         },
                                         _ => break
                                     };
-                                    io.client_send(sid, payload).await;
+                                    io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
                                 }
 
                                 engress = to_send.next() => {
                                     match engress {
-                                        Some(Payload::Message(d)) => session.text(String::from_utf8(d).unwrap()).await,
+                                        Some(Ok(Payload::Message(d))) => session.text(String::from_utf8(d).unwrap()).await,
+                                        Some(Err(e)) => { break},
                                         _ => Ok(())
                                         
                                     };
@@ -164,20 +164,31 @@ where F: NewConnectionService + 'static
                 async move {
                     let sid = session.sid.ok_or(EngineError::UnknownSession)?;
                     dbg!(&sid);
-                    let res = io.input(sid, EngineInput::Poll(uuid::Uuid::new_v4())).await.collect::<Vec<Payload>>().await;
-            
-                    dbg!();
-                    let res_size = res.len();
-                    let seperator = b"\x1e";
+                    let res = io.input(sid, EngineInput::Poll(uuid::Uuid::new_v4())).await.collect::<Vec<Result<Payload,EngineError>>>().await;
 
-                    let combined = res.iter()
-                        .map(|p| p.as_bytes(sid))
-                        .enumerate()
-                        .map(|(n,b)| if res_size > 1 && n < res_size - 1{ vec![b,seperator.to_vec()].concat() } else { b } )
-                        .flat_map(|a| a )
-                        .collect();
-                        
-                    Ok::<Vec<u8>,EngineError>(combined)
+                    // We have to inspect the streams first element to determine response status...
+                    // can we do better?
+                    let r: Result<Vec<u8>, EngineError>  = match res.last() {
+                        None => Ok(vec![]),
+                        Some(Ok(..)) => {
+                            let res_size = res.len();
+                            let seperator = b"\x1e";
+
+                            let combined = res.into_iter()
+                                .filter_map(|a|a.ok())
+                                .map(|p| p.as_bytes(sid))
+                                .enumerate()
+                                .map(|(n,b)| if res_size > 1 && n < res_size - 1{ vec![b,seperator.to_vec()].concat() } else { b } )
+                                .flat_map(|a| a )
+                                .collect();
+
+                            Ok(combined)
+                        },
+                        Some(Err(e)) => Err(e.clone())
+                    };
+
+
+                    return r
                 }
             })
         )
@@ -196,25 +207,26 @@ where F: NewConnectionService + 'static
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
+                    let server_events_stream = io.input(sid, EngineInput::Listen(Participant::Server)).await;
                     let res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
-                    let server_events_stream = io.listen(sid, Participant::Server).await;
 
                     // GET 
-                    let res_stream = res.map(
-                        move |p| {
-                            dbg!(sid.clone());
-                            let b = p.as_bytes(sid.clone());
-                            dbg!(&b);
-                            Ok::<Bytes, actix_web::Error>(Bytes::from(b))
-                        }
-                    )
-                    .take(1);
+                    //
                     <F as NewConnectionService>::new_connection(
                         &client,
                         server_events_stream,
                         crate::io::AsyncSessionIOSender::new(sid,io)
                     );
-                    HttpResponse::Ok().streaming(res_stream)
+
+                    let r = res.collect::<Vec<Result<Payload,EngineError>>>().await;
+                
+                    // TODO: WHY DOES LAST ERORR ?
+                    match r.first() {
+                        None => HttpResponse::InternalServerError().body(vec![]),
+                        Some(Ok(p)) => HttpResponse::Ok().body(p.as_bytes(sid.clone())),
+                        Some(Err(e)) => HttpResponse::BadRequest().body(vec![])
+                    }
+
                 }
             }
             )
@@ -246,7 +258,7 @@ where F: NewConnectionService + 'static
 
                     for msg in buf.iter().filter(|v| v[0] == b"4"[0] ) {
                         let p = Payload::Message((**msg)[1..].to_vec());
-                        io.client_send(sid, p).await;
+                        io.input(sid, EngineInput::Data(Participant::Client, p)).await;
                     }
                     // TODO: Test suite assumes an "ok" returned in response... 
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))

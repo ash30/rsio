@@ -7,10 +7,10 @@ use futures_util::pin_mut;
 
 struct NewConnectionManager {}
 impl NewConnectionService for NewConnectionManager {
-    fn new_connection<S:Stream<Item=engineio::Payload> + 'static>(&self, stream:S, emit:Emitter) {
+    fn new_connection<S:Stream<Item=Result<engineio::Payload,engineio::EngineError>> + 'static>(&self, stream:S, emit:Emitter) {
         actix_rt::spawn(async move {
             pin_mut!(stream);
-            while let Some(engineio::Payload::Message(v)) = stream.next().await {
+            while let Some(Ok(engineio::Payload::Message(v))) = stream.next().await {
                 dbg!();
                 let _ = emit.send(engineio::Payload::Message(v)).await;
             }
