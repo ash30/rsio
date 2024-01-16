@@ -4,7 +4,7 @@ use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::{Message, CloseReason};
 
-use crate::{EngineOutput, async_session_io_create, EngineInput};
+use crate::{EngineOutput, async_session_io_create, EngineInput, session_collect};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
@@ -32,6 +32,7 @@ struct SessionInfo {
 impl actix_web::ResponseError for EngineError{
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
+            EngineError::InvalidPollRequest => actix_web::http::StatusCode::BAD_REQUEST,
             EngineError::Generic => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             EngineError::MissingSession => actix_web::http::StatusCode::BAD_REQUEST,
             _ => actix_web::http::StatusCode::NOT_FOUND
@@ -162,33 +163,33 @@ where F: NewConnectionService + 'static
                 dbg!();
                 let io = io.clone();
                 async move {
-                    let sid = session.sid.ok_or(EngineError::UnknownSession)?;
-                    dbg!(&sid);
-                    let res = io.input(sid, EngineInput::Poll(uuid::Uuid::new_v4())).await.collect::<Vec<Result<Payload,EngineError>>>().await;
+                    if let Some(sid) = session.sid {
+                        let res = io.input(sid, EngineInput::Poll(uuid::Uuid::new_v4())).await;
+                        let (all, reason) = session_collect(res).await;
+                        let mut response = if let Some(e) = reason {
+                            match e {
+                                EngineError::InvalidPollRequest => HttpResponse::BadRequest(),
+                                EngineError::UnknownSession=> HttpResponse::BadRequest(),
+                                _ => HttpResponse::InternalServerError(),
+                            }
+                        }
+                        else { HttpResponse::Ok() };
 
-                    // We have to inspect the streams first element to determine response status...
-                    // can we do better?
-                    let r: Result<Vec<u8>, EngineError>  = match res.last() {
-                        None => Ok(vec![]),
-                        Some(Ok(..)) => {
-                            let res_size = res.len();
-                            let seperator = b"\x1e";
+                        let res_size = all.len();
+                        let seperator = b"\x1e";
+                        let combined: Vec<u8> = all.into_iter()
+                            .map(|p| p.as_bytes(sid))
+                            .enumerate()
+                            .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
+                            .flat_map(|a| a )
+                            .collect();
 
-                            let combined = res.into_iter()
-                                .filter_map(|a|a.ok())
-                                .map(|p| p.as_bytes(sid))
-                                .enumerate()
-                                .map(|(n,b)| if res_size > 1 && n < res_size - 1{ vec![b,seperator.to_vec()].concat() } else { b } )
-                                .flat_map(|a| a )
-                                .collect();
-
-                            Ok(combined)
-                        },
-                        Some(Err(e)) => Err(e.clone())
-                    };
-
-
-                    return r
+                        dbg!(&combined);
+                        response.body(combined)
+                    }
+                    else {
+                        HttpResponse::BadRequest().body(vec![])
+                    }
                 }
             })
         )

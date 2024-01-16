@@ -1,31 +1,17 @@
-use std::time::Duration;
 use std::time::Instant;
 use std::collections::HashMap;
 use futures_util::Stream;
-use futures_util::StreamExt;
 
-use tokio::sync::mpsc::Receiver;
+use futures_util::StreamExt;
 use tokio::sync::mpsc::Sender;
+use crate::EngineCloseReason;
 use crate::EngineInput;
 use crate::EngineOutput;
 use crate::EngineError;
-use crate::TransportConfig;
-use crate::engine;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 
-type ForwardingChannel<IN,OUT> = (Sender<IN>, Receiver<OUT>);
-
-
-// INTERFACE: 
-// NEW SESSION ( SID ) 
-//
-// CLEITN NEED x1 TX, leave RX 
-// SERVEFR SEND x1 
-//
-// NEW SESION ( TX) => GIVE RX TO STREAM in HANDLER 
-//
-// POLL( RX) 
 type AsyncIOSender = Sender<Result<Payload,EngineError>>;
+
 
 pub fn async_session_io_create() -> AsyncSessionIOHandle {
     let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOSender>)>(1024);
@@ -52,85 +38,76 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                 (EngineInput::New(..), None) => {
                     let e = Engine::new(sid);
                     engines.insert(sid,e);
-                    Ok(engines.get_mut(&sid).unwrap())
+                    engines.get_mut(&sid)
                 },
-
-                (EngineInput::New(..), Some(..)) => Err(EngineError::UnknownSession),
-
-                (EngineInput::Listen(participant), Some(engine)) => {
-                    match participant {
-                        Participant::Client => client_recv.insert(sid, output.clone().unwrap()),
-                        Participant::Server => server_recv.insert(sid, output.clone().unwrap()),
-                    };
-                    Ok(engine)
-                }
-
-                (_, None) => Err(EngineError::UnknownSession),
-
-                (_, Some(engine)) => Ok(engine)
+                (_, engine) => engine
             };
 
-            dbg!(sid);
-            dbg!("{}",engine.is_ok());
+            // Setup listeners 
+            match (&input,&engine,&output) {
+                (EngineInput::Listen(Participant::Server),Some(..), Some(sender)) => { server_recv.insert(sid, sender.clone());},
+                (EngineInput::Listen(Participant::Client),Some(..), Some(sender)) => { client_recv.insert(sid, sender.clone());}
+                _ => {}
+            }
 
-            match engine {
-                Ok(engine) => {
-                    engine.consume(input, Instant::now());
-                    let wait = loop {
+            let wait = match engine.and_then(|e| Some(e.consume(input, Instant::now()).and(Ok(e)))) {
+                Some(Ok(engine)) => {
+                    loop {
                         let out = engine.poll_output();
-                        dbg!(&out);
                         match out {
+                            Some(EngineOutput::Data(participant, payload)) => {
+                                let sender = if let Participant::Server = participant {server_recv.get(&sid)} else { client_recv.get(&sid) };
+                                for tx in [output.as_ref(), sender].into_iter().filter_map(|a| a) {
+                                    tx.send(Ok(payload.clone())).await;
+                                }
+                            },
+                            Some(EngineOutput::Closed(reason)) => {
+                                // The Engine should only dispatch x1 Close 
+                                // We have to close all long lived listeners
+                                let t = vec![output.as_ref(), client_recv.get(&sid), server_recv.get(&sid)];
+                                for tx in t.into_iter().filter_map(|a| a) {
+                                    tx.send(Ok(Payload::Close(None))).await;
+                                }
+                                match reason {
+                                    EngineCloseReason::Timeout => {},
+                                    EngineCloseReason::Command(p) => {},
+                                    EngineCloseReason::Error(e) => {
+                                        if let Some(output) = &output {
+                                           output.send(Err(e)).await;
+                                        }
+                                    }
+                                }
+                            },
                             Some(EngineOutput::Pending(duration,id)) => break Some((duration,id)),
-                            Some(EngineOutput::Data(Participant::Client,p)) => { 
-                                let t = vec![output.as_ref(), server_recv.get(&sid)];
-                                for tx in t.into_iter().filter_map(|a| a) {
-                                    tx.send(Ok(p.clone())).await;
-                                }
-                                dbg!();
-                            },
-                            Some(EngineOutput::Data(Participant::Server,p)) => {
-                                // TODO: UNWRAP 
-                                let t = vec![output.as_ref(), client_recv.get(&sid)];
-                                for tx in t.into_iter().filter_map(|a| a) {
-                                    tx.send(Ok(p.clone())).await;
-                                }
-                                dbg!();
-                            },
-                            Some(EngineOutput::Closed(..)) => {
-                                // .. what todo
-                                if let Some(output) = &output {
-                                    output.send(Err(EngineError::Generic)).await;
-                                }
-                            },
-                            None => {
-                                //... what todo...
-                                break None
-                            }
-                        }
-                    };
-                    dbg!();
-                    // Schedule next tick
-                    match wait {
-                        None => {},
-                        Some((duration, Some(poll))) => {
-                            let tx = time_tx.clone();
-                            tokio::spawn(async move { 
-                                tokio::time::sleep(duration).await; 
-                                tx.send((sid, EngineInput::Poll(poll), output)).await
-                            }) ;
-                        },
-                        Some((duration, None)) => {
-                            drop(output);
-                            let tx = time_tx.clone();
-                            tokio::spawn(async move { 
-                                tokio::time::sleep(duration).await; 
-                                tx.send((sid, EngineInput::NOP, None)).await
-                            });
+                            None => break None
                         }
                     }
                 },
-                Err(e) => {
-                    dbg!(e);
+                // Engine doesn't exist OR is closed already
+                _ => {
+                    if let Some(output) = &output {
+                        output.send(Err(EngineError::UnknownSession)).await;
+                    };
+                    None
+                },
+            };
+            // Schedule Next Tick
+            match wait {
+                None => {},
+                Some((duration, Some(poll))) => {
+                    let tx = time_tx.clone();
+                    tokio::spawn(async move { 
+                        tokio::time::sleep(duration).await; 
+                        tx.send((sid, EngineInput::Poll(poll), output)).await
+                    }) ;
+                },
+                Some((duration, None)) => {
+                    drop(output);
+                    let tx = time_tx.clone();
+                    tokio::spawn(async move { 
+                        tokio::time::sleep(duration).await; 
+                        tx.send((sid, EngineInput::NOP, None)).await
+                    });
                 }
             }
         }
@@ -172,6 +149,21 @@ impl AsyncSessionIOSender {
    pub async fn send(&self, payload:Payload) {
        self.handle.input(self.sid, EngineInput::Data(Participant::Server, payload)).await;
    }
+}
+
+pub async fn session_collect(s:impl Stream<Item=Result<Payload,EngineError>>) -> (Vec<Payload>,Option<EngineError>) {
+    let mut all:Vec<Result<Payload,EngineError>> = s.collect().await;
+    let reason = match all.last() {
+        None => None,
+        Some(Err(e)) => all.pop().unwrap().err(),
+        Some(Ok(..)) => None
+    };
+    dbg!(&reason);
+    dbg!(&all);
+    return (
+        all.into_iter().filter_map(|r| r.ok()).collect(),
+        reason
+    )
 }
 
 

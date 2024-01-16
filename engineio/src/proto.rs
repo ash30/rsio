@@ -1,11 +1,9 @@
 use std::fmt;
-use std::error;
 use std::time::Duration;
 use std::u8;
 
 use crate::Participant;
-use crate::PollingState;
-
+use crate::EngineCloseReason;
 
 pub type Sid = uuid::Uuid;
 
@@ -38,7 +36,7 @@ pub enum EngineKind {
 pub enum EngineOutput {
     Pending(Duration, Option<uuid::Uuid>),
     Data(Participant, Payload),
-    Closed(Option<EngineError>)
+    Closed(EngineCloseReason)
 
 }
 
@@ -86,6 +84,7 @@ impl fmt::Display for EngineInput {
     }
 }
 
+use actix_ws::CloseReason;
 use serde::{Deserialize, Serialize};
 
 
