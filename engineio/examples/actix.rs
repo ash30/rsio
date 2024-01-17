@@ -10,10 +10,13 @@ impl NewConnectionService for NewConnectionManager {
     fn new_connection<S:Stream<Item=Result<engineio::Payload,engineio::EngineError>> + 'static>(&self, stream:S, emit:Emitter) {
         actix_rt::spawn(async move {
             pin_mut!(stream);
-            while let Some(Ok(engineio::Payload::Message(v))) = stream.next().await {
-                dbg!();
-                let _ = emit.send(engineio::Payload::Message(v)).await;
+            
+            loop {
+                let p = stream.next().await;
+                dbg!(&p);
+                if let Some(Ok(p)) = p {  emit.send(p).await; }
             }
+
         });
         
     }
