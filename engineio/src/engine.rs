@@ -12,7 +12,7 @@ pub enum Participant {
 pub enum PollingState {
     Inactive {lastPoll:Option<Instant>},
     Active {id: uuid::Uuid, start:Instant, duration:Duration},
-    Continuous
+    Continuous { lastPoll:Option<Instant> },
 }
 
 #[derive(Debug)]
@@ -64,8 +64,8 @@ impl Engine
             (_, None) => {
                 let (duration, poll_id) = match self.polling {
                     PollingState::Active { id, start, duration } => (duration, Some(id)), 
-                    PollingState::Inactive { lastPoll } => (self.poll_timeout, None),
-                    PollingState::Continuous => (std::time::Duration::from_secs(60*60), None)
+                    PollingState::Inactive { .. } => (self.poll_timeout, None),
+                    PollingState::Continuous { .. } => (self.poll_timeout, None)
                 };
                 Some(EngineOutput::Pending(duration, poll_id ))
             }
@@ -81,6 +81,15 @@ impl Engine
                 if now > (*last + self.poll_timeout) {
                     self.transport = TransportState::Closed;
                     self.output.push_back(EngineOutput::Closed(EngineCloseReason::Timeout));
+                }
+            }
+            (TransportState::Connected, PollingState::Continuous{ lastPoll:Some(last) }) => {
+                if now > (*last + self.poll_timeout) {
+                    self.transport = TransportState::Closed;
+                    self.output.push_back(EngineOutput::Closed(EngineCloseReason::Timeout));
+                    self.output.push_back(
+                        EngineOutput::Closed(EngineCloseReason::Timeout)
+                    );
                 }
             }
             _ => {}
@@ -112,9 +121,15 @@ impl Engine
                 }
                 Ok(())
             },
+            //
+            // NOP
+            (EngineInput::NOP, _, _) => {
+                Ok(())
+            },
 
             (_, TransportState::Closed, _) => {
                 // GENERALLY We do NOTHING if ALREADY CLOSED!
+                dbg!();
                 Err(EngineInputError::AlreadyClosed)
             },
 
@@ -125,14 +140,14 @@ impl Engine
                 self.poll_timeout = Duration::from_millis(config.ping_timeout.into());
                 self.poll_duration = Duration::from_millis(config.ping_interval.into());
                 self.polling = match kind {
-                    EngineKind::Continuous => PollingState::Continuous,
+                    EngineKind::Continuous => PollingState::Continuous { lastPoll: Some(now) },
                     EngineKind::Poll => PollingState::Inactive { lastPoll: Some(now) }
                 };
                 self.transport = TransportState::Connected;
 
                 println!("interval: {}", self.poll_duration.as_millis());
 
-                let upgrades = if let PollingState::Continuous = self.polling { vec![] } else { vec!["websocket"] };
+                let upgrades = if let PollingState::Continuous{..} = self.polling { vec![] } else { vec!["websocket"] };
                 let data = serde_json::json!({
                     "upgrades": upgrades,
                     "maxPayload": config.max_payload,
@@ -179,7 +194,7 @@ impl Engine
             },
             
 
-            (EngineInput::Poll(..), _, PollingState::Continuous) => {
+            (EngineInput::Poll(..), _, PollingState::Continuous{ .. }) => {
                 self.polling = PollingState::Inactive { lastPoll: Some(now) };
                 self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                 Ok(())
@@ -197,7 +212,6 @@ impl Engine
             },
 
             (EngineInput::Data(Participant::Client, Payload::Upgrade), _, _) => {
-                self.polling = PollingState::Continuous;
                 Ok(())
             },
 
@@ -209,7 +223,7 @@ impl Engine
             // Buffer server emitted events depending on polling state
             
              
-            (EngineInput::Data(Participant::Server, p),_,PollingState::Continuous) => {
+            (EngineInput::Data(Participant::Server, p),_,PollingState::Continuous { .. } ) => {
                 self.output.push_back(EngineOutput::Data(Participant::Server, p));
                 Ok(())
             }
@@ -223,10 +237,6 @@ impl Engine
                 Ok(())
             }
             
-            // NOP
-            (EngineInput::NOP, _, _) => {
-                Ok(())
-            },
 
             (EngineInput::Listen(..), _, _ ) => {
                 Ok(())

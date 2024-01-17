@@ -22,7 +22,6 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
     let mut server_recv: HashMap<Sid, AsyncIOSender> = HashMap::new();
     let mut client_recv: HashMap<Sid, AsyncIOSender> = HashMap::new();
 
-    dbg!();
     tokio::spawn( async move {
         loop {
             dbg!();
