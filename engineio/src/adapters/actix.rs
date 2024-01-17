@@ -209,8 +209,8 @@ where F: NewConnectionService + 'static
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let server_events_stream = io.input(sid, EngineInput::Listen(Participant::Server)).await;
                     let res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
+                    let server_events_stream = io.input(sid, EngineInput::Listen(Participant::Server)).await;
 
                     // GET 
                     //
