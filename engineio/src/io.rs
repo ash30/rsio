@@ -43,9 +43,9 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
             };
 
             // Setup listeners 
-            match (&input,&engine,&output) {
-                (EngineInput::Listen(Participant::Server),Some(..), Some(sender)) => { server_recv.insert(sid, sender.clone());},
-                (EngineInput::Listen(Participant::Client),Some(..), Some(sender)) => { client_recv.insert(sid, sender.clone());}
+            match (&input,&output) {
+                (EngineInput::Listen(Participant::Server),Some(sender)) => { server_recv.insert(sid, sender.clone());},
+                (EngineInput::Listen(Participant::Client),Some(sender)) => { client_recv.insert(sid, sender.clone());}
                 _ => {}
             }
 
