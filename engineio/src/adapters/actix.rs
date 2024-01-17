@@ -132,6 +132,7 @@ where F: NewConnectionService + 'static
                                 engress = to_send.next() => {
                                     match engress {
                                         Some(Ok(Payload::Message(d))) => session.text(String::from_utf8(d).unwrap()).await,
+                                        Some(Ok(Payload::Close(..))) => break,
                                         Some(Err(e)) => { break},
                                         _ => Ok(())
                                         
