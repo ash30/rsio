@@ -3,26 +3,16 @@ use std::time::Duration;
 use std::u8;
 
 use crate::Participant;
-use crate::EngineCloseReason;
-
 pub type Sid = uuid::Uuid;
-
-
-pub enum TransportState { 
-    New,
-    Connected,
-    Closed
-}
 
 #[derive(Debug)]
 pub enum EngineInput {
     New(Option<TransportConfig>, EngineKind),
     Close(Participant),
     Data(Participant, Payload),
-    Poll(uuid::Uuid),
+    Poll,
     Listen(Participant),
-    Error,
-    NOP
+    Tock
 }
 
 #[derive(Debug)]
@@ -34,10 +24,9 @@ pub enum EngineKind {
 
 #[derive(Debug)]
 pub enum EngineOutput {
-    Pending(Duration, Option<uuid::Uuid>),
+    Tick { length:Duration },
+    Reset,
     Data(Participant, Payload),
-    Closed(EngineCloseReason)
-
 }
 
 #[derive(Debug, Clone)]
@@ -57,24 +46,13 @@ impl fmt::Display for EngineError {
     }
 }
 
-impl fmt::Display for EngineOutput {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Pending(t,..) => write!(f, "wait {}", t.as_millis() ),
-            Self::Data(Participant::Server,d) => write!(f, "data - Server emit"),
-            Self::Data(Participant::Client,d) => write!(f, "data - Client Recv"),
-            Self::Closed(e) => write!(f, "close")
-        }
-    }
-}
 
 impl fmt::Display for EngineInput {
 
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let output = match self {
-            Self::NOP => "NOP",
-            Self::Poll(..) => "POLL",
-            Self::Error => "ERR",
+            Self::Tock  => "Tock",
+            Self::Poll => "POLL",
             Self::Listen(..) => "LISTEN",
             Self::New(..) => "NEW",
             Self::Data(p,d) => "DATA",
@@ -84,14 +62,13 @@ impl fmt::Display for EngineInput {
     }
 }
 
-use actix_ws::CloseReason;
 use serde::{Deserialize, Serialize};
 
 
 #[derive(Clone,Debug)]
 pub enum Payload {
     Open(Vec<u8>),
-    Close(Option<EngineError>),
+    Close,
     Ping,
     Pong,
     Message(Vec<u8>),
@@ -104,7 +81,7 @@ impl Payload{
     pub fn as_bytes(&self, sid:Sid) -> Vec<u8>{
         let (prefix, data) = match &self{
             Payload::Open(data) => ("0", Some(data.to_owned())),
-            Payload::Close(..) => ("1", None),
+            Payload::Close => ("1", None),
             Payload::Ping => ("2", None),
             Payload::Pong => ("3", None),
             Payload::Message(p) => ("4", Some(p.to_owned())),

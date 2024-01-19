@@ -5,13 +5,13 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use tokio::sync::mpsc::Sender;
 use crate::EngineCloseReason;
+use crate::EngineInputError;
 use crate::EngineInput;
 use crate::EngineOutput;
 use crate::EngineError;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 
-type AsyncIOSender = Sender<Result<Payload,EngineError>>;
-
+type AsyncIOSender = Sender<Result<Payload,EngineInputError>>;
 
 pub fn async_session_io_create() -> AsyncSessionIOHandle {
     let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOSender>)>(1024);
@@ -24,8 +24,7 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
 
     tokio::spawn( async move {
         loop {
-            dbg!();
-            let (sid, input, output)  = tokio::select! {
+            let (sid, input, tx)  = tokio::select! {
                 Some(v1) = client_sent_rx.recv() => v1,
                 Some(v2) = server_sent_rx.recv() => v2,
                 Some(v3) = time_rx.recv() => v3
@@ -33,82 +32,53 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
 
             dbg!(&input);
 
-            let engine = match (&input, engines.get_mut(&sid)) {
-                (EngineInput::New(..), None) => {
-                    let e = Engine::new(sid);
-                    engines.insert(sid,e);
-                    engines.get_mut(&sid)
-                },
-                (_, engine) => engine
+            let engine = match &input  {
+                EngineInput::New(..) => Some(engines.entry(sid).or_insert(Engine::new(sid))),
+                _ => engines.get_mut(&sid)
             };
 
             // Setup listeners 
-            match (&input,&output) {
+            match (&input,&tx) {
                 (EngineInput::Listen(Participant::Server),Some(sender)) => { server_recv.insert(sid, sender.clone());},
                 (EngineInput::Listen(Participant::Client),Some(sender)) => { client_recv.insert(sid, sender.clone());}
                 _ => {}
-            }
+            };
 
-            let wait = match engine.and_then(|e| Some(e.consume(input, Instant::now()).and(Ok(e)))) {
-                Some(Ok(engine)) => {
-                    loop {
-                        let out = engine.poll_output();
-                        match out {
-                            Some(EngineOutput::Data(participant, payload)) => {
-                                let sender = if let Participant::Server = participant {server_recv.get(&sid)} else { client_recv.get(&sid) };
-                                for tx in [output.as_ref(), sender].into_iter().filter_map(|a| a) {
-                                    tx.send(Ok(payload.clone())).await;
-                                }
-                            },
-                            Some(EngineOutput::Closed(reason)) => {
-                                // The Engine should only dispatch x1 Close 
-                                // We have to close all long lived listeners
-                                let t = vec![output.as_ref(), client_recv.get(&sid), server_recv.get(&sid)];
-                                for tx in t.into_iter().filter_map(|a| a) {
-                                    tx.send(Ok(Payload::Close(None))).await;
-                                }
-                                match reason {
-                                    EngineCloseReason::Timeout => {},
-                                    EngineCloseReason::Command(p) => {},
-                                    EngineCloseReason::Error(e) => {
-                                        if let Some(output) = &output {
-                                           output.send(Err(e)).await;
-                                        }
-                                    }
-                                }
-                            },
-                            Some(EngineOutput::Pending(duration,id)) => break Some((duration,id)),
-                            None => break None
-                        }
+            let output = engine.ok_or(EngineInputError::AlreadyClosed)
+                .and_then(|e| e.consume(input, Instant::now()).and(Ok(e)))
+                .and_then(|e| { let mut b = vec![]; while let Some(p) = e.poll_output() { b.push(p); }; Ok(b) });
+
+            match output {
+                Err(e) => {
+                    if let Some(t) = tx {
+                        t.send(Err(e)).await;
                     }
                 },
-                // Engine doesn't exist OR is closed already
-                _ => {
-                    if let Some(output) = &output {
-                        output.send(Err(EngineError::UnknownSession)).await;
+                Ok(output) => {
+                    for o in output {
+                        match o {
+                            EngineOutput::Data(participant, data) => {
+                                let sender = if let Participant::Client = participant {server_recv.get(&sid)} else { client_recv.get(&sid) };
+                                if let Some(sender) = sender {
+                                    sender.send(Ok(data)).await;
+                                };
+                            },
+                            EngineOutput::Reset => {
+
+                            },
+                            EngineOutput::Tick { length } => {
+                                let tx = time_tx.clone();
+                                tokio::spawn(async move { 
+                                    tokio::time::sleep(length).await; 
+                                    tx.send((sid, EngineInput::Tock, None)).await
+                                });
+                            }
+                        };
                     };
-                    None
-                },
-            };
-            // Schedule Next Tick
-            match wait {
-                None => {},
-                Some((duration, Some(poll))) => {
-                    let tx = time_tx.clone();
-                    tokio::spawn(async move { 
-                        tokio::time::sleep(duration).await; 
-                        tx.send((sid, EngineInput::Poll(poll), output)).await
-                    }) ;
-                },
-                Some((duration, None)) => {
-                    drop(output);
-                    let tx = time_tx.clone();
-                    tokio::spawn(async move { 
-                        tokio::time::sleep(duration).await; 
-                        tx.send((sid, EngineInput::NOP, None)).await
-                    });
+                    drop(tx);
                 }
-            }
+            };
+
         }
     });
 
@@ -120,14 +90,14 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
 
 #[derive(Debug, Clone)]
 pub struct AsyncSessionIOHandle {
-    client_send_tx: Sender<(Sid, EngineInput, Option<Sender<Result<Payload,EngineError>>>)>,
-    server_send_tx: Sender<(Sid, EngineInput, Option<Sender<Result<Payload, EngineError>>>)>,
+    client_send_tx: Sender<(Sid, EngineInput, Option<Sender<Result<Payload,EngineInputError>>>)>,
+    server_send_tx: Sender<(Sid, EngineInput, Option<Sender<Result<Payload, EngineInputError>>>)>,
 }
 
 impl AsyncSessionIOHandle {
 
-    pub async fn input(&self, id:Sid, input:EngineInput) -> impl Stream<Item=Result<Payload,EngineError>> {
-        let (tx,rx) = tokio::sync::mpsc::channel::<Result<Payload,EngineError>>(10);
+    pub async fn input(&self, id:Sid, input:EngineInput) -> impl Stream<Item=Result<Payload,EngineInputError>> {
+        let (tx,rx) = tokio::sync::mpsc::channel::<Result<Payload,EngineInputError>>(10);
         let _ = self.client_send_tx.send((id,input, Some(tx))).await;
         return tokio_stream::wrappers::ReceiverStream::new(rx);
     }
@@ -146,19 +116,19 @@ impl AsyncSessionIOSender {
     }
 
    pub async fn send(&self, payload:Payload) {
+       // TODO: Listen for SEND errors ?
        self.handle.input(self.sid, EngineInput::Data(Participant::Server, payload)).await;
    }
 }
 
-pub async fn session_collect(s:impl Stream<Item=Result<Payload,EngineError>>) -> (Vec<Payload>,Option<EngineError>) {
-    let mut all:Vec<Result<Payload,EngineError>> = s.collect().await;
+
+pub async fn session_collect(s:impl Stream<Item=Result<Payload,EngineInputError>>) -> (Vec<Payload>,Option<EngineInputError>) {
+    let mut all:Vec<Result<Payload, EngineInputError>> = s.collect().await;
     let reason = match all.last() {
         None => None,
         Some(Err(e)) => all.pop().unwrap().err(),
         Some(Ok(..)) => None
     };
-    dbg!(&reason);
-    dbg!(&all);
     return (
         all.into_iter().filter_map(|r| r.ok()).collect(),
         reason

@@ -1,10 +1,9 @@
 use std::sync::Arc;
-use actix_web::web::Bytes;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
-use actix_ws::{Message, CloseReason};
+use actix_ws::{Message};
 
-use crate::{EngineOutput, async_session_io_create, EngineInput, session_collect};
+use crate::{async_session_io_create, EngineInput, session_collect, EngineInputError};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
@@ -132,7 +131,7 @@ where F: NewConnectionService + 'static
                                 engress = to_send.next() => {
                                     match engress {
                                         Some(Ok(Payload::Message(d))) => session.text(String::from_utf8(d).unwrap()).await,
-                                        Some(Ok(Payload::Close(..))) => break,
+                                        Some(Ok(Payload::Close)) => break,
                                         Some(Err(e)) => { break},
                                         _ => Ok(())
                                         
@@ -169,8 +168,7 @@ where F: NewConnectionService + 'static
                         let (all, reason) = session_collect(res).await;
                         let mut response = if let Some(e) = reason {
                             match e {
-                                EngineError::InvalidPollRequest => HttpResponse::BadRequest(),
-                                EngineError::UnknownSession=> HttpResponse::BadRequest(),
+                                EngineInputError::InvalidPoll => HttpResponse::BadRequest(),
                                 _ => HttpResponse::InternalServerError(),
                             }
                         }
@@ -220,7 +218,7 @@ where F: NewConnectionService + 'static
                         crate::io::AsyncSessionIOSender::new(sid,io)
                     );
 
-                    let r = res.collect::<Vec<Result<Payload,EngineError>>>().await;
+                    let r = res.collect::<Vec<Result<Payload,EngineInputError>>>().await;
                 
                     // TODO: WHY DOES LAST ERORR ?
                     match r.first() {

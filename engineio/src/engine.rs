@@ -1,21 +1,28 @@
 use std::{collections::VecDeque, u8, time::{Instant, Duration}};
+
 pub use crate::proto::*;
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum TransportState { 
+    New,
+    Connected { last_poll:Instant },
+    Closed(EngineCloseReason)
+}
+
+#[derive(Debug, Clone)]
 pub enum Participant {
     Client,
     Server
 } 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PollingState {
-    Inactive {lastPoll:Option<Instant>},
-    Active {id: uuid::Uuid, start:Instant, duration:Duration},
-    Continuous { lastPoll:Option<Instant> },
+    Poll { active:Option<Duration>},
+    Continuous ,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EngineCloseReason {
     Error(EngineError),
     Timeout,
@@ -23,22 +30,36 @@ pub enum EngineCloseReason {
 }
 
 pub enum EngineInputError {
+    OpenFailed,
+    InvalidPoll,
     AlreadyClosed
 }
+
+#[derive(Debug, Clone)]
+pub struct EngineState {
+    transport: TransportState,
+    polling: PollingState, 
+    poll_timeout:Duration,
+    poll_duration: Duration,
+}
+
+impl EngineState {
+    fn new(now:Instant) -> Self {
+        return Self {
+            transport: TransportState::New,
+            polling: PollingState::Poll { active: None },
+            poll_timeout: Duration::from_secs(2),
+            poll_duration: Duration::from_secs(10)
+        }   
+    }
+}
+
 
 pub struct Engine  { 
     pub session:Sid,
     output:VecDeque<EngineOutput>,
     poll_buffer: VecDeque<EngineOutput>,
-
-    // Engine State
-    transport: TransportState,
-    pub polling: PollingState, 
-    pub poll_timeout:Duration,
-    pub poll_duration: Duration,
-
-
-
+    state: EngineState
 }
 
 impl Engine  
@@ -48,202 +69,211 @@ impl Engine
             session: sid,
             output: VecDeque::new(),
             poll_buffer: VecDeque::new(),
-            transport: TransportState::New,
-            polling: PollingState::Inactive { lastPoll: Some(Instant::now()) },
-            poll_timeout: Duration::from_secs(30*10),
-            poll_duration: Duration::from_secs(30),
+            state: EngineState::new(Instant::now())
         }
     }
 
     pub fn poll_output(&mut self) -> Option<EngineOutput> { 
-        // Let them drain output even when closed, but onced empty - forever return None
-        match (&self.transport, self.output.pop_front()) {
-            (TransportState::Closed, Some(p)) => Some(p),
-            (TransportState::Closed, None) => None,
-            (_, Some(p)) => Some(p),
-            (_, None) => {
-                let (duration, poll_id) = match self.polling {
-                    PollingState::Active { id, start, duration } => (duration, Some(id)), 
-                    PollingState::Inactive { .. } => (self.poll_timeout, None),
-                    PollingState::Continuous { .. } => (self.poll_timeout, None)
-                };
-                Some(EngineOutput::Pending(duration, poll_id ))
-            }
-        }
-
+        self.output.pop_front()
     }
-    
-    pub fn consume(&mut self, data:EngineInput, now:Instant) -> Result<(), EngineInputError> {
 
+    fn update(now:Instant, input:EngineInput, currentState:&EngineState, nextState:&mut EngineState, poll_buf_length:usize) -> Result<Vec<EngineOutput>,EngineInputError> {
+
+        let mut output = Vec::new();
         // Before Consuming event, make sure poll timeout is valid
-        match (&self.transport, &self.polling) {
-            (TransportState::Connected, PollingState::Inactive { lastPoll:Some(last) }) => {
-                if now > (*last + self.poll_timeout) {
-                    self.transport = TransportState::Closed;
-                    self.output.push_back(EngineOutput::Closed(EngineCloseReason::Timeout));
+        match &currentState.transport {
+            TransportState::Connected { last_poll } => {
+                if now > *last_poll + currentState.poll_timeout{
+                    nextState.transport = TransportState::Closed(EngineCloseReason::Timeout);
                 }
             }
-            (TransportState::Connected, PollingState::Continuous{ lastPoll:Some(last) }) => {
-                if now > (*last + self.poll_timeout) {
-                    self.transport = TransportState::Closed;
-                    self.output.push_back(EngineOutput::Closed(EngineCloseReason::Timeout));
+            _ => {}
+        };
+
+        let res = match input {
+            EngineInput::New(config, kind) => {
+                match &currentState.transport {
+                    TransportState::New => {
+                        let config = config.unwrap_or(TransportConfig::default());
+                        // Update timeouts
+                        nextState.poll_timeout = Duration::from_millis(config.ping_timeout.into());
+                        nextState.poll_duration= Duration::from_millis(config.ping_interval.into());
+                        nextState.polling = match kind {
+                            EngineKind::Continuous => PollingState::Continuous,
+                            EngineKind::Poll => PollingState::Poll { active: None }
+                        };
+                        nextState.transport = TransportState::Connected { last_poll: now };
+                        Ok(())
+                    },
+                    _ => {
+                        // ITS AN ERROR TO INPUT NEW IF CLOSED OR CONNECTED!!
+                        Err(EngineInputError::OpenFailed)
+                    }
+                }
+            },
+            EngineInput::Listen(..) => Ok(()),
+            EngineInput::Data(src,payload) => {
+                match (src, payload) {
+                    (_, Payload::Close) => {
+                        nextState.transport = TransportState::Closed(EngineCloseReason::Command(Participant::Client));
+                        Ok(())
+                    },
+
+                    (_, Payload::Upgrade) => Ok(()),
+
+                    (Participant::Client,p) => {
+                        output.push(EngineOutput::Data(Participant::Client, p));
+                        Ok(())
+                    },
+
+                    (Participant::Server,p) => {
+                        if let TransportState::Closed(..)= currentState.transport {
+                            // DONT ALLOW SERVER TO SEND EVENT IF CLOSED 
+                            Err(EngineInputError::AlreadyClosed)
+                        } 
+                        else {
+                            output.push(EngineOutput::Data(Participant::Server, p));
+                            Ok(())
+                        }
+                    }
+                }
+            },
+            EngineInput::Tock => {
+
+                match currentState.polling { 
+                        // we MUST make sure only origial poll can udpate state 
+                    PollingState::Poll { active:Some(duration) } => {
+                        let is_complete = if let TransportState::Connected { last_poll } = currentState.transport { 
+                            last_poll + currentState.poll_timeout > now 
+                        }
+                        else { true } ;
+
+                        if is_complete == true {
+                            nextState.polling = PollingState::Poll { active: None};
+                        }
+                    },
+
+                    _ => {}
+                };
+                Ok(())
+            },
+
+            EngineInput::Poll => {
+                // POLLs are one of the inputs that are independant of current connection state
+                // BUT CAN mutate it 
+                match currentState.polling {
+                    PollingState::Poll { active:Some(..) } => {
+                        nextState.transport = TransportState::Closed(EngineCloseReason::Error(EngineError::InvalidPollRequest));
+                        Err(EngineInputError::InvalidPoll)
+                    },
+
+                    PollingState::Poll { active:None } => {
+                        if poll_buf_length > 0 {
+                            nextState.polling = PollingState::Poll { active: Some( Duration::from_secs(1)) };
+                        }
+                        else {
+                            nextState.polling = PollingState::Poll { active: Some( currentState.poll_duration) }
+                        }
+                        Ok(())
+                    },
+
+                    PollingState::Continuous{ .. } => {
+                        Ok(())
+                    },
+
+                }
+            },
+            EngineInput::Close(..) => {
+                match currentState.transport {
+                    TransportState::Closed(..) => {
+                        // TODO: WE SHOULD ERROR 
+                        Err(EngineInputError::AlreadyClosed)
+                    },
+                    _ => {
+                        nextState.transport = TransportState::Closed(EngineCloseReason::Command(Participant::Server));
+                        Ok(())
+                    }
+                }
+            },
+        };
+        res.and(Ok(output))
+    }
+    
+    pub fn consume(&mut self, input:EngineInput, now:Instant) -> Result<(), EngineInputError> {
+        dbg!();
+        let currentState = &self.state;
+        let mut nextState = self.state.clone();
+
+        // CALCULATE NEXT STATE
+        let mut output = Engine::update(now, input, currentState, &mut nextState, self.poll_buffer.len())?;
+
+        // FORWARD TO CORRECT BUFFER
+        let output_buffer = if let PollingState::Poll { .. } = nextState.polling { &mut self.poll_buffer } else { &mut self.output};
+        output.drain(0..).for_each(|p| output_buffer.push_back(p));
+        
+
+        // WORK OUT DISPATCH
+        match (&currentState.polling, &nextState.polling) { 
+            // FINISHED POLLING - DRAIN BUFFER
+            (PollingState::Poll { active:Some(..)},PollingState::Poll { active:None }) => {
+                self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
+                self.output.push_back(EngineOutput::Reset);
+            }
+
+            // UPDATED POLL DURATION
+            (PollingState::Poll { active:Some(old) }, PollingState::Poll { active:Some(new) } )=> {
+                self.output.push_back(
+                    EngineOutput::Tick { length: *new }
+                )
+            }
+            _ => {}
+        };
+
+        match (&currentState.transport, &nextState.transport) {
+            (TransportState::Closed(..), TransportState::Closed(..)) => {},
+
+            // Initial Transition to Closed 
+            (_, TransportState::Closed(..)) => {
+                if let PollingState::Poll { .. } = &nextState.polling  {
+                    self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
+                };
+                self.output.push_back(EngineOutput::Data(Participant::Client, Payload::Close))
+            }
+            // Intial setup 
+            (TransportState::New, TransportState::Connected { .. } ) => {
+                let upgrades = if let PollingState::Continuous = nextState.polling { vec![] } else { vec!["websocket"] };
+                let data = serde_json::json!({
+                    "upgrades": upgrades,
+                    //"maxPayload": config.max_payload,
+                    "pingInterval": nextState.poll_duration,
+                    "pingTimeout": nextState.poll_timeout,
+                    "sid":  self.session
+                });
+                self.output.push_back(
+                    EngineOutput::Data(
+                        Participant::Server, Payload::Open(serde_json::to_vec(&data).unwrap())
+                    )
+                );
+                // START TICK TOCK 
+                self.output.push_back(
+                    EngineOutput::Tick { length: nextState.poll_timeout }
+                )
+            }
+
+            // UPDATED LAST POLL
+            (TransportState::Connected { last_poll}, TransportState::Connected { last_poll:new_last_poll }) => {
+                if new_last_poll > last_poll {
                     self.output.push_back(
-                        EngineOutput::Closed(EngineCloseReason::Timeout)
-                    );
+                        EngineOutput::Tick { length: nextState.poll_timeout }
+                    )
                 }
             }
             _ => {}
         };
 
 
-        match (data, &mut self.transport, &mut self.polling) {
-            (EngineInput::Poll(_id), transportState, PollingState::Active { id, start, duration }) => {
-                // ERROR If we receive another poll request wwhilst active and IDs don't match!!
-                if _id != *id {
-                    self.transport = TransportState::Closed;
-                    self.output.push_back(
-                        EngineOutput::Closed(EngineCloseReason::Error(EngineError::InvalidPollRequest))
-                    );
-                    self.poll_buffer.push_back(
-                        EngineOutput::Data(Participant::Server, Payload::Close(None))
-                    );
-                }
-                else {
-                    // DRAIN IF CONNECTED and TIME is PASSED OR ALREADY CLOSED, else DO NOTHING
-                    match (now > (*start + *duration), transportState) {
-                        (false, TransportState::Connected) => {},
-                        (false, TransportState::New) => {},
-                        _ => { 
-                            self.polling = PollingState::Inactive { lastPoll: Some(now) };
-                            self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-                        }
-                    }
-                }
-                Ok(())
-            },
-            //
-            // NOP
-            (EngineInput::NOP, _, _) => {
-                Ok(())
-            },
-
-            (_, TransportState::Closed, _) => {
-                // GENERALLY We do NOTHING if ALREADY CLOSED!
-                dbg!();
-                Err(EngineInputError::AlreadyClosed)
-            },
-
-            (EngineInput::New(config, kind),TransportState::New, _) => {
-                let config = config.unwrap_or(TransportConfig::default());
-            
-                // Update timeouts
-                self.poll_timeout = Duration::from_millis(config.ping_timeout.into());
-                self.poll_duration = Duration::from_millis(config.ping_interval.into());
-                self.polling = match kind {
-                    EngineKind::Continuous => PollingState::Continuous { lastPoll: Some(now) },
-                    EngineKind::Poll => PollingState::Inactive { lastPoll: Some(now) }
-                };
-                self.transport = TransportState::Connected;
-
-                println!("interval: {}", self.poll_duration.as_millis());
-
-                let upgrades = if let PollingState::Continuous{..} = self.polling { vec![] } else { vec!["websocket"] };
-                let data = serde_json::json!({
-                    "upgrades": upgrades,
-                    "maxPayload": config.max_payload,
-                    "pingInterval": config.ping_interval,
-                    "pingTimeout": config.ping_timeout,
-                    "sid":  self.session
-                });
-                
-                self.output.push_back(
-                    EngineOutput::Data(
-                        Participant::Server, Payload::Open(serde_json::to_vec(&data).unwrap())
-                    )
-                );
-                Ok(())
-            },
-
-            (EngineInput::New(..), _, _) => {
-                // SHOULD WE RETURN AN ERROR ??
-                Ok(())
-            },
-
-            (EngineInput::Close(participant),_,_) => {
-                self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-                self.output.push_back(EngineOutput::Closed(EngineCloseReason::Command(Participant::Server)));
-                self.transport = TransportState::Closed;
-                Ok(())
-            },
-
-            (EngineInput::Error,_,_) => {
-                Ok(())
-            },
-
-            // PollingState
-            (EngineInput::Poll(id), _, PollingState::Inactive { .. }) => {
-                // FLUSH buffer else starting polling
-                if self.poll_buffer.len() > 0 {
-                   self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-                   self.polling = PollingState::Inactive { lastPoll: Some(now) }
-                }
-                else {
-                    self.polling = PollingState::Active { id, start: now, duration: self.poll_duration };
-                };
-                Ok(())
-            },
-            
-
-            (EngineInput::Poll(..), _, PollingState::Continuous{ .. }) => {
-                self.polling = PollingState::Inactive { lastPoll: Some(now) };
-                self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-                Ok(())
-            },
-
-            // Payloads
-            //
-            // TODO:THIS WILL ONLY FIRE IF NOT CONNECTED ... 
-            (EngineInput::Data(_,Payload::Close(..)),_, _) => {
-                self.transport = TransportState::Closed;
-                self.output.push_back(
-                    EngineOutput::Closed(EngineCloseReason::Command(Participant::Client))
-                );
-                Ok(())
-            },
-
-            (EngineInput::Data(Participant::Client, Payload::Upgrade), _, _) => {
-                Ok(())
-            },
-
-            (EngineInput::Data(Participant::Client, p),_,_) => {
-                self.output.push_back(EngineOutput::Data(Participant::Client, p));
-                Ok(())
-            },
-
-            // Buffer server emitted events depending on polling state
-            
-             
-            (EngineInput::Data(Participant::Server, p),_,PollingState::Continuous { .. } ) => {
-                self.output.push_back(EngineOutput::Data(Participant::Server, p));
-                Ok(())
-            }
-            (EngineInput::Data(Participant::Server, p),_,PollingState::Inactive { .. }) => {
-                self.poll_buffer.push_back(EngineOutput::Data(Participant::Server, p));
-                Ok(())
-            }
-            (EngineInput::Data(Participant::Server, p),_,PollingState::Active { id, start, mut duration }) => {
-                self.poll_buffer.push_back(EngineOutput::Data(Participant::Server, p));
-                self.polling = PollingState::Active { id:*id, start: *start, duration: duration.min(Duration::from_secs(1)) };
-                Ok(())
-            }
-            
-
-            (EngineInput::Listen(..), _, _ ) => {
-                Ok(())
-            }
-
-        }
-
+        self.state = nextState;
+        return Ok(())
     }
 
 }
