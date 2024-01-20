@@ -4,23 +4,23 @@ use futures_util::Stream;
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc::Sender;
-use crate::EngineCloseReason;
 use crate::EngineInputError;
 use crate::EngineInput;
 use crate::EngineOutput;
-use crate::EngineError;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 
 type AsyncIOSender = Sender<Result<Payload,EngineInputError>>;
 
+type AsyncIOInput = tokio::sync::oneshot::Sender<Result<Option<Sender<Payload>>,EngineInputError>>;
+
 pub fn async_session_io_create() -> AsyncSessionIOHandle {
-    let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOSender>)>(1024);
-    let (server_sent_tx, mut server_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOSender>)>(1024);
-    let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOSender>)>(1024);
+    let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
+    let (server_sent_tx, mut server_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
+    let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
 
     let mut engines: HashMap<Sid,Engine> = HashMap::new();
-    let mut server_recv: HashMap<Sid, AsyncIOSender> = HashMap::new();
-    let mut client_recv: HashMap<Sid, AsyncIOSender> = HashMap::new();
+    let mut server_recv: HashMap<Sid, AsyncIOInput> = HashMap::new();
+    let mut client_recv: HashMap<Sid, AsyncIOInput> = HashMap::new();
 
     tokio::spawn( async move {
         loop {
@@ -37,13 +37,6 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                 _ => engines.get_mut(&sid)
             };
 
-            // Setup listeners 
-            match (&input,&tx) {
-                (EngineInput::Listen(Participant::Server),Some(sender)) => { server_recv.insert(sid, sender.clone());},
-                (EngineInput::Listen(Participant::Client),Some(sender)) => { client_recv.insert(sid, sender.clone());}
-                _ => {}
-            };
-
             let output = engine.ok_or(EngineInputError::AlreadyClosed)
                 .and_then(|e| e.consume(input, Instant::now()).and(Ok(e)))
                 .and_then(|e| { let mut b = vec![]; while let Some(p) = e.poll_output() { b.push(p); }; Ok(b) });
@@ -51,7 +44,7 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
             match output {
                 Err(e) => {
                     if let Some(t) = tx {
-                        t.send(Err(e)).await;
+                        t.send(Err(e));
                     }
                 },
                 Ok(output) => {
@@ -60,11 +53,15 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                             EngineOutput::Data(participant, data) => {
                                 let sender = if let Participant::Client = participant {server_recv.get(&sid)} else { client_recv.get(&sid) };
                                 if let Some(sender) = sender {
-                                    sender.send(Ok(data)).await;
+                                    sender.send(Ok(data));
                                 };
+                                None
                             },
-                            EngineOutput::Reset => {
-
+                            EngineOutput::SetIO(participant, close ) => {
+                                let map = if let Participant::Server = participant { server_recv } else { client_recv };
+                                let (tx,rx) = tokio::sync::mpsc::channel::<Payload>(10);
+                                map.insert(sid, tx);
+                                Some(rx)
                             },
                             EngineOutput::Tick { length } => {
                                 let tx = time_tx.clone();
@@ -72,6 +69,7 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                                     tokio::time::sleep(length).await; 
                                     tx.send((sid, EngineInput::Tock, None)).await
                                 });
+                                None
                             }
                         };
                     };
@@ -90,8 +88,8 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
 
 #[derive(Debug, Clone)]
 pub struct AsyncSessionIOHandle {
-    client_send_tx: Sender<(Sid, EngineInput, Option<Sender<Result<Payload,EngineInputError>>>)>,
-    server_send_tx: Sender<(Sid, EngineInput, Option<Sender<Result<Payload, EngineInputError>>>)>,
+    client_send_tx: Sender<(Sid, EngineInput, Option<AsyncIOInput>)>,
+    server_send_tx: Sender<(Sid, EngineInput, Option<AsyncIOInput>)>,
 }
 
 impl AsyncSessionIOHandle {
@@ -121,18 +119,13 @@ impl AsyncSessionIOSender {
    }
 }
 
-
-pub async fn session_collect(s:impl Stream<Item=Result<Payload,EngineInputError>>) -> (Vec<Payload>,Option<EngineInputError>) {
-    let mut all:Vec<Result<Payload, EngineInputError>> = s.collect().await;
-    let reason = match all.last() {
-        None => None,
-        Some(Err(e)) => all.pop().unwrap().err(),
-        Some(Ok(..)) => None
-    };
-    return (
-        all.into_iter().filter_map(|r| r.ok()).collect(),
-        reason
-    )
+pub async fn session_stream(s: impl Stream<Item=Result<Payload,EngineInputError>> ) -> Result<impl Stream<Item=Payload>,EngineInputError> { 
+    let mut stream = Box::pin(s);
+    match stream.next().await {
+        None => Err(EngineInputError::AlreadyClosed),
+        Some(Err(e)) => Err(e.clone()),
+        Some(Ok(p)) => Ok(stream.filter_map(|a| async move { a.ok() }))
+    }
 }
 
 

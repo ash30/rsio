@@ -29,6 +29,7 @@ pub enum EngineCloseReason {
     Command(Participant)
 }
 
+#[derive(Debug, Clone)]
 pub enum EngineInputError {
     OpenFailed,
     InvalidPoll,
@@ -111,7 +112,6 @@ impl Engine
                     }
                 }
             },
-            EngineInput::Listen(..) => Ok(()),
             EngineInput::Data(src,payload) => {
                 match (src, payload) {
                     (_, Payload::Close) => {
@@ -217,7 +217,11 @@ impl Engine
             // FINISHED POLLING - DRAIN BUFFER
             (PollingState::Poll { active:Some(..)},PollingState::Poll { active:None }) => {
                 self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-                self.output.push_back(EngineOutput::Reset);
+                self.output.push_back(EngineOutput::ResetIO(Participant::Client));
+            }
+
+            (PollingState::Poll { active:None},PollingState::Poll { active:Some(..) }) => {
+                self.output.push_back(EngineOutput::StoreIO(Participant::Client));
             }
 
             // UPDATED POLL DURATION
@@ -237,7 +241,7 @@ impl Engine
                 if let PollingState::Poll { .. } = &nextState.polling  {
                     self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                 };
-                self.output.push_back(EngineOutput::Data(Participant::Client, Payload::Close))
+                self.output.push_back(EngineOutput::Data(Participant::Client, Payload::Close));
             }
             // Intial setup 
             (TransportState::New, TransportState::Connected { .. } ) => {
@@ -254,6 +258,13 @@ impl Engine
                         Participant::Server, Payload::Open(serde_json::to_vec(&data).unwrap())
                     )
                 );
+
+                if let PollingState::Continuous = nextState.polling {
+                    self.output.push_back(
+                        EngineOutput::StoreIO(Participant::Server)
+                    );
+                }
+
                 // START TICK TOCK 
                 self.output.push_back(
                     EngineOutput::Tick { length: nextState.poll_timeout }

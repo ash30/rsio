@@ -11,7 +11,6 @@ pub enum EngineInput {
     Close(Participant),
     Data(Participant, Payload),
     Poll,
-    Listen(Participant),
     Tock
 }
 
@@ -25,7 +24,7 @@ pub enum EngineKind {
 #[derive(Debug)]
 pub enum EngineOutput {
     Tick { length:Duration },
-    Reset,
+    SetIO(Participant, bool),
     Data(Participant, Payload),
 }
 

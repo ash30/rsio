@@ -3,7 +3,7 @@ use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::{Message};
 
-use crate::{async_session_io_create, EngineInput, session_collect, EngineInputError};
+use crate::{async_session_io_create, EngineInput, session_stream, EngineInputError};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
@@ -90,57 +90,62 @@ where F: NewConnectionService + 'static
 
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
-                    let server_events_stream = io.input(sid, EngineInput::Listen(Participant::Server)).await;
-                    let mut to_send = io.input(sid, EngineInput::Listen(Participant::Client)).await;
+                    let mut s = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
+                    let res = session_stream(s).await;
 
-                   <F as NewConnectionService>::new_connection(
-                       &client,
-                       server_events_stream,
-                        crate::io::AsyncSessionIOSender::new(sid,io.clone())
-                   );
+                    let s2 = io.input(sid, EngineInput::Poll).await;
+                    let res2 = session_stream(s2).await;
 
-                    actix_rt::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                Some(Ok(start)) = res.next() => {
-                                    dbg!();
-                                    let p = start.as_bytes(sid);
-                                    session.text(String::from_utf8(p).unwrap()).await;
-                                },
-
-                                ingress = msg_stream.next() => {
-                                    let payload = match ingress {
-                                        Some(Ok(m)) => {
-                                            match m {
-                                                Message::Ping(bytes) => Payload::Ping,
-                                                Message::Pong(bytes) => Payload::Pong,
-                                                // TODO: 
-                                                Message::Text(s) => Payload::Message(s.to_string().as_bytes().to_vec()),
-                                                Message::Binary(bytes) => Payload::Message(bytes.to_vec()),
-                                                Message::Close(bytes) => break,
-                                                Message::Continuation(bytes) => Payload::Ping,
-                                                Message::Nop =>  Payload::Ping,
-                                            }
-                                        },
-                                        _ => break
-                                    };
-                                    io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
+                    match (res,res2) {
+                        (Ok(server_stream), Ok(client_stream)) => {
+                           <F as NewConnectionService>::new_connection(
+                               &client,
+                               server_stream,
+                                crate::io::AsyncSessionIOSender::new(sid,io.clone())
+                           );
+                            //std::pin::pin!(client_stream);
+                            //std::pin::pin!(msg_stream);
+                            let client_stream = Box::pin(client_stream);
+                            actix_rt::spawn(async move {
+                                loop {
+                                    tokio::select! {
+                                        ingress = msg_stream.next() => {
+                                            let payload = match ingress {
+                                                Some(Ok(m)) => {
+                                                    match m {
+                                                        Message::Ping(bytes) => Payload::Ping,
+                                                        Message::Pong(bytes) => Payload::Pong,
+                                                        // TODO: 
+                                                        Message::Text(s) => Payload::Message(s.to_string().as_bytes().to_vec()),
+                                                        Message::Binary(bytes) => Payload::Message(bytes.to_vec()),
+                                                        Message::Close(bytes) => break,
+                                                        Message::Continuation(bytes) => Payload::Ping,
+                                                        Message::Nop =>  Payload::Ping,
+                                                    }
+                                                },
+                                                _ => break
+                                            };
+                                            io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
+                                        }
+                                        engress = client_stream.next() => {
+                                            match engress {
+                                                Some(Payload::Message(d)) => session.text(String::from_utf8(d).unwrap()).await,
+                                                Some(Payload::Close) => break,
+                                                _ => Ok(())
+                                                
+                                            };
+                                        }
+                                    }
                                 }
+                                let _ = session.close(None).await;
+                            });
 
-                                engress = to_send.next() => {
-                                    match engress {
-                                        Some(Ok(Payload::Message(d))) => session.text(String::from_utf8(d).unwrap()).await,
-                                        Some(Ok(Payload::Close)) => break,
-                                        Some(Err(e)) => { break},
-                                        _ => Ok(())
-                                        
-                                    };
-                                }
-                            }
+
                         }
-                        let _ = session.close(None).await;
-                    });
+                        _ => {}
+                    };
+
+
 
 
                     response
@@ -164,7 +169,8 @@ where F: NewConnectionService + 'static
                 let io = io.clone();
                 async move {
                     if let Some(sid) = session.sid {
-                        let res = io.input(sid, EngineInput::Poll(uuid::Uuid::new_v4())).await;
+                        let s = io.input(sid, EngineInput::Poll).await;
+                        let res = session_stream(s).await;
                         let (all, reason) = session_collect(res).await;
                         let mut response = if let Some(e) = reason {
                             match e {
