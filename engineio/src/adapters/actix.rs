@@ -3,7 +3,7 @@ use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 use actix_ws::{Message};
 
-use crate::{async_session_io_create, EngineInput, session_stream, EngineInputError};
+use crate::{async_session_io_create, EngineInput, EngineInputError};
 use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
@@ -90,14 +90,11 @@ where F: NewConnectionService + 'static
 
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut s = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
-                    let res = session_stream(s).await;
+                    let s = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
+                    let s2 = io.input(sid, EngineInput::Listen).await;
 
-                    let s2 = io.input(sid, EngineInput::Poll).await;
-                    let res2 = session_stream(s2).await;
-
-                    match (res,res2) {
-                        (Ok(server_stream), Ok(client_stream)) => {
+                    match (s2,s) {
+                        (Ok(Some(server_stream)), Ok(Some(mut client_stream))) => {
                            <F as NewConnectionService>::new_connection(
                                &client,
                                server_stream,
@@ -105,7 +102,6 @@ where F: NewConnectionService + 'static
                            );
                             //std::pin::pin!(client_stream);
                             //std::pin::pin!(msg_stream);
-                            let client_stream = Box::pin(client_stream);
                             actix_rt::spawn(async move {
                                 loop {
                                     tokio::select! {
@@ -128,11 +124,10 @@ where F: NewConnectionService + 'static
                                             io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
                                         }
                                         engress = client_stream.next() => {
-                                            match engress {
-                                                Some(Payload::Message(d)) => session.text(String::from_utf8(d).unwrap()).await,
-                                                Some(Payload::Close) => break,
-                                                _ => Ok(())
-                                                
+                                            dbg!(&engress);
+                                            match &engress {
+                                                Some(p) => session.text(String::from_utf8(p.as_bytes(sid)).unwrap()).await,
+                                                None => break
                                             };
                                         }
                                     }
@@ -170,27 +165,25 @@ where F: NewConnectionService + 'static
                 async move {
                     if let Some(sid) = session.sid {
                         let s = io.input(sid, EngineInput::Poll).await;
-                        let res = session_stream(s).await;
-                        let (all, reason) = session_collect(res).await;
-                        let mut response = if let Some(e) = reason {
-                            match e {
-                                EngineInputError::InvalidPoll => HttpResponse::BadRequest(),
-                                _ => HttpResponse::InternalServerError(),
+                        match s {
+                            Err(e) =>  HttpResponse::BadRequest().body(""),
+                            Ok(None) => HttpResponse::InternalServerError().body(""),
+                            Ok(Some(s)) => {
+                                let all = s.collect::<Vec<Payload>>().await;
+
+                                let res_size = all.len();
+                                let seperator = b"\x1e";
+                                let combined: Vec<u8> = all.into_iter()
+                                    .map(|p| p.as_bytes(sid))
+                                    .enumerate()
+                                    .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
+                                    .flat_map(|a| a )
+                                    .collect();
+
+                                dbg!(&combined);
+                                HttpResponse::Ok().body(combined)
                             }
                         }
-                        else { HttpResponse::Ok() };
-
-                        let res_size = all.len();
-                        let seperator = b"\x1e";
-                        let combined: Vec<u8> = all.into_iter()
-                            .map(|p| p.as_bytes(sid))
-                            .enumerate()
-                            .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
-                            .flat_map(|a| a )
-                            .collect();
-
-                        dbg!(&combined);
-                        response.body(combined)
                     }
                     else {
                         HttpResponse::BadRequest().body(vec![])
@@ -214,24 +207,41 @@ where F: NewConnectionService + 'static
                 async move {
                     let sid = uuid::Uuid::new_v4();
                     let res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
-                    let server_events_stream = io.input(sid, EngineInput::Listen(Participant::Server)).await;
 
-                    // GET 
-                    //
-                    <F as NewConnectionService>::new_connection(
-                        &client,
-                        server_events_stream,
-                        crate::io::AsyncSessionIOSender::new(sid,io)
-                    );
+                    dbg!();
+                    match res {
+                        Err(e) => {  dbg!(e); dbg!(HttpResponse::BadRequest().body(""))},
+                        Ok(None) => dbg!(HttpResponse::BadRequest().body("")),
+                        Ok(Some(s)) => {
 
-                    let r = res.collect::<Vec<Result<Payload,EngineInputError>>>().await;
-                
-                    // TODO: WHY DOES LAST ERORR ?
-                    match r.first() {
-                        None => HttpResponse::InternalServerError().body(vec![]),
-                        Some(Ok(p)) => HttpResponse::Ok().body(p.as_bytes(sid.clone())),
-                        Some(Err(e)) => HttpResponse::BadRequest().body(vec![])
+
+                            dbg!();
+                            if let Ok(Some(server_stream)) = io.input(sid, EngineInput::Listen).await {
+                                dbg!();
+                                <F as NewConnectionService>::new_connection(
+                                    &client,
+                                    server_stream,
+                                    crate::io::AsyncSessionIOSender::new(sid,io)
+                                );
+                            }
+
+                            let all = s.take(1).collect::<Vec<Payload>>().await;
+                            let res_size = all.len();
+                            let seperator = b"\x1e";
+                            let combined: Vec<u8> = all.into_iter()
+                                .map(|p| p.as_bytes(sid))
+                                .enumerate()
+                                .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
+                                .flat_map(|a| a )
+                                .collect();
+
+                            dbg!(&combined);
+
+                            HttpResponse::Ok().body(combined)
+
+                        }
                     }
+
 
                 }
             }

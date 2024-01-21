@@ -11,6 +11,7 @@ pub enum EngineInput {
     Close(Participant),
     Data(Participant, Payload),
     Poll,
+    Listen,
     Tock
 }
 
@@ -52,7 +53,7 @@ impl fmt::Display for EngineInput {
         let output = match self {
             Self::Tock  => "Tock",
             Self::Poll => "POLL",
-            Self::Listen(..) => "LISTEN",
+            Self::Listen => "LISTEN",
             Self::New(..) => "NEW",
             Self::Data(p,d) => "DATA",
             Self::Close(..) => "CLOSE",

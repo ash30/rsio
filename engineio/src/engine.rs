@@ -42,6 +42,7 @@ pub struct EngineState {
     polling: PollingState, 
     poll_timeout:Duration,
     poll_duration: Duration,
+    max_payload: u32,
 }
 
 impl EngineState {
@@ -50,7 +51,8 @@ impl EngineState {
             transport: TransportState::New,
             polling: PollingState::Poll { active: None },
             poll_timeout: Duration::from_secs(2),
-            poll_duration: Duration::from_secs(10)
+            poll_duration: Duration::from_secs(10),
+            max_payload: 1000000
         }   
     }
 }
@@ -92,6 +94,8 @@ impl Engine
         };
 
         let res = match input {
+            EngineInput::Listen => Ok(()),
+
             EngineInput::New(config, kind) => {
                 match &currentState.transport {
                     TransportState::New => {
@@ -99,6 +103,7 @@ impl Engine
                         // Update timeouts
                         nextState.poll_timeout = Duration::from_millis(config.ping_timeout.into());
                         nextState.poll_duration= Duration::from_millis(config.ping_interval.into());
+                        nextState.max_payload = config.max_payload;
                         nextState.polling = match kind {
                             EngineKind::Continuous => PollingState::Continuous,
                             EngineKind::Poll => PollingState::Poll { active: None }
@@ -164,6 +169,7 @@ impl Engine
                 match currentState.polling {
                     PollingState::Poll { active:Some(..) } => {
                         nextState.transport = TransportState::Closed(EngineCloseReason::Error(EngineError::InvalidPollRequest));
+                        nextState.polling = PollingState::Poll { active: Some( Duration::from_millis(1)) };
                         Err(EngineInputError::InvalidPoll)
                     },
 
@@ -204,24 +210,28 @@ impl Engine
         let currentState = &self.state;
         let mut nextState = self.state.clone();
 
+        // Special case LISTEN ... Is there a better way?
+        if let EngineInput::Listen = &input {
+            self.output.push_back(EngineOutput::SetIO(Participant::Server, true));
+        }
+
         // CALCULATE NEXT STATE
         let mut output = Engine::update(now, input, currentState, &mut nextState, self.poll_buffer.len())?;
 
         // FORWARD TO CORRECT BUFFER
         let output_buffer = if let PollingState::Poll { .. } = nextState.polling { &mut self.poll_buffer } else { &mut self.output};
         output.drain(0..).for_each(|p| output_buffer.push_back(p));
-        
 
         // WORK OUT DISPATCH
         match (&currentState.polling, &nextState.polling) { 
             // FINISHED POLLING - DRAIN BUFFER
             (PollingState::Poll { active:Some(..)},PollingState::Poll { active:None }) => {
                 self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-                self.output.push_back(EngineOutput::ResetIO(Participant::Client));
+                self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
             }
 
             (PollingState::Poll { active:None},PollingState::Poll { active:Some(..) }) => {
-                self.output.push_back(EngineOutput::StoreIO(Participant::Client));
+                self.output.push_back(EngineOutput::SetIO(Participant::Client, true));
             }
 
             // UPDATED POLL DURATION
@@ -241,27 +251,32 @@ impl Engine
                 if let PollingState::Poll { .. } = &nextState.polling  {
                     self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                 };
-                self.output.push_back(EngineOutput::Data(Participant::Client, Payload::Close));
+                self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Close));
+                self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
             }
             // Intial setup 
             (TransportState::New, TransportState::Connected { .. } ) => {
                 let upgrades = if let PollingState::Continuous = nextState.polling { vec![] } else { vec!["websocket"] };
                 let data = serde_json::json!({
                     "upgrades": upgrades,
-                    //"maxPayload": config.max_payload,
-                    "pingInterval": nextState.poll_duration,
-                    "pingTimeout": nextState.poll_timeout,
+                    "maxPayload": nextState.max_payload,
+                    "pingInterval": nextState.poll_duration.as_millis(),
+                    "pingTimeout": nextState.poll_timeout.as_millis(),
                     "sid":  self.session
                 });
+                self.output.push_back(
+                    EngineOutput::SetIO(Participant::Client, true)
+                );
+
                 self.output.push_back(
                     EngineOutput::Data(
                         Participant::Server, Payload::Open(serde_json::to_vec(&data).unwrap())
                     )
                 );
 
-                if let PollingState::Continuous = nextState.polling {
+                if let PollingState::Poll {..} = nextState.polling {
                     self.output.push_back(
-                        EngineOutput::StoreIO(Participant::Server)
+                        EngineOutput::SetIO(Participant::Client, false)
                     );
                 }
 

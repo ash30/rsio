@@ -4,14 +4,15 @@ use futures_util::Stream;
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::Receiver;
 use crate::EngineInputError;
 use crate::EngineInput;
 use crate::EngineOutput;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 
-type AsyncIOSender = Sender<Result<Payload,EngineInputError>>;
 
-type AsyncIOInput = tokio::sync::oneshot::Sender<Result<Option<Sender<Payload>>,EngineInputError>>;
+type AsyncIOInputFoo = Result<Option<Receiver<Payload>>,EngineInputError>;
+type AsyncIOInput = tokio::sync::oneshot::Sender<Result<Option<Receiver<Payload>>,EngineInputError>>;
 
 pub fn async_session_io_create() -> AsyncSessionIOHandle {
     let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
@@ -19,8 +20,8 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
     let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
 
     let mut engines: HashMap<Sid,Engine> = HashMap::new();
-    let mut server_recv: HashMap<Sid, AsyncIOInput> = HashMap::new();
-    let mut client_recv: HashMap<Sid, AsyncIOInput> = HashMap::new();
+    let mut server_recv: HashMap<Sid, Sender<Payload>> = HashMap::new();
+    let mut client_recv: HashMap<Sid, Sender<Payload>> = HashMap::new();
 
     tokio::spawn( async move {
         loop {
@@ -37,31 +38,38 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                 _ => engines.get_mut(&sid)
             };
 
-            let output = engine.ok_or(EngineInputError::AlreadyClosed)
+            dbg!(&engine.is_some());
+
+            let output = engine.ok_or(EngineInputError::OpenFailed)
                 .and_then(|e| e.consume(input, Instant::now()).and(Ok(e)))
                 .and_then(|e| { let mut b = vec![]; while let Some(p) = e.poll_output() { b.push(p); }; Ok(b) });
 
-            match output {
+            let response = match output {
                 Err(e) => {
-                    if let Some(t) = tx {
-                        t.send(Err(e));
-                    }
+                    Err(e)
                 },
                 Ok(output) => {
+                    let mut res = None;
                     for o in output {
+                        dbg!(&o);
                         match o {
                             EngineOutput::Data(participant, data) => {
-                                let sender = if let Participant::Client = participant {server_recv.get(&sid)} else { client_recv.get(&sid) };
+                                let map = if let Participant::Client = participant { &mut server_recv } else { &mut client_recv };
+                                let sender = map.get(&sid);
+                                dbg!(sender.is_some());
                                 if let Some(sender) = sender {
-                                    sender.send(Ok(data));
+                                    dbg!(sender.send(data).await);
                                 };
-                                None
                             },
-                            EngineOutput::SetIO(participant, close ) => {
-                                let map = if let Participant::Server = participant { server_recv } else { client_recv };
+                            EngineOutput::SetIO(participant, true ) => {
+                                let map = if let Participant::Server = participant { &mut server_recv } else { &mut client_recv };
                                 let (tx,rx) = tokio::sync::mpsc::channel::<Payload>(10);
                                 map.insert(sid, tx);
-                                Some(rx)
+                                res = Some(rx);
+                            },
+                            EngineOutput::SetIO(participant, false) => {
+                                let map = if let Participant::Server = participant { &mut server_recv } else { &mut client_recv };
+                                map.remove(&sid);
                             },
                             EngineOutput::Tick { length } => {
                                 let tx = time_tx.clone();
@@ -69,13 +77,17 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                                     tokio::time::sleep(length).await; 
                                     tx.send((sid, EngineInput::Tock, None)).await
                                 });
-                                None
                             }
-                        };
-                    };
-                    drop(tx);
+                        }
+                    }
+                    Ok(res)
                 }
             };
+
+            if let Some(tx) = tx { 
+                dbg!(&response);
+                tx.send(response);
+            }
 
         }
     });
@@ -94,10 +106,12 @@ pub struct AsyncSessionIOHandle {
 
 impl AsyncSessionIOHandle {
 
-    pub async fn input(&self, id:Sid, input:EngineInput) -> impl Stream<Item=Result<Payload,EngineInputError>> {
-        let (tx,rx) = tokio::sync::mpsc::channel::<Result<Payload,EngineInputError>>(10);
+    pub async fn input(&self, id:Sid, input:EngineInput) -> Result<Option<impl Stream<Item =Payload>>,EngineInputError> {
+        //let (tx,rx) = tokio::sync::oneshot::channel::<,EngineInputError>>(10);
+        let (tx,rx) = tokio::sync::oneshot::channel::<AsyncIOInputFoo>();
         let _ = self.client_send_tx.send((id,input, Some(tx))).await;
-        return tokio_stream::wrappers::ReceiverStream::new(rx);
+        let res = rx.await.unwrap_or(Err(EngineInputError::AlreadyClosed));
+        return res.and_then(|opt| Ok(opt.and_then(|rx| Some(tokio_stream::wrappers::ReceiverStream::new(rx)))))
     }
 }
 
@@ -119,14 +133,6 @@ impl AsyncSessionIOSender {
    }
 }
 
-pub async fn session_stream(s: impl Stream<Item=Result<Payload,EngineInputError>> ) -> Result<impl Stream<Item=Payload>,EngineInputError> { 
-    let mut stream = Box::pin(s);
-    match stream.next().await {
-        None => Err(EngineInputError::AlreadyClosed),
-        Some(Err(e)) => Err(e.clone()),
-        Some(Ok(p)) => Ok(stream.filter_map(|a| async move { a.ok() }))
-    }
-}
 
 
 
