@@ -12,8 +12,11 @@ impl NewConnectionService for NewConnectionManager {
             pin_mut!(stream);
             
             loop {
-                let p = stream.next().await;
-                if let Some(p) = p {  emit.send(p).await; }
+                match stream.next().await {
+                    None => break,
+                    Some(engineio::Payload::Message(d)) => emit.send(engineio::Payload::Message(d)).await,
+                    _ => {}
+                }
             }
 
         });

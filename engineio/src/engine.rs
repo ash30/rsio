@@ -18,7 +18,7 @@ pub enum Participant {
 
 #[derive(Debug, Clone)]
 pub enum PollingState {
-    Poll { active:Option<Duration>},
+    Poll { active:Option<(Instant,Duration)>},
     Continuous ,
 }
 
@@ -77,22 +77,13 @@ impl Engine
     }
 
     pub fn poll_output(&mut self) -> Option<EngineOutput> { 
-        self.output.pop_front()
+        dbg!(self.output.pop_front())
     }
 
     fn update(now:Instant, input:EngineInput, currentState:&EngineState, nextState:&mut EngineState, poll_buf_length:usize) -> Result<Vec<EngineOutput>,EngineInputError> {
 
         let mut output = Vec::new();
         // Before Consuming event, make sure poll timeout is valid
-        match &currentState.transport {
-            TransportState::Connected { last_poll } => {
-                if now > *last_poll + currentState.poll_timeout{
-                    nextState.transport = TransportState::Closed(EngineCloseReason::Timeout);
-                }
-            }
-            _ => {}
-        };
-
         let res = match input {
             EngineInput::Listen => Ok(()),
 
@@ -146,10 +137,9 @@ impl Engine
             EngineInput::Tock => {
 
                 match currentState.polling { 
-                        // we MUST make sure only origial poll can udpate state 
-                    PollingState::Poll { active:Some(duration) } => {
+                    PollingState::Poll { active:Some((start, duration)) } => {
                         let is_complete = if let TransportState::Connected { last_poll } = currentState.transport { 
-                            last_poll + currentState.poll_timeout > now 
+                            start + duration > now 
                         }
                         else { true } ;
 
@@ -157,6 +147,13 @@ impl Engine
                             nextState.polling = PollingState::Poll { active: None};
                         }
                     },
+                    PollingState::Poll { active:None } => {
+                        if let TransportState::Connected { last_poll } = currentState.transport { 
+                            if now > last_poll + currentState.poll_timeout {
+                                nextState.transport = TransportState::Closed(EngineCloseReason::Timeout);
+                            }
+                        }
+                    }
 
                     _ => {}
                 };
@@ -166,28 +163,29 @@ impl Engine
             EngineInput::Poll => {
                 // POLLs are one of the inputs that are independant of current connection state
                 // BUT CAN mutate it 
-                match currentState.polling {
-                    PollingState::Poll { active:Some(..) } => {
+
+                match (&currentState.polling, &currentState.transport) {
+                    (PollingState::Poll { active:Some(..) }, TransportState::Closed(..)) => {
+                        Err(EngineInputError::AlreadyClosed)
+                    },
+                    (PollingState::Poll { active:Some(..) }, _ ) => {
                         nextState.transport = TransportState::Closed(EngineCloseReason::Error(EngineError::InvalidPollRequest));
-                        nextState.polling = PollingState::Poll { active: Some( Duration::from_millis(1)) };
+                        nextState.polling = PollingState::Poll { active: Some( (now,Duration::from_millis(1))) };
                         Err(EngineInputError::InvalidPoll)
                     },
-
-                    PollingState::Poll { active:None } => {
+                    (PollingState::Poll { active:None }, TransportState::Connected { last_poll }) => {
                         if poll_buf_length > 0 {
-                            nextState.polling = PollingState::Poll { active: Some( Duration::from_secs(1)) };
+                            nextState.polling = PollingState::Poll { active: Some( (now,Duration::from_secs(1))) };
                         }
                         else {
-                            nextState.polling = PollingState::Poll { active: Some( currentState.poll_duration) }
+                            nextState.polling = PollingState::Poll { active: Some( (now,currentState.poll_duration)) };
                         }
                         Ok(())
                     },
-
-                    PollingState::Continuous{ .. } => {
-                        Ok(())
-                    },
-
+                    (PollingState::Poll { active:None }, TransportState::Closed(..)) => Err(EngineInputError::AlreadyClosed),
+                    _ =>  Err(EngineInputError::InvalidPoll),
                 }
+
             },
             EngineInput::Close(..) => {
                 match currentState.transport {
@@ -206,9 +204,10 @@ impl Engine
     }
     
     pub fn consume(&mut self, input:EngineInput, now:Instant) -> Result<(), EngineInputError> {
-        dbg!();
+        dbg!(&input);
         let currentState = &self.state;
         let mut nextState = self.state.clone();
+
 
         // Special case LISTEN ... Is there a better way?
         if let EngineInput::Listen = &input {
@@ -216,11 +215,25 @@ impl Engine
         }
 
         // CALCULATE NEXT STATE
-        let mut output = Engine::update(now, input, currentState, &mut nextState, self.poll_buffer.len())?;
+        let mut output = Engine::update(now, input, currentState, &mut nextState, self.poll_buffer.len());
+
+        dbg!(&nextState);
 
         // FORWARD TO CORRECT BUFFER
-        let output_buffer = if let PollingState::Poll { .. } = nextState.polling { &mut self.poll_buffer } else { &mut self.output};
-        output.drain(0..).for_each(|p| output_buffer.push_back(p));
+        let err = match output {
+            Ok(mut output) => {
+                output.drain(0..).for_each(|p| { 
+                    let output_buffer = if let PollingState::Poll { .. } = nextState.polling { &mut self.poll_buffer } else { &mut self.output};
+                    match &p {
+                        EngineOutput::Data(Participant::Server, d ) => output_buffer.push_back(p),
+                        EngineOutput::Data(Participant::Client,d ) => self.output.push_back(p),
+                        _ => {},
+                    }
+                });
+                None
+            },
+            Err(e) => Some(e)
+        };
 
         // WORK OUT DISPATCH
         match (&currentState.polling, &nextState.polling) { 
@@ -235,10 +248,12 @@ impl Engine
             }
 
             // UPDATED POLL DURATION
-            (PollingState::Poll { active:Some(old) }, PollingState::Poll { active:Some(new) } )=> {
-                self.output.push_back(
-                    EngineOutput::Tick { length: *new }
-                )
+            (PollingState::Poll { active:Some((old_start,old_length)) }, PollingState::Poll { active:Some((new_start,new_length)) } )=> {
+                if old_length != new_length {
+                    self.output.push_back(
+                        EngineOutput::Tick { length: *new_length }
+                    )
+                }
             }
             _ => {}
         };
@@ -251,6 +266,7 @@ impl Engine
                 if let PollingState::Poll { .. } = &nextState.polling  {
                     self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                 };
+                dbg!();
                 self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Close));
                 self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
             }
@@ -288,7 +304,7 @@ impl Engine
 
             // UPDATED LAST POLL
             (TransportState::Connected { last_poll}, TransportState::Connected { last_poll:new_last_poll }) => {
-                if new_last_poll > last_poll {
+                if new_last_poll != last_poll {
                     self.output.push_back(
                         EngineOutput::Tick { length: nextState.poll_timeout }
                     )
@@ -299,7 +315,7 @@ impl Engine
 
 
         self.state = nextState;
-        return Ok(())
+        return if let Some(e) = err { Err(e) } else { Ok(()) }
     }
 
 }

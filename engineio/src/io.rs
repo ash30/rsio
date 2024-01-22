@@ -30,15 +30,10 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                 Some(v2) = server_sent_rx.recv() => v2,
                 Some(v3) = time_rx.recv() => v3
             };
-
-            dbg!(&input);
-
             let engine = match &input  {
                 EngineInput::New(..) => Some(engines.entry(sid).or_insert(Engine::new(sid))),
                 _ => engines.get_mut(&sid)
             };
-
-            dbg!(&engine.is_some());
 
             let output = engine.ok_or(EngineInputError::OpenFailed)
                 .and_then(|e| e.consume(input, Instant::now()).and(Ok(e)))
@@ -51,7 +46,6 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                 Ok(output) => {
                     let mut res = None;
                     for o in output {
-                        dbg!(&o);
                         match o {
                             EngineOutput::Data(participant, data) => {
                                 let map = if let Participant::Client = participant { &mut server_recv } else { &mut client_recv };
