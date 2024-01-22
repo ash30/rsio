@@ -110,7 +110,7 @@ impl Engine
             },
             EngineInput::Data(src,payload) => {
                 match (src, payload) {
-                    (_, Payload::Close) => {
+                    (_, Payload::Close(..)) => {
                         nextState.transport = TransportState::Closed(EngineCloseReason::Command(Participant::Client));
                         Ok(())
                     },
@@ -262,12 +262,12 @@ impl Engine
             (TransportState::Closed(..), TransportState::Closed(..)) => {},
 
             // Initial Transition to Closed 
-            (_, TransportState::Closed(..)) => {
+            (_, TransportState::Closed(reason)) => {
                 if let PollingState::Poll { .. } = &nextState.polling  {
                     self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                 };
                 dbg!();
-                self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Close));
+                self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Close(reason.clone())));
                 self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
             }
             // Intial setup 

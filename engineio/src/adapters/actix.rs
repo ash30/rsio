@@ -97,7 +97,11 @@ where F: NewConnectionService + 'static
                         (Ok(Some(server_stream)), Ok(Some(mut client_stream))) => {
                            <F as NewConnectionService>::new_connection(
                                &client,
-                               server_stream,
+                               server_stream.filter_map(|p| match p { 
+                                    Payload::Message(d) => Some(Ok(d)),
+                                    Payload::Close(r) => Some(Err(r)),
+                                    _ => None,
+                               }),
                                 crate::io::AsyncSessionIOSender::new(sid,io.clone())
                            );
                             //std::pin::pin!(client_stream);
@@ -220,7 +224,11 @@ where F: NewConnectionService + 'static
                                 dbg!();
                                 <F as NewConnectionService>::new_connection(
                                     &client,
-                                    server_stream,
+                                    server_stream.filter_map(|p| match p { 
+                                         Payload::Message(d) => Some(Ok(d)),
+                                         Payload::Close(r) => Some(Err(r)),
+                                         _ => None,
+                                    }),
                                     crate::io::AsyncSessionIOSender::new(sid,io)
                                 );
                             }

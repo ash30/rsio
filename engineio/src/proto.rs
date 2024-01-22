@@ -3,6 +3,7 @@ use std::time::Duration;
 use std::u8;
 
 use crate::Participant;
+use crate::EngineCloseReason;
 pub type Sid = uuid::Uuid;
 
 #[derive(Debug)]
@@ -68,7 +69,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone,Debug)]
 pub enum Payload {
     Open(Vec<u8>),
-    Close,
+    Close(EngineCloseReason),
     Ping,
     Pong,
     Message(Vec<u8>),
@@ -81,7 +82,7 @@ impl Payload{
     pub fn as_bytes(&self, sid:Sid) -> Vec<u8>{
         let (prefix, data) = match &self{
             Payload::Open(data) => ("0", Some(data.to_owned())),
-            Payload::Close => ("1", None),
+            Payload::Close(reason) => ("1", None),
             Payload::Ping => ("2", None),
             Payload::Pong => ("3", None),
             Payload::Message(p) => ("4", Some(p.to_owned())),
