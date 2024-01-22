@@ -118,6 +118,14 @@ impl Engine
                     (_, Payload::Upgrade) => Ok(()),
 
                     (Participant::Client,p) => {
+
+                        // PONGS will update last poll 
+                        if let Payload::Pong = p {
+                            if let TransportState::Connected { last_poll } = currentState.transport {
+                                nextState.transport = TransportState::Connected { last_poll: now }
+                            }
+                        }
+
                         output.push(EngineOutput::Data(Participant::Client, p));
                         Ok(())
                     },
@@ -239,12 +247,27 @@ impl Engine
         match (&currentState.polling, &nextState.polling) { 
             // FINISHED POLLING - DRAIN BUFFER
             (PollingState::Poll { active:Some(..)},PollingState::Poll { active:None }) => {
+                let buf_len = self.poll_buffer.len();
                 self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
+
+
+                // SEEMS WE SHOULD ONLY SEND PING WHEN CONNECTED AND POLL WAS EMPTY ?
+                if let TransportState::Connected { .. } = &nextState.transport {
+                    if buf_len == 0 {
+                        self.output.push_back(
+                            EngineOutput::Data(Participant::Server, Payload::Ping)
+                        );
+                    }
+                }
+
                 self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
             }
 
-            (PollingState::Poll { active:None},PollingState::Poll { active:Some(..) }) => {
+            (PollingState::Poll { active:None},PollingState::Poll { active:Some((start,length)) }) => {
                 self.output.push_back(EngineOutput::SetIO(Participant::Client, true));
+                self.output.push_back(
+                    EngineOutput::Tick { length: *length }
+                );
             }
 
             // UPDATED POLL DURATION
