@@ -8,9 +8,30 @@ use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant }
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
 
-impl From<actix_ws::Message> for WebsocketEvent {
-    fn from(value: actix_ws::Message) -> Self {
-        Self::Ping
+pub enum MessageParsingError {
+    UnknownType
+}
+impl TryFrom<actix_ws::Message> for Payload {
+    type Error = MessageParsingError;
+    fn try_from(value: actix_ws::Message) -> Result<Self, Self::Error> {
+        match value {
+            actix_ws::Message::Text(d) => {
+                let mut iter = d.into_bytes().into_iter();
+                match iter.next() {
+                    None => Err(MessageParsingError::UnknownType),
+                    Some(b'0') => Ok(Payload::Open(vec![])),
+                    Some(b'1') => Ok(Payload::Close(crate::EngineCloseReason::Timeout)),
+                    Some(b'2') => Ok(Payload::Ping),
+                    Some(b'3') => Ok(Payload::Pong),
+                    Some(b'4') => Ok(Payload::Message(iter.collect::<Vec<u8>>())),
+                    Some(b'5') => Ok(Payload::Upgrade),
+                    Some(b'6') => Ok(Payload::Noop),
+                    _ => Err(MessageParsingError::UnknownType)
+                }
+            },
+            _ => Err(MessageParsingError::UnknownType)
+        }
+        
     }
 }
 
@@ -111,26 +132,20 @@ where F: NewConnectionService + 'static
                                     tokio::select! {
                                         ingress = msg_stream.next() => {
                                             let payload = match ingress {
-                                                Some(Ok(m)) => {
-                                                    match m {
-                                                        Message::Ping(bytes) => Payload::Ping,
-                                                        Message::Pong(bytes) => Payload::Pong,
-                                                        // TODO: 
-                                                        Message::Text(s) => Payload::Message(s.to_string().as_bytes().to_vec()),
-                                                        Message::Binary(bytes) => Payload::Message(bytes.to_vec()),
-                                                        Message::Close(bytes) => break,
-                                                        Message::Continuation(bytes) => Payload::Ping,
-                                                        Message::Nop =>  Payload::Ping,
-                                                    }
-                                                },
+                                                Some(Ok(m)) => Payload::try_from(m),
                                                 _ => break
                                             };
-                                            io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
+                                            if let Ok(payload) = payload {
+                                                io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
+                                            }
                                         }
                                         engress = client_stream.next() => {
-                                            dbg!(&engress);
                                             match &engress {
-                                                Some(p) => session.text(String::from_utf8(p.as_bytes(sid)).unwrap()).await,
+                                                Some(p) => { 
+                                                    match &p {
+                                                        _ => dbg!(session.text(String::from_utf8(p.as_bytes(sid)).unwrap()).await),
+                                                    }
+                                                },
                                                 None => break
                                             };
                                         }

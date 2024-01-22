@@ -322,7 +322,8 @@ impl Engine
                 // START TICK TOCK 
                 self.output.push_back(
                     EngineOutput::Tick { length: nextState.poll_timeout }
-                )
+                );
+                self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Ping));
             }
 
             // UPDATED LAST POLL
@@ -332,10 +333,13 @@ impl Engine
                         EngineOutput::Tick { length: nextState.poll_timeout }
                     )
                 }
+                if let PollingState::Continuous =  &nextState.polling {
+                    self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Ping))
+                }
             }
             _ => {}
         };
-
+ 
 
         self.state = nextState;
         return if let Some(e) = err { Err(e) } else { Ok(()) }
