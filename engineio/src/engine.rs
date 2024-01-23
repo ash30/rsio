@@ -6,7 +6,7 @@ pub use crate::proto::*;
 #[derive(Debug, Clone)]
 pub enum TransportState { 
     New,
-    Connected { last_poll:Instant },
+    Connected { last_poll:Instant, last_ping:Option<Instant>},
     Closed(EngineCloseReason)
 }
 
@@ -19,7 +19,7 @@ pub enum Participant {
 #[derive(Debug, Clone)]
 pub enum PollingState {
     Poll { active:Option<(Instant,Duration)>},
-    Continuous ,
+    Continuous,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +99,7 @@ impl Engine
                             EngineKind::Continuous => PollingState::Continuous,
                             EngineKind::Poll => PollingState::Poll { active: None }
                         };
-                        nextState.transport = TransportState::Connected { last_poll: now };
+                        nextState.transport = TransportState::Connected { last_poll: now, last_ping:None };
                         Ok(())
                     },
                     _ => {
@@ -119,11 +119,9 @@ impl Engine
 
                     (Participant::Client,p) => {
 
-                        // PONGS will update last poll 
-                        if let Payload::Pong = p {
-                            if let TransportState::Connected { last_poll } = currentState.transport {
-                                nextState.transport = TransportState::Connected { last_poll: now }
-                            }
+                        // ALL information from client acts as a heartbeat 
+                        if let TransportState::Connected { last_poll, last_ping } = currentState.transport {
+                            nextState.transport = TransportState::Connected { last_poll: now , last_ping:None}
                         }
 
                         output.push(EngineOutput::Data(Participant::Client, p));
@@ -143,34 +141,53 @@ impl Engine
                 }
             },
             EngineInput::Tock => {
-
-                match currentState.polling { 
-                    PollingState::Poll { active:Some((start, duration)) } => {
-                        let is_complete = if let TransportState::Connected { last_poll } = currentState.transport { 
-                            start + duration > now 
-                        }
-                        else { true } ;
-
-                        if is_complete == true {
-                            nextState.polling = PollingState::Poll { active: None};
-                        }
-                    },
-                    PollingState::Poll { active:None } => {
-                        if let TransportState::Connected { last_poll } = currentState.transport { 
-                            if now > last_poll + currentState.poll_timeout {
-                                nextState.transport = TransportState::Closed(EngineCloseReason::Timeout);
+                match &currentState.transport {
+                    TransportState::Connected { last_poll, last_ping } => {
+                        if let PollingState::Poll { active:Some((start,duration)) } = &currentState.polling {
+                            if now > *start + *duration {
+                                nextState.polling = PollingState::Poll { active: None }
                             }
                         }
-                    }
 
+                        match (now > *last_poll + currentState.poll_duration, last_ping) {
+                            (true, None) => {
+                                // SEND PING OUT IF PING INTERVAL PASSED
+                                nextState.transport = TransportState::Connected { last_poll: *last_poll, last_ping: Some(now) };
+                                // IF poll is active, close out, IF NOT, no point in pinging
+                                match &currentState.polling {
+                                    PollingState::Poll { active:Some((start,..)) } => {
+                                        nextState.polling = PollingState::Poll { active: Some((*start,Duration::from_millis(100))) };
+                                    },
+                                    _ => {}
+                                }
+                                // TODO: We have to cut poll short to get PING out ...
+                            }
+                            (true, Some(last_ping)) => {
+                                if now > *last_ping + currentState.poll_timeout {
+                                    nextState.transport = TransportState::Closed(EngineCloseReason::Timeout);
+                                    if let PollingState::Poll { active:Some(..) } = currentState.polling {
+                                        nextState.polling = PollingState::Poll { active: None };
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    },
                     _ => {}
                 };
                 Ok(())
+
             },
 
             EngineInput::Poll => {
-                // POLLs are one of the inputs that are independant of current connection state
-                // BUT CAN mutate it 
+
+                // Treat Polls as PONGS, and reset last seens
+                match &currentState.transport {
+                    TransportState::Connected { .. } => {
+                        nextState.transport = TransportState::Connected { last_poll: now, last_ping: None };
+                    },
+                    _ => {}
+                };
 
                 match (&currentState.polling, &currentState.transport) {
                     (PollingState::Poll { active:Some(..) }, TransportState::Closed(..)) => {
@@ -181,7 +198,7 @@ impl Engine
                         nextState.polling = PollingState::Poll { active: Some( (now,Duration::from_millis(1))) };
                         Err(EngineInputError::InvalidPoll)
                     },
-                    (PollingState::Poll { active:None }, TransportState::Connected { last_poll }) => {
+                    (PollingState::Poll { active:None }, TransportState::Connected { last_poll, last_ping }) => {
                         if poll_buf_length > 0 {
                             nextState.polling = PollingState::Poll { active: Some( (now,Duration::from_secs(1))) };
                         }
@@ -249,18 +266,6 @@ impl Engine
             (PollingState::Poll { active:Some(..)},PollingState::Poll { active:None }) => {
                 let buf_len = self.poll_buffer.len();
                 self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
-
-
-                // SEEMS WE SHOULD ONLY SEND PING WHEN CONNECTED AND POLL WAS EMPTY ?
-                if let TransportState::Connected { .. } = &nextState.transport {
-                    if buf_len == 0 {
-                        self.output.push_back(
-                            EngineOutput::Data(Participant::Server, Payload::Ping)
-                        );
-                    }
-                }
-
-                self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
             }
 
             (PollingState::Poll { active:None},PollingState::Poll { active:Some((start,length)) }) => {
@@ -272,7 +277,7 @@ impl Engine
 
             // UPDATED POLL DURATION
             (PollingState::Poll { active:Some((old_start,old_length)) }, PollingState::Poll { active:Some((new_start,new_length)) } )=> {
-                if old_length != new_length {
+                if old_length != new_length || old_start != new_start {
                     self.output.push_back(
                         EngineOutput::Tick { length: *new_length }
                     )
@@ -295,7 +300,7 @@ impl Engine
             }
             // Intial setup 
             (TransportState::New, TransportState::Connected { .. } ) => {
-                let upgrades = if let PollingState::Continuous = nextState.polling { vec![] } else { vec!["websocket"] };
+                let upgrades = if let PollingState::Continuous {..} = nextState.polling { vec![] } else { vec!["websocket"] };
                 let data = serde_json::json!({
                     "upgrades": upgrades,
                     "maxPayload": nextState.max_payload,
@@ -321,25 +326,45 @@ impl Engine
 
                 // START TICK TOCK 
                 self.output.push_back(
-                    EngineOutput::Tick { length: nextState.poll_timeout }
+                    EngineOutput::Tick { length: nextState.poll_duration }
                 );
-                self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Ping));
             }
 
             // UPDATED LAST POLL
-            (TransportState::Connected { last_poll}, TransportState::Connected { last_poll:new_last_poll }) => {
+            (TransportState::Connected { last_poll, last_ping}, TransportState::Connected { last_poll:new_last_poll, last_ping: new_last_ping}) => {
                 if new_last_poll != last_poll {
                     self.output.push_back(
-                        EngineOutput::Tick { length: nextState.poll_timeout }
-                    )
+                       EngineOutput::Tick { length: nextState.poll_duration }
+                    );
                 }
-                if let PollingState::Continuous =  &nextState.polling {
-                    self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Ping))
+                else if last_ping != new_last_ping{
+                    if let Some(..) = new_last_ping {
+                        self.output.push_back(
+                           EngineOutput::Tick { length: nextState.poll_timeout }
+                        );
+                        match &nextState.polling {
+                            PollingState::Poll { active:None } => {},
+                            _ => {
+                                self.output.push_back(
+                                    EngineOutput::Data(
+                                        Participant::Server, Payload::Ping)
+                                );
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
         };
  
+        // TODO: WE have to do this last... but less hacky please 
+        match (&currentState.polling, &nextState.polling) { 
+            // FINISHED POLLING - DRAIN BUFFER
+            (PollingState::Poll { active:Some(..)},PollingState::Poll { active:None }) => {
+                self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
+            }
+            _ => {}
+        };
 
         self.state = nextState;
         return if let Some(e) = err { Err(e) } else { Ok(()) }

@@ -8,6 +8,7 @@ use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant }
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
 
+#[derive(Debug, Clone)]
 pub enum MessageParsingError {
     UnknownType
 }
@@ -131,10 +132,12 @@ where F: NewConnectionService + 'static
                                 loop {
                                     tokio::select! {
                                         ingress = msg_stream.next() => {
+                                            dbg!();
                                             let payload = match ingress {
                                                 Some(Ok(m)) => Payload::try_from(m),
                                                 _ => break
                                             };
+                                            dbg!(&payload);
                                             if let Ok(payload) = payload {
                                                 io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
                                             }
@@ -142,27 +145,27 @@ where F: NewConnectionService + 'static
                                         engress = client_stream.next() => {
                                             match &engress {
                                                 Some(p) => { 
-                                                    match &p {
-                                                        _ => dbg!(session.text(String::from_utf8(p.as_bytes(sid)).unwrap()).await),
-                                                    }
+                                                    dbg!(&p);
+                                                    let d = String::from_utf8(p.as_bytes(sid)).unwrap();
+                                                    dbg!(&d);
+                                                    dbg!(session.text(d.clone()).await);
+                                                    dbg!();
                                                 },
-                                                None => break
+                                                None => {
+                                                    dbg!();
+                                                    break
+                                                }
                                             };
                                         }
                                     }
                                 }
+                                dbg!();
                                 let _ = session.close(None).await;
                             });
-
-
-                        }
+                        },
                         _ => {}
                     };
-
-
-
-
-                    response
+                    return response
                 }
             }
             )
