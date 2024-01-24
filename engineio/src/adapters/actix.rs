@@ -115,7 +115,7 @@ where F: NewConnectionService + 'static
                                             match &engress {
                                                 Some(p) => { 
                                                     dbg!(&p);
-                                                    let d = String::from_utf8(p.as_bytes(sid)).unwrap();
+                                                    let d = String::from_utf8(p.as_bytes()).unwrap();
                                                     dbg!(&d);
                                                     dbg!(session.text(d.clone()).await);
                                                     dbg!();
@@ -165,7 +165,7 @@ where F: NewConnectionService + 'static
                                 let res_size = all.len();
                                 let seperator = b"\x1e";
                                 let combined: Vec<u8> = all.into_iter()
-                                    .map(|p| p.as_bytes(sid))
+                                    .map(|p| p.as_bytes())
                                     .enumerate()
                                     .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
                                     .flat_map(|a| a )
@@ -224,7 +224,7 @@ where F: NewConnectionService + 'static
                             let res_size = all.len();
                             let seperator = b"\x1e";
                             let combined: Vec<u8> = all.into_iter()
-                                .map(|p| p.as_bytes(sid))
+                                .map(|p| p.as_bytes())
                                 .enumerate()
                                 .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
                                 .flat_map(|a| a )
@@ -262,7 +262,6 @@ where F: NewConnectionService + 'static
                         if *data == b"\x1e"[0] {
                             buf.push(&body[start..n]);
                             start = n+1;
-                            println!("test1b");
                         }
                     }
                      buf.push(&body[start..body.len()]);

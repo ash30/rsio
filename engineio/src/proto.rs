@@ -78,8 +78,37 @@ pub enum Payload {
 }
 
 
+
+pub enum PayloadDecodeError {
+    InvalidFormat,
+    UnknownType
+}
+
+impl TryFrom<&[u8]> for Payload {
+    type Error = PayloadDecodeError;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let t = value.first();
+        match t {
+            None => Err(PayloadDecodeError::InvalidFormat),
+            Some(n) => {
+                let data = value.get(1..).and_then(|a| Some(a.to_vec())).unwrap_or(vec![]);
+                match n {
+                    0 => Ok(Payload::Open(data)),
+                    1 => Ok(Payload::Close(EngineCloseReason::Timeout)),
+                    2 => Ok(Payload::Ping),
+                    3 => Ok(Payload::Pong),
+                    4 => Ok(Payload::Message(data)),
+                    5 => Ok(Payload::Upgrade),
+                    6 => Ok(Payload::Noop),
+                    _ => Err(PayloadDecodeError::UnknownType)
+                }
+            }
+        }
+    }
+}
+
 impl Payload{
-    pub fn as_bytes(&self, sid:Sid) -> Vec<u8>{
+    pub fn as_bytes(&self) -> Vec<u8>{
         let (prefix, data) = match &self{
             Payload::Open(data) => ("0", Some(data.to_owned())),
             Payload::Close(reason) => ("1", None),
