@@ -372,36 +372,4 @@ impl Engine
 
 }
 
-// Marker Trait 
-pub trait TransportEvent: Into<Payload> {}
-impl TransportEvent for LongPollEvent {}
-impl TransportEvent for WebsocketEvent {}
-
-pub enum LongPollEvent {
-    GET, 
-    POST(Vec<u8>)
-}
-
-impl From<LongPollEvent> for Payload {
-    fn from(value: LongPollEvent) -> Self {
-        match value {
-            LongPollEvent::POST(p) => Payload::Message(p),
-            LongPollEvent::GET => Payload::Ping,
-        }
-    }
-}
-
-pub enum WebsocketEvent {
-    Ping,
-    Pong
-}
-
-impl From<WebsocketEvent> for Payload {
-    fn from(value: WebsocketEvent) -> Self {
-        match value {
-            WebsocketEvent::Ping => Payload::Ping,
-            WebsocketEvent::Pong => Payload::Pong
-        }
-    }
-}
 

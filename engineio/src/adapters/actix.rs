@@ -1,10 +1,9 @@
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
-use actix_ws::{Message};
 
-use crate::{async_session_io_create, EngineInput, EngineInputError};
-use crate::engine::{Sid, WebsocketEvent, TransportConfig, Payload, Participant };
+use crate::{async_session_io_create, EngineInput };
+use crate::engine::{Sid, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
 
@@ -36,13 +35,6 @@ impl TryFrom<actix_ws::Message> for Payload {
     }
 }
 
-//#[cfg(feature = "actix")]
-//impl From<Result<actix_ws::Message, actix_ws::ProtocolError>> for WebsocketEvent {
-//    fn from(value: Result<actix_ws::Message, actix_ws::ProtocolError>) -> Self {
-//        Self::Ping
-//    }
-//}
-
 #[derive(serde::Deserialize)]
 struct SessionInfo {
     #[serde(alias = "EIO")]
@@ -66,29 +58,6 @@ impl actix_web::ResponseError for EngineError{
 
 }
 
-//async fn create_sio_ws<F>(req: HttpRequest, body: web::Payload, handler:F)-> impl Responder 
-//where F:  Fn(AsyncEngine, Emitter) -> (),
-//{
-//    let engine = Engine::new_ws();
-//    let (response, session, msg_stream) = actix_ws::handle(&req, body).unwrap();
-//
-//    let config = SessionConfig::default();
-//    let res = json!({
-//      "sid": engine.session,
-//      "upgrades": [],
-//      "pingInterval": config.ping_interval,
-//      "pingTimeout": config.ping_timeout,
-//      "maxPayload": config.max_payload
-//    });
-//
-//    let emitter = Emitter::WS(session);
-//    let sio = AsyncEngine::WS(AsyncEngineInner::new(engine, msg_stream));
-//    handler(sio,emitter);
-//
-//    return web::Bytes::from(res.to_string());
-//}
-
-// Actix Service for accepting LONG POLL reqs and WS ? 
 pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: F) -> Resource
 where F: NewConnectionService + 'static
 {
