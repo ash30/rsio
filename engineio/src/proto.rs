@@ -10,7 +10,7 @@ pub type Sid = uuid::Uuid;
 pub enum EngineInput {
     New(Option<TransportConfig>, EngineKind),
     Close(Participant),
-    Data(Participant, Payload),
+    Data(Participant, Vec<u8>),
     Poll,
     Listen,
     Tock

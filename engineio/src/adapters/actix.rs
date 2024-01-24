@@ -101,12 +101,10 @@ where F: NewConnectionService + 'static
                                 loop {
                                     tokio::select! {
                                         ingress = msg_stream.next() => {
-                                            dbg!();
                                             let payload = match ingress {
-                                                Some(Ok(m)) => Payload::try_from(m),
+                                                Some(Ok(m)) => m.as_bytes()
                                                 _ => break
                                             };
-                                            dbg!(&payload);
                                             if let Ok(payload) = payload {
                                                 io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
                                             }
@@ -266,9 +264,8 @@ where F: NewConnectionService + 'static
                     }
                      buf.push(&body[start..body.len()]);
 
-                    for msg in buf.iter().filter(|v| v[0] == b"4"[0] ) {
-                        let p = Payload::Message((**msg)[1..].to_vec());
-                        io.input(sid, EngineInput::Data(Participant::Client, p)).await;
+                    for msg in buf.into_iter() {
+                        io.input(sid, EngineInput::Data(Participant::Client, msg.to_vec())).await;
                     }
                     // TODO: Test suite assumes an "ok" returned in response... 
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))

@@ -31,9 +31,10 @@ pub enum EngineCloseReason {
 
 #[derive(Debug, Clone)]
 pub enum EngineInputError {
+    AlreadyClosed,
     OpenFailed,
     InvalidPoll,
-    AlreadyClosed
+    UnknownPayload,
 }
 
 #[derive(Debug, Clone)]
@@ -108,16 +109,23 @@ impl Engine
                     }
                 }
             },
-            EngineInput::Data(src,payload) => {
+            EngineInput::Data(src,data) => {
+                let payload = data.as_slice().try_into();
+
                 match (src, payload) {
-                    (_, Payload::Close(..)) => {
+                    (_, Err(e)) => {
+                        nextState.transport = TransportState::Closed(EngineCloseReason::Error(EngineError::Generic));
+                        Err(EngineInputError::UnknownPayload)
+                    }
+
+                    (_, Ok(Payload::Close(..))) => {
                         nextState.transport = TransportState::Closed(EngineCloseReason::Command(Participant::Client));
                         Ok(())
                     },
 
-                    (_, Payload::Upgrade) => Ok(()),
+                    (_, Ok(Payload::Upgrade)) => Ok(()),
 
-                    (Participant::Client,p) => {
+                    (Participant::Client,Ok(p)) => {
 
                         // ALL information from client acts as a heartbeat 
                         if let TransportState::Connected { last_poll, last_ping } = currentState.transport {
@@ -128,7 +136,7 @@ impl Engine
                         Ok(())
                     },
 
-                    (Participant::Server,p) => {
+                    (Participant::Server,Ok(p)) => {
                         if let TransportState::Closed(..)= currentState.transport {
                             // DONT ALLOW SERVER TO SEND EVENT IF CLOSED 
                             Err(EngineInputError::AlreadyClosed)
