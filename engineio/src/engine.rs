@@ -200,7 +200,7 @@ impl Engine
                     },
                     (PollingState::Poll { active:None }, TransportState::Connected { last_poll, last_ping }) => {
                         if poll_buf_length > 0 {
-                            nextState.polling = PollingState::Poll { active: Some( (now,Duration::from_secs(1))) };
+                            nextState.polling = PollingState::Poll { active: Some( (now, currentState.poll_timeout.mul_f32(0.1))) };
                         }
                         else {
                             nextState.polling = PollingState::Poll { active: Some( (now,currentState.poll_duration)) };
