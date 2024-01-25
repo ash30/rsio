@@ -1,8 +1,9 @@
 use std::sync::Arc;
+use actix_web::body::MessageBody;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 
-use crate::{async_session_io_create, EngineInput };
+use crate::{async_session_io_create, EngineInput, PayloadDecodeError };
 use crate::engine::{Sid, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
@@ -12,13 +13,13 @@ pub enum MessageParsingError {
     UnknownType
 }
 impl TryFrom<actix_ws::Message> for Payload {
-    type Error = MessageParsingError;
+    type Error = PayloadDecodeError;
     fn try_from(value: actix_ws::Message) -> Result<Self, Self::Error> {
         match value {
             actix_ws::Message::Text(d) => {
                 let mut iter = d.into_bytes().into_iter();
                 match iter.next() {
-                    None => Err(MessageParsingError::UnknownType),
+                    None => Err(PayloadDecodeError::UnknownType),
                     Some(b'0') => Ok(Payload::Open(vec![])),
                     Some(b'1') => Ok(Payload::Close(crate::EngineCloseReason::Timeout)),
                     Some(b'2') => Ok(Payload::Ping),
@@ -26,10 +27,10 @@ impl TryFrom<actix_ws::Message> for Payload {
                     Some(b'4') => Ok(Payload::Message(iter.collect::<Vec<u8>>())),
                     Some(b'5') => Ok(Payload::Upgrade),
                     Some(b'6') => Ok(Payload::Noop),
-                    _ => Err(MessageParsingError::UnknownType)
+                    _ => Err(PayloadDecodeError::InvalidFormat)
                 }
             },
-            _ => Err(MessageParsingError::UnknownType)
+            _ => Ok(Payload::Noop)
         }
         
     }
@@ -102,12 +103,10 @@ where F: NewConnectionService + 'static
                                     tokio::select! {
                                         ingress = msg_stream.next() => {
                                             let payload = match ingress {
-                                                Some(Ok(m)) => m.as_bytes()
+                                                Some(Ok(m)) => m.try_into(),
                                                 _ => break
                                             };
-                                            if let Ok(payload) = payload {
-                                                io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
-                                            }
+                                            io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
                                         }
                                         engress = client_stream.next() => {
                                             match &engress {
@@ -265,7 +264,8 @@ where F: NewConnectionService + 'static
                      buf.push(&body[start..body.len()]);
 
                     for msg in buf.into_iter() {
-                        io.input(sid, EngineInput::Data(Participant::Client, msg.to_vec())).await;
+                        dbg!(msg);
+                        io.input(sid, EngineInput::Data(Participant::Client, msg.try_into())).await;
                     }
                     // TODO: Test suite assumes an "ok" returned in response... 
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))

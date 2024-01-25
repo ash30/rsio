@@ -124,7 +124,7 @@ impl AsyncSessionIOSender {
 
    pub async fn send(&self, payload:Payload) {
        // TODO: Listen for SEND errors ?
-       self.handle.input(self.sid, EngineInput::Data(Participant::Server, payload)).await;
+       self.handle.input(self.sid, EngineInput::Data(Participant::Server, Ok(payload))).await;
    }
 }
 

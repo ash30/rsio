@@ -109,8 +109,7 @@ impl Engine
                     }
                 }
             },
-            EngineInput::Data(src,data) => {
-                let payload = data.as_slice().try_into();
+            EngineInput::Data(src,payload) => {
 
                 match (src, payload) {
                     (_, Err(e)) => {

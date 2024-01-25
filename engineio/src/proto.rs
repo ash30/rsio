@@ -10,7 +10,7 @@ pub type Sid = uuid::Uuid;
 pub enum EngineInput {
     New(Option<TransportConfig>, EngineKind),
     Close(Participant),
-    Data(Participant, Vec<u8>),
+    Data(Participant, Result<Payload,PayloadDecodeError>),
     Poll,
     Listen,
     Tock
@@ -77,8 +77,7 @@ pub enum Payload {
     Noop
 }
 
-
-
+#[derive(Debug)]
 pub enum PayloadDecodeError {
     InvalidFormat,
     UnknownType
@@ -93,13 +92,13 @@ impl TryFrom<&[u8]> for Payload {
             Some(n) => {
                 let data = value.get(1..).and_then(|a| Some(a.to_vec())).unwrap_or(vec![]);
                 match n {
-                    0 => Ok(Payload::Open(data)),
-                    1 => Ok(Payload::Close(EngineCloseReason::Timeout)),
-                    2 => Ok(Payload::Ping),
-                    3 => Ok(Payload::Pong),
-                    4 => Ok(Payload::Message(data)),
-                    5 => Ok(Payload::Upgrade),
-                    6 => Ok(Payload::Noop),
+                    b'0' => Ok(Payload::Open(data)),
+                    b'1' => Ok(Payload::Close(EngineCloseReason::Timeout)),
+                    b'2' => Ok(Payload::Ping),
+                    b'3' => Ok(Payload::Pong),
+                    b'4' => Ok(Payload::Message(data)),
+                    b'5' => Ok(Payload::Upgrade),
+                    b'6' => Ok(Payload::Noop),
                     _ => Err(PayloadDecodeError::UnknownType)
                 }
             }
