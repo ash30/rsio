@@ -142,3 +142,7 @@ impl Default for TransportConfig {
         }
     }
 }
+
+fn is_binary(d:&[u8]) -> bool {
+    d.first().filter(|c| **c == b'b').is_some()
+}

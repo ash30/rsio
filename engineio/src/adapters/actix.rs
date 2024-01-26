@@ -30,6 +30,10 @@ impl TryFrom<actix_ws::Message> for Payload {
                     _ => Err(PayloadDecodeError::InvalidFormat)
                 }
             },
+            actix_ws::Message::Binary(d) => {
+                let data = d.into_iter().collect::<Vec<u8>>();
+                return Ok(Payload::Message(data.to_owned()))
+            },
             _ => Ok(Payload::Noop)
         }
         

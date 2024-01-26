@@ -301,8 +301,12 @@ impl Engine
                 if let PollingState::Poll { .. } = &nextState.polling  {
                     self.poll_buffer.drain(0..).for_each(|p| self.output.push_back(p));
                 };
-                dbg!();
-                self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Close(reason.clone())));
+                if let EngineCloseReason::Command(Participant::Client) = reason {
+                    self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Noop))
+                }
+                else { 
+                    self.output.push_back(EngineOutput::Data(Participant::Server, Payload::Close(reason.clone())));
+                }
                 self.output.push_back(EngineOutput::SetIO(Participant::Client, false));
             }
             // Intial setup 
