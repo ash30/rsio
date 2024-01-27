@@ -1,5 +1,5 @@
 use actix_web::{middleware::Logger, App, HttpServer };
-use engineio::TransportConfig;
+use engineio::{TransportConfig, EngineData};
 use engineio::adapters::actix::{ socket_io, NewConnectionService, Emitter };
 use futures_util::StreamExt;
 use futures_util::Stream;
@@ -14,7 +14,15 @@ impl NewConnectionService for NewConnectionManager {
             loop {
                 match stream.next().await {
                     None => break,
-                    Some(Ok(data)) => emit.send(engineio::Payload::Message(data)).await,
+                    Some(Ok(data)) => { 
+
+                        if let Ok(msg) =  EngineData::try_from(data) {
+                            
+                            emit.send(engineio::Payload::Message(msg.as_bytes())).await
+                        }
+
+
+                    },
                     _ => {}
                 }
             }

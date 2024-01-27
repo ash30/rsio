@@ -1,6 +1,8 @@
 use std::fmt;
+use std::string::FromUtf8Error;
 use std::time::Duration;
 use std::u8;
+use std::vec;
 
 use crate::Participant;
 use crate::EngineCloseReason;
@@ -113,7 +115,14 @@ impl Payload{
             Payload::Close(reason) => ("1", None),
             Payload::Ping => ("2", None),
             Payload::Pong => ("3", None),
-            Payload::Message(p) => ("4", Some(p.to_owned())),
+            Payload::Message(p) => { 
+                if EngineData::is_binary(p) {
+                    ("", Some(p.to_owned()))
+                }
+                else {
+                    ("4", Some(p.to_owned()))
+                }
+            },
             Payload::Upgrade => ("5",None),
             Payload::Noop => ("6",None),
         };
@@ -143,6 +152,41 @@ impl Default for TransportConfig {
     }
 }
 
-fn is_binary(d:&[u8]) -> bool {
-    d.first().filter(|c| **c == b'b').is_some()
+
+pub enum EngineData {
+    Text(String),
+    Binary(Vec<u8>)
+}
+
+impl EngineData {
+
+    pub fn is_binary(d:&[u8]) -> bool {
+        d.first().filter(|c| **c == b'b').is_some()
+    }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        match self {
+            EngineData::Binary(vec) => { 
+                let mut d = vec.clone();
+                d.insert(0, b'b');
+                return d
+            }
+            EngineData::Text(s) => s.as_bytes().to_owned()
+        }
+    }
+}
+
+impl TryFrom<Vec<u8>> for EngineData {
+    type Error = FromUtf8Error;
+    
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        match value.first() {
+            None => Ok(Self::Text("".to_string())),
+            Some(b'b') => Ok(Self::Binary(value.get(1..).and_then(|d| Some(d.to_vec())).unwrap_or(vec![]))),
+            Some(..) => { 
+                let d = String::from_utf8(value)?;
+                Ok(Self::Text(d))
+            }
+        }
+    }
 }

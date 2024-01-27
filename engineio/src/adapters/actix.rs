@@ -3,7 +3,7 @@ use actix_web::body::MessageBody;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 
-use crate::{async_session_io_create, EngineInput, PayloadDecodeError };
+use crate::{async_session_io_create, EngineInput, PayloadDecodeError, EngineData };
 use crate::engine::{Sid, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
@@ -116,10 +116,13 @@ where F: NewConnectionService + 'static
                                             match &engress {
                                                 Some(p) => { 
                                                     dbg!(&p);
-                                                    let d = String::from_utf8(p.as_bytes()).unwrap();
-                                                    dbg!(&d);
-                                                    dbg!(session.text(d.clone()).await);
-                                                    dbg!();
+                                                    let d = p.as_bytes();
+                                                    if EngineData::is_binary(&d) == true {
+                                                        dbg!(session.binary(d).await);
+                                                    }
+                                                    else {
+                                                        dbg!(session.text(String::from_utf8(d).unwrap()).await);
+                                                    }
                                                 },
                                                 None => {
                                                     dbg!();
