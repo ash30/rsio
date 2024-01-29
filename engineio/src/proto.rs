@@ -52,7 +52,7 @@ impl Payload{
         }
     }
 
-    pub fn encode(&self, transport: EngineKind) -> Vec<u8> {
+    pub fn encode(&self, transport: &EngineKind) -> Vec<u8> {
         let header:Option<u8> = match self {
             Payload::Open(..) => b'0'.into(),
             Payload::Close(..) => b'1'.into(),
@@ -95,6 +95,13 @@ impl Payload{
             }
         }
 
+    }
+
+    pub fn combine_encode(v:&[Payload], t:&EngineKind) -> Vec<u8> {
+        let seperator:u8 = b'\x1e';
+        let start = v.first().map(|p| p.encode(t));
+        let rest = v.get(1..).map(|s| s.iter().flat_map(|p| vec![vec![seperator], p.encode(t).to_vec()].concat()).collect::<Vec<u8>>());
+        return start.and_then(|mut n| rest.map(|r| {n.extend_from_slice(&r); n})).unwrap_or(vec![])
     }
 
 }

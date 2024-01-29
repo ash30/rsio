@@ -2,7 +2,7 @@ use std::{collections::VecDeque, time::{Instant, Duration}};
 use std::fmt;
 pub use crate::proto::*;
 
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub enum EngineKind {
     Poll,
     Continuous

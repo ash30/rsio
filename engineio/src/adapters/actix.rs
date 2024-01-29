@@ -72,11 +72,11 @@ where F: NewConnectionService + 'static
                     let sid = uuid::Uuid::new_v4();
                     let mut client_stream = io.input(
                         sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)
-                    ).await.map_err(|e|EngineError::OpenFailed)?.unwrap();
+                    ).await.map_err(|_e| EngineError::OpenFailed)?.unwrap();
 
                     let server_stream = io.input(
                         sid, EngineInput::Listen
-                    ).await.map_err(|e| EngineError::OpenFailed)?.unwrap();
+                    ).await.map_err(|_e| EngineError::OpenFailed)?.unwrap();
 
                    <F as NewConnectionService>::new_connection(
                         &client,
@@ -96,7 +96,8 @@ where F: NewConnectionService + 'static
                                 engress = client_stream.next() => {
                                     match &engress {
                                         Some(p) => { 
-                                            let d = p.encode(EngineKind::Continuous);
+                                            let t = EngineKind::Continuous;
+                                            let d = p.encode(&t);
                                             match p {
                                                 Payload::Message(MessageData::Binary(..)) => session.binary(d).await,
                                                 _ => session.text(String::from_utf8(d).unwrap()).await
@@ -135,16 +136,8 @@ where F: NewConnectionService + 'static
                             Ok(None) => HttpResponse::InternalServerError().body(""),
                             Ok(Some(s)) => {
                                 let all = s.collect::<Vec<Payload>>().await;
-
-                                let res_size = all.len();
-                                let seperator = b"\x1e";
-                                let combined: Vec<u8> = all.into_iter()
-                                    .map(|p| p.encode(EngineKind::Poll).to_owned())
-                                    .enumerate()
-                                    .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
-                                    .flat_map(|a| a )
-                                    .collect();
-
+                                let t = EngineKind::Poll;
+                                let combined = Payload::combine_encode(&all, &t);
                                 dbg!(&combined);
                                 HttpResponse::Ok().body(combined)
                             }
@@ -185,14 +178,8 @@ where F: NewConnectionService + 'static
                             }
 
                             let all = s.take(1).collect::<Vec<Payload>>().await;
-                            let res_size = all.len();
-                            let seperator = b"\x1e";
-                            let combined: Vec<u8> = all.into_iter()
-                                .map(|p| p.encode(EngineKind::Poll).to_owned())
-                                .enumerate()
-                                .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
-                                .flat_map(|a| a )
-                                .collect();
+                            let t = EngineKind::Poll;
+                            let combined = Payload::combine_encode(&all, &t);
                             HttpResponse::Ok().body(combined)
                         }
                     }
