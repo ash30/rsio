@@ -1,20 +1,16 @@
 use std::time::Instant;
 use std::collections::HashMap;
 use futures_util::Stream;
-
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::Receiver;
-use crate::EngineCloseReason;
-use crate::EngineInputError;
+use crate::EngineError;
 use crate::EngineInput;
 use crate::EngineOutput;
 use crate::MessageData;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 
-
-type AsyncIOInputFoo = Result<Option<Receiver<Payload>>,EngineInputError>;
-type AsyncIOInput = tokio::sync::oneshot::Sender<Result<Option<Receiver<Payload>>,EngineInputError>>;
-
+type AsyncIOInputFoo = Result<Option<Receiver<Payload>>,EngineError>;
+type AsyncIOInput = tokio::sync::oneshot::Sender<Result<Option<Receiver<Payload>>,EngineError>>;
 
 pub fn async_session_io_create() -> AsyncSessionIOHandle {
     let (client_sent_tx, mut client_sent_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
@@ -37,7 +33,7 @@ pub fn async_session_io_create() -> AsyncSessionIOHandle {
                 _ => engines.get_mut(&sid)
             };
 
-            let output = engine.ok_or(EngineInputError::OpenFailed)
+            let output = engine.ok_or(EngineError::OpenFailed)
                 .and_then(|e| e.consume(input, Instant::now()).and(Ok(e)))
                 .and_then(|e| { let mut b = vec![]; while let Some(p) = e.poll_output() { b.push(p); }; Ok(b) });
 
@@ -102,11 +98,11 @@ pub struct AsyncSessionIOHandle {
 
 impl AsyncSessionIOHandle {
 
-    pub async fn input(&self, id:Sid, input:EngineInput) -> Result<Option<impl Stream<Item =Payload>>,EngineInputError> {
+    pub async fn input(&self, id:Sid, input:EngineInput) -> Result<Option<impl Stream<Item =Payload>>,EngineError> {
         //let (tx,rx) = tokio::sync::oneshot::channel::<,EngineInputError>>(10);
         let (tx,rx) = tokio::sync::oneshot::channel::<AsyncIOInputFoo>();
         let _ = self.client_send_tx.send((id,input, Some(tx))).await;
-        let res = rx.await.unwrap_or(Err(EngineInputError::AlreadyClosed));
+        let res = rx.await.unwrap_or(Err(EngineError::AlreadyClosed));
         return res.and_then(|opt| Ok(opt.and_then(|rx| Some(tokio_stream::wrappers::ReceiverStream::new(rx)))))
     }
 }

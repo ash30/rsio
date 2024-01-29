@@ -1,7 +1,65 @@
-use std::{collections::VecDeque, u8, time::{Instant, Duration}};
-
+use std::{collections::VecDeque, time::{Instant, Duration}};
+use std::fmt;
 pub use crate::proto::*;
 
+#[derive(Debug)]
+pub enum EngineKind {
+    Poll,
+    Continuous
+}
+
+#[derive(Debug)]
+pub enum EngineInput {
+    New(Option<TransportConfig>, EngineKind),
+    Close(Participant),
+    Data(Participant, Result<Payload,PayloadDecodeError>),
+    Poll,
+    Listen,
+    Tock
+}
+
+#[derive(Debug)]
+pub enum EngineOutput {
+    Tick { length:Duration },
+    SetIO(Participant, bool),
+    Data(Participant, Payload),
+}
+
+#[derive(Debug, Clone)]
+pub enum EngineCloseReason {
+    Error(EngineError),
+    Timeout,
+    Command(Participant)
+}
+
+#[derive(Debug, Clone)]
+pub enum EngineError {
+    Generic,
+    MissingSession,
+    AlreadyClosed,
+    OpenFailed,
+    InvalidPoll,
+    UnknownPayload,
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f,"EngineError: {self:?}")
+    }
+}
+impl fmt::Display for EngineInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let output = match self {
+            Self::Tock  => "Tock",
+            Self::Poll => "POLL",
+            Self::Listen => "LISTEN",
+            Self::New(..) => "NEW",
+            Self::Data(p,d) => "DATA",
+            Self::Close(..) => "CLOSE",
+        };
+        write!(f, "{}", output)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum TransportState { 
@@ -22,20 +80,6 @@ pub enum PollingState {
     Continuous,
 }
 
-#[derive(Debug, Clone)]
-pub enum EngineCloseReason {
-    Error(EngineError),
-    Timeout,
-    Command(Participant)
-}
-
-#[derive(Debug, Clone)]
-pub enum EngineInputError {
-    AlreadyClosed,
-    OpenFailed,
-    InvalidPoll,
-    UnknownPayload,
-}
 
 #[derive(Debug, Clone)]
 pub struct EngineState {
@@ -81,7 +125,7 @@ impl Engine
         dbg!(self.output.pop_front())
     }
 
-    fn update(now:Instant, input:EngineInput, currentState:&EngineState, nextState:&mut EngineState, poll_buf_length:usize) -> Result<Vec<EngineOutput>,EngineInputError> {
+    fn update(now:Instant, input:EngineInput, currentState:&EngineState, nextState:&mut EngineState, poll_buf_length:usize) -> Result<Vec<EngineOutput>,EngineError> {
 
         let mut output = Vec::new();
         // Before Consuming event, make sure poll timeout is valid
@@ -105,7 +149,7 @@ impl Engine
                     },
                     _ => {
                         // ITS AN ERROR TO INPUT NEW IF CLOSED OR CONNECTED!!
-                        Err(EngineInputError::OpenFailed)
+                        Err(EngineError::OpenFailed)
                     }
                 }
             },
@@ -114,7 +158,7 @@ impl Engine
                 match (src, payload) {
                     (_, Err(e)) => {
                         nextState.transport = TransportState::Closed(EngineCloseReason::Error(EngineError::Generic));
-                        Err(EngineInputError::UnknownPayload)
+                        Err(EngineError::UnknownPayload)
                     }
 
                     (_, Ok(Payload::Close(..))) => {
@@ -138,7 +182,7 @@ impl Engine
                     (Participant::Server,Ok(p)) => {
                         if let TransportState::Closed(..)= currentState.transport {
                             // DONT ALLOW SERVER TO SEND EVENT IF CLOSED 
-                            Err(EngineInputError::AlreadyClosed)
+                            Err(EngineError::AlreadyClosed)
                         } 
                         else {
                             output.push(EngineOutput::Data(Participant::Server, p));
@@ -198,12 +242,12 @@ impl Engine
 
                 match (&currentState.polling, &currentState.transport) {
                     (PollingState::Poll { active:Some(..) }, TransportState::Closed(..)) => {
-                        Err(EngineInputError::AlreadyClosed)
+                        Err(EngineError::AlreadyClosed)
                     },
                     (PollingState::Poll { active:Some(..) }, _ ) => {
-                        nextState.transport = TransportState::Closed(EngineCloseReason::Error(EngineError::InvalidPollRequest));
+                        nextState.transport = TransportState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll));
                         nextState.polling = PollingState::Poll { active: Some( (now,Duration::from_millis(1))) };
-                        Err(EngineInputError::InvalidPoll)
+                        Err(EngineError::InvalidPoll)
                     },
                     (PollingState::Poll { active:None }, TransportState::Connected { last_poll, last_ping }) => {
                         if poll_buf_length > 0 {
@@ -214,8 +258,8 @@ impl Engine
                         }
                         Ok(())
                     },
-                    (PollingState::Poll { active:None }, TransportState::Closed(..)) => Err(EngineInputError::AlreadyClosed),
-                    _ =>  Err(EngineInputError::InvalidPoll),
+                    (PollingState::Poll { active:None }, TransportState::Closed(..)) => Err(EngineError::AlreadyClosed),
+                    _ =>  Err(EngineError::InvalidPoll),
                 }
 
             },
@@ -223,7 +267,7 @@ impl Engine
                 match currentState.transport {
                     TransportState::Closed(..) => {
                         // TODO: WE SHOULD ERROR 
-                        Err(EngineInputError::AlreadyClosed)
+                        Err(EngineError::AlreadyClosed)
                     },
                     _ => {
                         nextState.transport = TransportState::Closed(EngineCloseReason::Command(Participant::Server));
@@ -235,7 +279,7 @@ impl Engine
         res.and(Ok(output))
     }
     
-    pub fn consume(&mut self, input:EngineInput, now:Instant) -> Result<(), EngineInputError> {
+    pub fn consume(&mut self, input:EngineInput, now:Instant) -> Result<(), EngineError> {
         dbg!(&input);
         let currentState = &self.state;
         let mut nextState = self.state.clone();

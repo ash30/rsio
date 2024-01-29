@@ -3,8 +3,7 @@ use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 
 use crate::{async_session_io_create, EngineInput, PayloadDecodeError, MessageData, EngineKind };
-use crate::engine::{Sid, TransportConfig, Payload, Participant };
-use crate::proto::EngineError;
+use crate::engine::{Sid, TransportConfig, Payload, Participant, EngineError };
 pub use super::common::{ NewConnectionService, Emitter };
 
 impl TryFrom<actix_ws::Message> for Payload {
@@ -35,7 +34,7 @@ struct SessionInfo {
 impl actix_web::ResponseError for EngineError{
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
-            EngineError::InvalidPollRequest => actix_web::http::StatusCode::BAD_REQUEST,
+            EngineError::InvalidPoll => actix_web::http::StatusCode::BAD_REQUEST,
             EngineError::Generic => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             EngineError::MissingSession => actix_web::http::StatusCode::BAD_REQUEST,
             _ => actix_web::http::StatusCode::NOT_FOUND

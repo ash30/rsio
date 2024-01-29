@@ -1,69 +1,8 @@
-use std::fmt;
-use std::time::Duration;
 use std::u8;
 use std::vec;
-
-use crate::Participant;
 use crate::EngineCloseReason;
+use crate::EngineKind;
 pub type Sid = uuid::Uuid;
-
-#[derive(Debug)]
-pub enum EngineInput {
-    New(Option<TransportConfig>, EngineKind),
-    Close(Participant),
-    Data(Participant, Result<Payload,PayloadDecodeError>),
-    Poll,
-    Listen,
-    Tock
-}
-
-#[derive(Debug)]
-pub enum EngineKind {
-    Poll,
-    Continuous
-}
-
-
-#[derive(Debug)]
-pub enum EngineOutput {
-    Tick { length:Duration },
-    SetIO(Participant, bool),
-    Data(Participant, Payload),
-}
-
-#[derive(Debug, Clone)]
-pub enum EngineError {
-    Generic,
-    MissingSession,
-    UnknownSession,
-    SessionAlreadyClosed,
-    InvalidPollRequest,
-    SessionUnresponsive,
-    
-}
-
-impl fmt::Display for EngineError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-
-impl fmt::Display for EngineInput {
-
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let output = match self {
-            Self::Tock  => "Tock",
-            Self::Poll => "POLL",
-            Self::Listen => "LISTEN",
-            Self::New(..) => "NEW",
-            Self::Data(p,d) => "DATA",
-            Self::Close(..) => "CLOSE",
-        };
-        write!(f, "{}", output)
-    }
-}
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone,Debug)]
@@ -176,8 +115,4 @@ impl Default for TransportConfig {
         }
     }
 }
-
-
-
-
 
