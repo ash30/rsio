@@ -6,15 +6,14 @@ use tokio::sync::mpsc::Receiver;
 use crate::EngineError;
 use crate::EngineInput;
 use crate::EngineOutput;
-use crate::MessageData;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 
-type AsyncIOInputFoo = Result<Option<Receiver<Payload>>,EngineError>;
-type AsyncIOInput = tokio::sync::oneshot::Sender<Result<Option<Receiver<Payload>>,EngineError>>;
+type AsyncInputResult = Result<Option<Receiver<Payload>>,EngineError>;
+type AsyncInputSender = tokio::sync::oneshot::Sender<AsyncInputResult>;
 
-pub fn async_session_io_create() -> AsyncIOHandle {
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
-    let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncIOInput>)>(1024);
+pub fn async_engine_create() -> AsyncIOHandle {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
+    let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
 
     let mut engines: HashMap<Sid,Engine> = HashMap::new();
     let mut server_recv: HashMap<Sid, Sender<Payload>> = HashMap::new();
@@ -26,6 +25,7 @@ pub fn async_session_io_create() -> AsyncIOHandle {
                 Some(v1) = input_rx.recv() => v1,
                 Some(v3) = time_rx.recv() => v3
             };
+
             let engine = match &input  {
                 EngineInput::New(..) => Some(engines.entry(sid).or_insert(Engine::new(sid))),
                 _ => engines.get_mut(&sid)
@@ -89,12 +89,12 @@ pub fn async_session_io_create() -> AsyncIOHandle {
 
 #[derive(Debug, Clone)]
 pub struct AsyncIOHandle {
-    input_tx: Sender<(Sid, EngineInput, Option<AsyncIOInput>)>,
+    input_tx: Sender<(Sid, EngineInput, Option<AsyncInputSender>)>,
 }
 
 impl AsyncIOHandle {
     pub async fn input(&self, id:Sid, input:EngineInput) -> Result<Option<impl Stream<Item =Payload>>,EngineError> {
-        let (tx,rx) = tokio::sync::oneshot::channel::<AsyncIOInputFoo>();
+        let (tx,rx) = tokio::sync::oneshot::channel::<AsyncInputResult>();
         let _ = self.input_tx.send((id,input, Some(tx))).await;
         let res = rx.await.unwrap_or(Err(EngineError::AlreadyClosed));
         return res.and_then(|opt| Ok(opt.and_then(|rx| Some(tokio_stream::wrappers::ReceiverStream::new(rx)))))

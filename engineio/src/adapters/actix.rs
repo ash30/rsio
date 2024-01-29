@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 
-use crate::{async_session_io_create, EngineInput, PayloadDecodeError, MessageData, EngineKind };
+use crate::{async_engine_create, EngineInput, PayloadDecodeError, MessageData, EngineKind };
 use crate::engine::{Sid, TransportConfig, Payload, Participant, EngineError };
 pub use super::common::{ NewConnectionService, AsyncEmitter as Emitter };
 
@@ -51,7 +51,7 @@ pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: 
 where F: NewConnectionService + 'static
 {
     let client = Arc::new(callback);
-    let io = async_session_io_create();
+    let io = async_engine_create();
 
     // WS 
     let path = {
