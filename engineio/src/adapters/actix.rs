@@ -4,7 +4,7 @@ use actix_web::{guard, web, HttpResponse, Resource};
 
 use crate::{async_session_io_create, EngineInput, PayloadDecodeError, MessageData, EngineKind };
 use crate::engine::{Sid, TransportConfig, Payload, Participant, EngineError };
-pub use super::common::{ NewConnectionService, Emitter };
+pub use super::common::{ NewConnectionService, AsyncEmitter as Emitter };
 
 impl TryFrom<actix_ws::Message> for Payload {
     type Error = PayloadDecodeError;
@@ -82,7 +82,7 @@ where F: NewConnectionService + 'static
                                     Payload::Close(r) => Some(Err(r)),
                                     _ => None,
                                }),
-                                crate::io::AsyncSessionIOSender::new(sid,io.clone())
+                                Emitter::new(sid, io.clone())
                            );
                             //std::pin::pin!(client_stream);
                             //std::pin::pin!(msg_stream);
@@ -208,7 +208,7 @@ where F: NewConnectionService + 'static
                                          Payload::Close(r) => Some(Err(r)),
                                          _ => None,
                                     }),
-                                    crate::io::AsyncSessionIOSender::new(sid,io)
+                                    Emitter::new(sid, io.clone())
                                 );
                             }
 
