@@ -20,7 +20,8 @@ impl TryFrom<actix_ws::Message> for Payload {
         match value {
             actix_ws::Message::Text(d) => {
                 let data = d.as_bytes().to_vec();
-                Payload::decode(&data, EngineKind::Continuous)
+                let t = EngineKind::Continuous;
+                Payload::decode(&data, &t)
             },
             actix_ws::Message::Binary(d) => {
                 let data = d.into_iter().collect::<Vec<u8>>();
@@ -137,7 +138,7 @@ where F: NewConnectionService + 'static
                             Ok(Some(s)) => {
                                 let all = s.collect::<Vec<Payload>>().await;
                                 let t = EngineKind::Poll;
-                                let combined = Payload::combine_encode(&all, &t);
+                                let combined = Payload::encode_combined(&all, &t);
                                 dbg!(&combined);
                                 HttpResponse::Ok().body(combined)
                             }
@@ -179,7 +180,7 @@ where F: NewConnectionService + 'static
 
                             let all = s.take(1).collect::<Vec<Payload>>().await;
                             let t = EngineKind::Poll;
-                            let combined = Payload::combine_encode(&all, &t);
+                            let combined = Payload::encode_combined(&all, &t);
                             HttpResponse::Ok().body(combined)
                         }
                     }
@@ -198,24 +199,11 @@ where F: NewConnectionService + 'static
                 let io = io.clone();
                 async move { 
                     let sid = session.sid.ok_or(EngineError::MissingSession)?;
-
-                    let mut buf = vec![];
-                    let mut start = 0;
-                    let mut iter = body.iter().enumerate();
-                    while let Some(d) = iter.next() {
-                        let (n,data) = d;
-                        if *data == b"\x1e"[0] {
-                            buf.push(&body[start..n]);
-                            start = n+1;
-                        }
+                    let t = EngineKind::Poll;
+                    for p in Payload::decode_combined(body.as_ref(), &t) {
+                        dbg!(&p);
+                        io.input(sid, EngineInput::Data(Participant::Client, p)).await;
                     }
-                     buf.push(&body[start..body.len()]);
-
-                    for msg in buf.into_iter() {
-                        dbg!(msg);
-                        io.input(sid, EngineInput::Data(Participant::Client, Payload::decode(msg, EngineKind::Poll))).await;
-                    }
-                    // TODO: Test suite assumes an "ok" returned in response... 
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))
                 }
             }
