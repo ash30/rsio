@@ -1,10 +1,17 @@
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
-
 use crate::{async_engine_create, EngineInput, PayloadDecodeError, MessageData, EngineKind };
 use crate::engine::{Sid, TransportConfig, Payload, Participant, EngineError };
 pub use super::common::{ NewConnectionService, AsyncEmitter as Emitter };
+use super::common::create_connection_stream;
+
+#[derive(serde::Deserialize)]
+struct SessionInfo {
+    #[serde(alias = "EIO")]
+    eio: u8,
+    sid: Option<Sid> 
+}
 
 impl TryFrom<actix_ws::Message> for Payload {
     type Error = PayloadDecodeError;
@@ -24,14 +31,7 @@ impl TryFrom<actix_ws::Message> for Payload {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct SessionInfo {
-    #[serde(alias = "EIO")]
-    eio: u8,
-    sid: Option<Sid> 
-}
-
-impl actix_web::ResponseError for EngineError{
+impl actix_web::ResponseError for EngineError {
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
             EngineError::InvalidPoll => actix_web::http::StatusCode::BAD_REQUEST,
@@ -70,66 +70,48 @@ where F: NewConnectionService + 'static
 
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let s = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)).await;
-                    let s2 = io.input(sid, EngineInput::Listen).await;
+                    let mut client_stream = io.input(
+                        sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)
+                    ).await.map_err(|e|EngineError::OpenFailed)?.unwrap();
 
-                    match (s2,s) {
-                        (Ok(Some(server_stream)), Ok(Some(mut client_stream))) => {
-                           <F as NewConnectionService>::new_connection(
-                               &client,
-                               server_stream.filter_map(|p| match p { 
-                                    Payload::Message(d) => Some(Ok(d)),
-                                    Payload::Close(r) => Some(Err(r)),
-                                    _ => None,
-                               }),
-                                Emitter::new(sid, io.clone())
-                           );
-                            //std::pin::pin!(client_stream);
-                            //std::pin::pin!(msg_stream);
-                            actix_rt::spawn(async move {
-                                loop {
-                                    tokio::select! {
-                                        ingress = msg_stream.next() => {
-                                            let payload = match ingress {
-                                                Some(Ok(m)) => m.try_into(),
-                                                _ => break
-                                            };
-                                            io.input(sid, EngineInput::Data(Participant::Client, payload)).await;
-                                        }
-                                        engress = client_stream.next() => {
-                                            match &engress {
-                                                Some(p) => { 
-                                                    dbg!(&p);
+                    let server_stream = io.input(
+                        sid, EngineInput::Listen
+                    ).await.map_err(|e| EngineError::OpenFailed)?.unwrap();
 
-                                                    let d = p.encode(EngineKind::Continuous);
-                                                    match p {
-                                                        Payload::Message(MessageData::Binary(..)) => {
-                                                            dbg!(session.binary(d).await);
-                                                        },
-                                                        _ => {
-                                                            dbg!(session.text(String::from_utf8(d).unwrap()).await);
+                   <F as NewConnectionService>::new_connection(
+                        &client,
+                        create_connection_stream(server_stream),
+                        Emitter::new(sid, io.clone())
+                   );
 
-                                                        }
-                                                    }   
-                                                },
-                                                None => {
-                                                    dbg!();
-                                                    break
-                                                }
-                                            };
-                                        }
-                                    }
+                    actix_rt::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                ingress = msg_stream.next() => {
+                                    match ingress {
+                                        Some(Ok(m)) => io.input(sid, EngineInput::Data(Participant::Client, m.try_into())).await,
+                                        _ => break
+                                    };
                                 }
-                                dbg!();
-                                let _ = session.close(None).await;
-                            });
-                        },
-                        _ => {}
-                    };
-                    return response
+                                engress = client_stream.next() => {
+                                    match &engress {
+                                        Some(p) => { 
+                                            let d = p.encode(EngineKind::Continuous);
+                                            match p {
+                                                Payload::Message(MessageData::Binary(..)) => session.binary(d).await,
+                                                _ => session.text(String::from_utf8(d).unwrap()).await
+                                            }   
+                                        },
+                                        None => break
+                                    };
+                                }
+                            }
+                        }
+                        let _ = session.close(None).await;
+                    });
+                    return Ok::<HttpResponse, EngineError>(response);
                 }
-            }
-            )
+            })
         )
     };
 
@@ -149,7 +131,7 @@ where F: NewConnectionService + 'static
                     if let Some(sid) = session.sid {
                         let s = io.input(sid, EngineInput::Poll).await;
                         match s {
-                            Err(e) =>  HttpResponse::BadRequest().body(""),
+                            Err(..) =>  HttpResponse::BadRequest().body(""),
                             Ok(None) => HttpResponse::InternalServerError().body(""),
                             Ok(Some(s)) => {
                                 let all = s.collect::<Vec<Payload>>().await;
@@ -190,24 +172,14 @@ where F: NewConnectionService + 'static
                 async move {
                     let sid = uuid::Uuid::new_v4();
                     let res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
-
-                    dbg!();
                     match res {
                         Err(e) => {  dbg!(e); dbg!(HttpResponse::BadRequest().body(""))},
                         Ok(None) => dbg!(HttpResponse::BadRequest().body("")),
                         Ok(Some(s)) => {
-
-
-                            dbg!();
                             if let Ok(Some(server_stream)) = io.input(sid, EngineInput::Listen).await {
-                                dbg!();
                                 <F as NewConnectionService>::new_connection(
                                     &client,
-                                    server_stream.filter_map(|p| match p { 
-                                         Payload::Message(d) => Some(Ok(d)),
-                                         Payload::Close(r) => Some(Err(r)),
-                                         _ => None,
-                                    }),
+                                    create_connection_stream(server_stream),
                                     Emitter::new(sid, io.clone())
                                 );
                             }
@@ -221,15 +193,9 @@ where F: NewConnectionService + 'static
                                 .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
                                 .flat_map(|a| a )
                                 .collect();
-
-                            dbg!(&combined);
-
                             HttpResponse::Ok().body(combined)
-
                         }
                     }
-
-
                 }
             }
             )
