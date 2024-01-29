@@ -1,42 +1,27 @@
 use std::sync::Arc;
-use actix_web::body::MessageBody;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 
-use crate::{async_session_io_create, EngineInput, PayloadDecodeError, EngineData };
+use crate::{async_session_io_create, EngineInput, PayloadDecodeError, MessageData, EngineKind };
 use crate::engine::{Sid, TransportConfig, Payload, Participant };
 use crate::proto::EngineError;
 pub use super::common::{ NewConnectionService, Emitter };
 
-#[derive(Debug, Clone)]
-pub enum MessageParsingError {
-    UnknownType
-}
 impl TryFrom<actix_ws::Message> for Payload {
     type Error = PayloadDecodeError;
+
     fn try_from(value: actix_ws::Message) -> Result<Self, Self::Error> {
         match value {
             actix_ws::Message::Text(d) => {
-                let mut iter = d.into_bytes().into_iter();
-                match iter.next() {
-                    None => Err(PayloadDecodeError::UnknownType),
-                    Some(b'0') => Ok(Payload::Open(vec![])),
-                    Some(b'1') => Ok(Payload::Close(crate::EngineCloseReason::Timeout)),
-                    Some(b'2') => Ok(Payload::Ping),
-                    Some(b'3') => Ok(Payload::Pong),
-                    Some(b'4') => Ok(Payload::Message(iter.collect::<Vec<u8>>())),
-                    Some(b'5') => Ok(Payload::Upgrade),
-                    Some(b'6') => Ok(Payload::Noop),
-                    _ => Err(PayloadDecodeError::InvalidFormat)
-                }
+                let data = d.as_bytes().to_vec();
+                Payload::decode(&data, EngineKind::Continuous)
             },
             actix_ws::Message::Binary(d) => {
                 let data = d.into_iter().collect::<Vec<u8>>();
-                return Ok(Payload::Message(data.to_owned()))
+                return Ok(Payload::Message(crate::MessageData::Binary(data)))
             },
             _ => Ok(Payload::Noop)
         }
-        
     }
 }
 
@@ -116,13 +101,17 @@ where F: NewConnectionService + 'static
                                             match &engress {
                                                 Some(p) => { 
                                                     dbg!(&p);
-                                                    let d = p.as_bytes();
-                                                    if EngineData::is_binary(&d) == true {
-                                                        dbg!(session.binary(d).await);
-                                                    }
-                                                    else {
-                                                        dbg!(session.text(String::from_utf8(d).unwrap()).await);
-                                                    }
+
+                                                    let d = p.encode(EngineKind::Continuous);
+                                                    match p {
+                                                        Payload::Message(MessageData::Binary(..)) => {
+                                                            dbg!(session.binary(d).await);
+                                                        },
+                                                        _ => {
+                                                            dbg!(session.text(String::from_utf8(d).unwrap()).await);
+
+                                                        }
+                                                    }   
                                                 },
                                                 None => {
                                                     dbg!();
@@ -169,7 +158,7 @@ where F: NewConnectionService + 'static
                                 let res_size = all.len();
                                 let seperator = b"\x1e";
                                 let combined: Vec<u8> = all.into_iter()
-                                    .map(|p| p.as_bytes())
+                                    .map(|p| p.encode(EngineKind::Poll).to_owned())
                                     .enumerate()
                                     .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
                                     .flat_map(|a| a )
@@ -228,7 +217,7 @@ where F: NewConnectionService + 'static
                             let res_size = all.len();
                             let seperator = b"\x1e";
                             let combined: Vec<u8> = all.into_iter()
-                                .map(|p| p.as_bytes())
+                                .map(|p| p.encode(EngineKind::Poll).to_owned())
                                 .enumerate()
                                 .map(|(n,b)| if res_size > 1 && n < res_size - 1{ dbg!(&b); vec![b,seperator.to_vec()].concat() } else { b } )
                                 .flat_map(|a| a )
@@ -272,7 +261,7 @@ where F: NewConnectionService + 'static
 
                     for msg in buf.into_iter() {
                         dbg!(msg);
-                        io.input(sid, EngineInput::Data(Participant::Client, msg.try_into())).await;
+                        io.input(sid, EngineInput::Data(Participant::Client, Payload::decode(msg, EngineKind::Poll))).await;
                     }
                     // TODO: Test suite assumes an "ok" returned in response... 
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))

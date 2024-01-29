@@ -509,7 +509,6 @@ dependencies = [
  "actix-rt",
  "actix-web",
  "actix-ws",
- "dashmap",
  "env_logger",
  "futures-util",
  "log",

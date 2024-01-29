@@ -1,5 +1,5 @@
 use actix_web::{middleware::Logger, App, HttpServer };
-use engineio::{TransportConfig, EngineData};
+use engineio::{TransportConfig, MessageData};
 use engineio::adapters::actix::{ socket_io, NewConnectionService, Emitter };
 use futures_util::StreamExt;
 use futures_util::Stream;
@@ -7,7 +7,7 @@ use futures_util::pin_mut;
 
 struct NewConnectionManager {}
 impl NewConnectionService for NewConnectionManager {
-    fn new_connection<S:Stream<Item=Result<Vec<u8>,engineio::EngineCloseReason>> + 'static>(&self, stream:S, emit:Emitter) {
+    fn new_connection<S:Stream<Item=Result<MessageData,engineio::EngineCloseReason>> + 'static>(&self, stream:S, emit:Emitter) {
         actix_rt::spawn(async move {
             pin_mut!(stream);
             
@@ -15,13 +15,7 @@ impl NewConnectionService for NewConnectionManager {
                 match stream.next().await {
                     None => break,
                     Some(Ok(data)) => { 
-
-                        if let Ok(msg) =  EngineData::try_from(data) {
-                            
-                            emit.send(engineio::Payload::Message(msg.as_bytes())).await
-                        }
-
-
+                        emit.send(data).await
                     },
                     _ => {}
                 }

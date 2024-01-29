@@ -1,5 +1,4 @@
 use std::fmt;
-use std::string::FromUtf8Error;
 use std::time::Duration;
 use std::u8;
 use std::vec;
@@ -67,6 +66,20 @@ impl fmt::Display for EngineInput {
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone,Debug)]
+pub enum MessageData {
+    String(Vec<u8>),
+    Binary(Vec<u8>)
+}
+
+impl MessageData {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            MessageData::String(v) => v,
+            MessageData::Binary(v) => v,
+        }
+    }
+}
 
 #[derive(Clone,Debug)]
 pub enum Payload {
@@ -74,7 +87,7 @@ pub enum Payload {
     Close(EngineCloseReason),
     Ping,
     Pong,
-    Message(Vec<u8>),
+    Message(MessageData),
     Upgrade,
     Noop
 }
@@ -85,54 +98,66 @@ pub enum PayloadDecodeError {
     UnknownType
 }
 
-impl TryFrom<&[u8]> for Payload {
-    type Error = PayloadDecodeError;
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let t = value.first();
+static EMPTY_DATA: [u8;0] = [];
+
+impl Payload{
+    fn as_bytes(&self) -> &[u8] {
+        match self { 
+            Payload::Open(data) =>data.as_slice(),
+            Payload::Close(reason) => EMPTY_DATA.as_slice(),
+            Payload::Ping => EMPTY_DATA.as_slice(),
+            Payload::Pong => EMPTY_DATA.as_slice(),
+            Payload::Message(p) => p.as_bytes(),
+            Payload::Upgrade => EMPTY_DATA.as_slice(),
+            Payload::Noop => EMPTY_DATA.as_slice()
+        }
+    }
+
+    pub fn encode(&self, transport: EngineKind) -> Vec<u8> {
+        let header:Option<u8> = match self {
+            Payload::Open(..) => b'0'.into(),
+            Payload::Close(..) => b'1'.into(),
+            Payload::Ping => b'2'.into(),
+            Payload::Pong => b'3'.into(),
+            Payload::Message(MessageData::String(..)) => b'4'.into(), 
+            Payload::Message(MessageData::Binary(..)) => { 
+                match transport {
+                    EngineKind::Poll => b'b'.into(),
+                    EngineKind::Continuous => None,
+                }
+            }, 
+            Payload::Upgrade => b'5'.into(),
+            Payload::Noop => b'6'.into()
+        };
+        let d = self.as_bytes();
+        let mut v = Vec::with_capacity(d.len()+10);
+        if let Some(c) = header { v.push(c) };
+        v.extend_from_slice(d);
+        return v
+    }
+
+    pub fn decode(data:&[u8], transport: EngineKind) -> Result<Payload, PayloadDecodeError> {
+        let t = data.first();
         match t {
             None => Err(PayloadDecodeError::InvalidFormat),
             Some(n) => {
-                let data = value.get(1..).and_then(|a| Some(a.to_vec())).unwrap_or(vec![]);
+                let data = data.get(1..).and_then(|a| Some(a.to_vec())).unwrap_or(vec![]);
                 match n {
                     b'0' => Ok(Payload::Open(data)),
                     b'1' => Ok(Payload::Close(EngineCloseReason::Timeout)),
                     b'2' => Ok(Payload::Ping),
                     b'3' => Ok(Payload::Pong),
-                    b'4' => Ok(Payload::Message(data)),
+                    b'4' => Ok(Payload::Message(MessageData::String(data))),
+                    b'b' => Ok(Payload::Message(MessageData::Binary(data))),
                     b'5' => Ok(Payload::Upgrade),
                     b'6' => Ok(Payload::Noop),
                     _ => Err(PayloadDecodeError::UnknownType)
                 }
             }
         }
-    }
-}
 
-impl Payload{
-    pub fn as_bytes(&self) -> Vec<u8>{
-        let (prefix, data) = match &self{
-            Payload::Open(data) => ("0", Some(data.to_owned())),
-            Payload::Close(reason) => ("1", None),
-            Payload::Ping => ("2", None),
-            Payload::Pong => ("3", None),
-            Payload::Message(p) => { 
-                if EngineData::is_binary(p) {
-                    ("", Some(p.to_owned()))
-                }
-                else {
-                    ("4", Some(p.to_owned()))
-                }
-            },
-            Payload::Upgrade => ("5",None),
-            Payload::Noop => ("6",None),
-        };
-
-        let mut b = prefix.as_bytes().to_owned();
-        if let Some(data) = data {
-            b = [b,data.clone()].concat();
-        }
-        return b
     }
+
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -153,40 +178,6 @@ impl Default for TransportConfig {
 }
 
 
-pub enum EngineData {
-    Text(String),
-    Binary(Vec<u8>)
-}
 
-impl EngineData {
 
-    pub fn is_binary(d:&[u8]) -> bool {
-        d.first().filter(|c| **c == b'b').is_some()
-    }
 
-    pub fn as_bytes(&self) -> Vec<u8> {
-        match self {
-            EngineData::Binary(vec) => { 
-                let mut d = vec.clone();
-                d.insert(0, b'b');
-                return d
-            }
-            EngineData::Text(s) => s.as_bytes().to_owned()
-        }
-    }
-}
-
-impl TryFrom<Vec<u8>> for EngineData {
-    type Error = FromUtf8Error;
-    
-    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        match value.first() {
-            None => Ok(Self::Text("".to_string())),
-            Some(b'b') => Ok(Self::Binary(value.get(1..).and_then(|d| Some(d.to_vec())).unwrap_or(vec![]))),
-            Some(..) => { 
-                let d = String::from_utf8(value)?;
-                Ok(Self::Text(d))
-            }
-        }
-    }
-}

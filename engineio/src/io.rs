@@ -8,6 +8,7 @@ use crate::EngineCloseReason;
 use crate::EngineInputError;
 use crate::EngineInput;
 use crate::EngineOutput;
+use crate::MessageData;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 
 
@@ -122,10 +123,14 @@ impl AsyncSessionIOSender {
         }
     }
 
-   pub async fn send(&self, payload:Payload) {
+   pub async fn send(&self, data:MessageData) {
        // TODO: Listen for SEND errors ?
-       self.handle.input(self.sid, EngineInput::Data(Participant::Server, Ok(payload))).await;
+       self.handle.input(
+           self.sid, 
+           EngineInput::Data(Participant::Server, Ok(Payload::Message(data))),
+        ).await;
    }
+
 }
 
 
