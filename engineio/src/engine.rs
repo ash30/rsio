@@ -14,7 +14,6 @@ pub enum EngineInput {
     Close(Participant),
     Data(Participant, Result<Payload,PayloadDecodeError>),
     Poll,
-    Listen,
     Tock
 }
 
@@ -52,7 +51,6 @@ impl fmt::Display for EngineInput {
         let output = match self {
             Self::Tock  => "Tock",
             Self::Poll => "POLL",
-            Self::Listen => "LISTEN",
             Self::New(..) => "NEW",
             Self::Data(p,d) => "DATA",
             Self::Close(..) => "CLOSE",
@@ -130,7 +128,6 @@ impl Engine
         let mut output = Vec::new();
         // Before Consuming event, make sure poll timeout is valid
         let res = match input {
-            EngineInput::Listen => Ok(()),
 
             EngineInput::New(config, kind) => {
                 match &currentState.transport {
@@ -284,11 +281,6 @@ impl Engine
         let currentState = &self.state;
         let mut nextState = self.state.clone();
 
-
-        // Special case LISTEN ... Is there a better way?
-        if let EngineInput::Listen = &input {
-            self.output.push_back(EngineOutput::SetIO(Participant::Server, true));
-        }
 
         // CALCULATE NEXT STATE
         let mut output = Engine::update(now, input, currentState, &mut nextState, self.poll_buffer.len());

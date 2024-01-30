@@ -1,10 +1,9 @@
-use std::sync::Arc;
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
 use crate::{create_async_io, EngineInput, PayloadDecodeError, MessageData, EngineKind };
 use crate::engine::{Sid, TransportConfig, Payload, Participant, EngineError };
-pub use super::common::{ NewConnectionService, AsyncEmitter as Emitter };
-use super::common::create_connection_stream;
+pub use crate::AsyncConnectionService as ConnectionService;
+pub use crate::AsyncSession as Session;
 
 #[derive(serde::Deserialize)]
 struct SessionInfo {
@@ -49,14 +48,11 @@ impl actix_web::ResponseError for EngineError {
 }
 
 pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: F) -> Resource
-where F: NewConnectionService + 'static
+where F: ConnectionService + 'static + Send + Sync 
 {
-    let client = Arc::new(callback);
-    let io = create_async_io();
-
+    let io = create_async_io(callback);
     // WS 
     let path = {
-        let client = client.clone();
         let io = io.clone();
         path.route(
             web::route()
@@ -65,7 +61,6 @@ where F: NewConnectionService + 'static
                 ctx.head().headers().get("Upgrade").is_some_and(|v| v == "websocket")
             }))
             .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
-                let client = client.clone();
                 let io = io.clone();
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
 
@@ -74,16 +69,6 @@ where F: NewConnectionService + 'static
                     let mut client_stream = io.input(
                         sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)
                     ).await.map_err(|_e| EngineError::OpenFailed)?.unwrap();
-
-                    let server_stream = io.input(
-                        sid, EngineInput::Listen
-                    ).await.map_err(|_e| EngineError::OpenFailed)?.unwrap();
-
-                   <F as NewConnectionService>::new_connection(
-                        &client,
-                        create_connection_stream(server_stream),
-                        Emitter::new(sid, io.clone())
-                   );
 
                     actix_rt::spawn(async move {
                         loop {
@@ -154,14 +139,12 @@ where F: NewConnectionService + 'static
 
     let path = {
         let io = io.clone();
-        let client = client.clone();
         let config = config.clone();
         path.route(
             web::route()
             .guard(guard::Get())
             .to(move |session: web::Query<SessionInfo>| { 
                 let io = io.clone();
-                let client = client.clone();
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
@@ -170,14 +153,6 @@ where F: NewConnectionService + 'static
                         Err(e) => {  dbg!(e); dbg!(HttpResponse::BadRequest().body(""))},
                         Ok(None) => dbg!(HttpResponse::BadRequest().body("")),
                         Ok(Some(s)) => {
-                            if let Ok(Some(server_stream)) = io.input(sid, EngineInput::Listen).await {
-                                <F as NewConnectionService>::new_connection(
-                                    &client,
-                                    create_connection_stream(server_stream),
-                                    Emitter::new(sid, io.clone())
-                                );
-                            }
-
                             let all = s.take(1).collect::<Vec<Payload>>().await;
                             let t = EngineKind::Poll;
                             let combined = Payload::encode_combined(&all, &t);

@@ -1,17 +1,60 @@
 use std::time::Instant;
 use std::collections::HashMap;
 use futures_util::Stream;
+use tokio_stream::StreamExt;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::Receiver;
 use crate::EngineError;
+use crate::EngineCloseReason;
 use crate::EngineInput;
 use crate::EngineOutput;
+use crate::MessageData;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
+use crate::handler::ConnectionMessage;
+
+pub trait AsyncConnectionService { 
+    fn new_connection<S:Stream<Item=ConnectionMessage> + 'static + Send>(&self, connection:S, session:AsyncSession);
+}
+
+fn create_connection_stream(s:impl Stream<Item=Payload>) -> impl Stream<Item=Result<MessageData,EngineCloseReason>> {
+    s.filter_map(|p| match p { 
+        Payload::Message(d) => Some(Ok(d)),
+        Payload::Close(r) => Some(Err(r)),
+        _ => None,
+    })
+}
+
+// =============================================
+
+pub struct AsyncSession {
+    sid:Sid,
+    handle: AsyncIOHandle
+}
+
+impl AsyncSession {
+    pub fn new(sid:Sid, handle:AsyncIOHandle) -> Self {
+        Self {
+            sid, handle
+        }
+    }
+
+   pub async fn send(&self, data:MessageData) {
+       // TODO: Listen for SEND errors ?
+       self.handle.input(
+           self.sid, 
+           EngineInput::Data(Participant::Server, Ok(Payload::Message(data))),
+        ).await;
+   }
+}
+
+// =============================================
 
 type AsyncInputResult = Result<Option<Receiver<Payload>>,EngineError>;
 type AsyncInputSender = tokio::sync::oneshot::Sender<AsyncInputResult>;
 
-pub fn create_async_io() -> AsyncIOHandle {
+pub fn create_async_io<F>(client:F) -> AsyncIOHandle 
+where F:AsyncConnectionService + 'static + Send
+{
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
     let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
 
@@ -19,6 +62,7 @@ pub fn create_async_io() -> AsyncIOHandle {
     let mut server_recv: HashMap<Sid, Sender<Payload>> = HashMap::new();
     let mut client_recv: HashMap<Sid, Sender<Payload>> = HashMap::new();
 
+    let input_tx_server = input_tx.clone();
     tokio::spawn( async move {
         loop {
             let (sid, input, tx)  = tokio::select! {
@@ -27,7 +71,15 @@ pub fn create_async_io() -> AsyncIOHandle {
             };
 
             let engine = match &input  {
-                EngineInput::New(..) => Some(engines.entry(sid).or_insert(Engine::new(sid))),
+                EngineInput::New(..) => { 
+                    let (tx,rx) = tokio::sync::mpsc::channel::<Payload>(10);
+                    server_recv.insert(sid.clone(), tx);
+                    client.new_connection(
+                        create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                        AsyncSession::new(sid.clone(), AsyncIOHandle { input_tx: input_tx_server.clone() } )
+                    );
+                    Some(engines.entry(sid).or_insert(Engine::new(sid)))
+                },
                 _ => engines.get_mut(&sid)
             };
 
