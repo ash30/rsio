@@ -19,8 +19,7 @@ impl TryFrom<actix_ws::Message> for Payload {
         match value {
             actix_ws::Message::Text(d) => {
                 let data = d.as_bytes().to_vec();
-                let t = EngineKind::Continuous;
-                Payload::decode(&data, &t)
+                Payload::decode(&data, EngineKind::Continuous)
             },
             actix_ws::Message::Binary(d) => {
                 let data = d.into_iter().collect::<Vec<u8>>();
@@ -82,8 +81,7 @@ where F: ConnectionService + 'static + Send + Sync
                                 engress = client_stream.next() => {
                                     match &engress {
                                         Some(p) => { 
-                                            let t = EngineKind::Continuous;
-                                            let d = p.encode(&t);
+                                            let d = p.encode(EngineKind::Continuous);
                                             match p {
                                                 Payload::Message(MessageData::Binary(..)) => session.binary(d).await,
                                                 _ => session.text(String::from_utf8(d).unwrap()).await
@@ -122,8 +120,7 @@ where F: ConnectionService + 'static + Send + Sync
                             Ok(None) => HttpResponse::InternalServerError().body(""),
                             Ok(Some(s)) => {
                                 let all = s.collect::<Vec<Payload>>().await;
-                                let t = EngineKind::Poll;
-                                let combined = Payload::encode_combined(&all, &t);
+                                let combined = Payload::encode_combined(&all, EngineKind::Poll);
                                 dbg!(&combined);
                                 HttpResponse::Ok().body(combined)
                             }
@@ -154,8 +151,7 @@ where F: ConnectionService + 'static + Send + Sync
                         Ok(None) => dbg!(HttpResponse::BadRequest().body("")),
                         Ok(Some(s)) => {
                             let all = s.take(1).collect::<Vec<Payload>>().await;
-                            let t = EngineKind::Poll;
-                            let combined = Payload::encode_combined(&all, &t);
+                            let combined = Payload::encode_combined(&all, EngineKind::Poll);
                             HttpResponse::Ok().body(combined)
                         }
                     }
@@ -174,8 +170,7 @@ where F: ConnectionService + 'static + Send + Sync
                 let io = io.clone();
                 async move { 
                     let sid = session.sid.ok_or(EngineError::MissingSession)?;
-                    let t = EngineKind::Poll;
-                    for p in Payload::decode_combined(body.as_ref(), &t) {
+                    for p in Payload::decode_combined(body.as_ref(), EngineKind::Poll) {
                         dbg!(&p);
                         io.input(sid, EngineInput::Data(Participant::Client, p)).await;
                     }

@@ -31,7 +31,7 @@ async fn main() -> std::io::Result<()> {
 
     let config = TransportConfig {
         ping_interval:300,
-        ping_timeout:200,
+        ping_timeout:60200,
         ..TransportConfig::default()
     };
 
