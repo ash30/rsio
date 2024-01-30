@@ -109,7 +109,6 @@ impl Payload{
         let rest = v.get(1..).map(|s| s.iter().flat_map(|p| vec![vec![seperator], p.encode(t).to_vec()].concat()).collect::<Vec<u8>>());
         return start.and_then(|mut n| rest.map(|r| {n.extend_from_slice(&r); n})).unwrap_or(vec![])
     }
-
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]

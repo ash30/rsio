@@ -11,7 +11,7 @@ use crate::engine::{Sid, Payload, Engine, Participant} ;
 type AsyncInputResult = Result<Option<Receiver<Payload>>,EngineError>;
 type AsyncInputSender = tokio::sync::oneshot::Sender<AsyncInputResult>;
 
-pub fn async_engine_create() -> AsyncIOHandle {
+pub fn create_async_io() -> AsyncIOHandle {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
     let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
 
