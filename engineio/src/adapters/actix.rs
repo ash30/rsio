@@ -33,10 +33,8 @@ impl TryFrom<actix_ws::Message> for Payload {
 impl actix_web::ResponseError for EngineError {
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
-            EngineError::InvalidPoll => actix_web::http::StatusCode::BAD_REQUEST,
             EngineError::Generic => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            EngineError::MissingSession => actix_web::http::StatusCode::BAD_REQUEST,
-            _ => actix_web::http::StatusCode::NOT_FOUND
+            _ => actix_web::http::StatusCode::BAD_REQUEST
         }
     }
 
@@ -50,6 +48,7 @@ pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: 
 where F: ConnectionService + 'static + Send + Sync 
 {
     let io = create_async_io(callback);
+    
     // WS 
     let path = {
         let io = io.clone();
@@ -62,7 +61,6 @@ where F: ConnectionService + 'static + Send + Sync
             .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
                 let io = io.clone();
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
-
                 async move {
                     let sid = uuid::Uuid::new_v4();
                     let mut client_stream = io.input(
@@ -70,27 +68,17 @@ where F: ConnectionService + 'static + Send + Sync
                     ).await.map_err(|_e| EngineError::OpenFailed)?.unwrap();
 
                     actix_rt::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                ingress = msg_stream.next() => {
-                                    match ingress {
-                                        Some(Ok(m)) => io.input(sid, EngineInput::Data(Participant::Client, m.try_into())).await,
-                                        _ => break
-                                    };
-                                }
-                                engress = client_stream.next() => {
-                                    match &engress {
-                                        Some(p) => { 
-                                            let d = p.encode(EngineKind::Continuous);
-                                            match p {
-                                                Payload::Message(MessageData::Binary(..)) => session.binary(d).await,
-                                                _ => session.text(String::from_utf8(d).unwrap()).await
-                                            }   
-                                        },
-                                        None => break
-                                    };
-                                }
-                            }
+                        while let Some(Ok(m)) = msg_stream.next().await {
+                            let _ = io.input(sid, EngineInput::Data(Participant::Client, m.try_into())).await;
+                        }
+                    });
+                    actix_rt::spawn(async move {
+                        while let Some(p) = client_stream.next().await {
+                            let d = p.encode(EngineKind::Continuous);
+                            let _ = match p {
+                                Payload::Message(MessageData::Binary(..)) => session.binary(d).await,
+                                _ => session.text(String::from_utf8(d).unwrap()).await
+                            };
                         }
                         let _ = session.close(None).await;
                     });
@@ -110,44 +98,37 @@ where F: ConnectionService + 'static + Send + Sync
                 ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
             }))
             .to(move |session: web::Query<SessionInfo>| { 
-                dbg!();
                 let io = io.clone();
                 async move {
-                    if let Some(sid) = session.sid {
-                        let s = io.input(sid, EngineInput::Poll).await;
-                        match s {
-                            Err(..) =>  HttpResponse::BadRequest().body(""),
-                            Ok(None) => HttpResponse::InternalServerError().body(""),
-                            Ok(Some(s)) => {
-                                let all = s.collect::<Vec<Payload>>().await;
-                                let combined = Payload::encode_combined(&all, EngineKind::Poll);
-                                dbg!(&combined);
-                                HttpResponse::Ok().body(combined)
-                            }
+                    let sid = session.sid.ok_or(EngineError::MissingSession)?;
+                    match io.input(sid, EngineInput::Poll).await {
+                        Err(e) => Err(e),
+                        Ok(None) => Err(EngineError::Generic),
+                        Ok(Some(s)) => {
+                            let all = s.collect::<Vec<Payload>>().await;
+                            let combined = Payload::encode_combined(&all, EngineKind::Poll);
+                            Ok(HttpResponse::Ok().body(combined))
                         }
-                    }
-                    else {
-                        HttpResponse::BadRequest().body(vec![])
                     }
                 }
             })
         )
     };
 
+    // NEW LONG POLL
     let path = {
         let io = io.clone();
         let config = config.clone();
         path.route(
             web::route()
             .guard(guard::Get())
-            .to(move |session: web::Query<SessionInfo>| { 
+            .to(move | _session: web::Query<SessionInfo>| { 
                 let io = io.clone();
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let res = io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await;
-                    match res {
-                        Err(e) => {  dbg!(e); dbg!(HttpResponse::BadRequest().body(""))},
+                    match io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await {
+                        Err(e) => { dbg!(e); dbg!(HttpResponse::BadRequest().body(""))},
                         Ok(None) => dbg!(HttpResponse::BadRequest().body("")),
                         Ok(Some(s)) => {
                             let all = s.take(1).collect::<Vec<Payload>>().await;
@@ -161,6 +142,7 @@ where F: ConnectionService + 'static + Send + Sync
         )
     };
 
+    // POST MSG LONG POLL
     let path = { 
         let io = io.clone();
         path.route(
@@ -171,8 +153,7 @@ where F: ConnectionService + 'static + Send + Sync
                 async move { 
                     let sid = session.sid.ok_or(EngineError::MissingSession)?;
                     for p in Payload::decode_combined(body.as_ref(), EngineKind::Poll) {
-                        dbg!(&p);
-                        io.input(sid, EngineInput::Data(Participant::Client, p)).await;
+                        let _ = io.input(sid, EngineInput::Data(Participant::Client, p)).await;
                     }
                     Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))
                 }
@@ -185,7 +166,7 @@ where F: ConnectionService + 'static + Send + Sync
     let path = {
         path.route(
             web::route()
-            .to(move |session: web::Query<SessionInfo>| {
+            .to(move | _session: web::Query<SessionInfo>| {
                 HttpResponse::BadRequest()
             })
         )
