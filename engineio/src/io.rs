@@ -148,8 +148,16 @@ impl AsyncIOHandle {
     pub async fn input(&self, id:Sid, input:EngineInput) -> Result<Option<impl Stream<Item =Payload>>,EngineError> {
         let (tx,rx) = tokio::sync::oneshot::channel::<AsyncInputResult>();
         let _ = self.input_tx.send((id,input, Some(tx))).await;
-        let res = rx.await.unwrap_or(Err(EngineError::AlreadyClosed));
-        return res.and_then(|opt| Ok(opt.and_then(|rx| Some(tokio_stream::wrappers::ReceiverStream::new(rx)))))
+        let res = rx.await.unwrap_or(Err(EngineError::AlreadyClosed))?;
+        Ok(res.map(|r| tokio_stream::wrappers::ReceiverStream::new(r)))
+    }
+
+    pub async fn input_with_response_stream(&self, id:Sid, input:EngineInput) -> Result<impl Stream<Item=Payload>,EngineError> {
+        match self.input(id, input).await {
+            Err(e) => Err(e),
+            Ok(Some(s)) => Ok(s),
+            Ok(None) => Err(EngineError::Generic)
+        }
     }
 }
 

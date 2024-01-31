@@ -63,9 +63,9 @@ where F: ConnectionService + 'static + Send + Sync
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut client_stream = io.input(
+                    let mut client_stream = io.input_with_response_stream(
                         sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)
-                    ).await.map_err(|_e| EngineError::OpenFailed)?.unwrap();
+                    ).await?;
 
                     actix_rt::spawn(async move {
                         while let Some(Ok(m)) = msg_stream.next().await {
@@ -101,15 +101,9 @@ where F: ConnectionService + 'static + Send + Sync
                 let io = io.clone();
                 async move {
                     let sid = session.sid.ok_or(EngineError::MissingSession)?;
-                    match io.input(sid, EngineInput::Poll).await {
-                        Err(e) => Err(e),
-                        Ok(None) => Err(EngineError::Generic),
-                        Ok(Some(s)) => {
-                            let all = s.collect::<Vec<Payload>>().await;
-                            let combined = Payload::encode_combined(&all, EngineKind::Poll);
-                            Ok(HttpResponse::Ok().body(combined))
-                        }
-                    }
+                    let s = io.input_with_response_stream(sid, EngineInput::Poll).await?;
+                    let all = s.collect::<Vec<Payload>>().await;
+                    Ok::<HttpResponse,EngineError>(HttpResponse::Ok().body(Payload::encode_combined(&all, EngineKind::Poll)))
                 }
             })
         )
@@ -127,15 +121,10 @@ where F: ConnectionService + 'static + Send + Sync
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    match io.input(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await {
-                        Err(e) => { dbg!(e); dbg!(HttpResponse::BadRequest().body(""))},
-                        Ok(None) => dbg!(HttpResponse::BadRequest().body("")),
-                        Ok(Some(s)) => {
-                            let all = s.take(1).collect::<Vec<Payload>>().await;
-                            let combined = Payload::encode_combined(&all, EngineKind::Poll);
-                            HttpResponse::Ok().body(combined)
-                        }
-                    }
+                    let s = io.input_with_response_stream(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await?;
+                    let all = s.take(1).collect::<Vec<Payload>>().await;
+                    let combined = Payload::encode_combined(&all, EngineKind::Poll);
+                    Ok::<HttpResponse,EngineError>(HttpResponse::Ok().body(combined))
                 }
             }
             )
@@ -153,9 +142,11 @@ where F: ConnectionService + 'static + Send + Sync
                 async move { 
                     let sid = session.sid.ok_or(EngineError::MissingSession)?;
                     for p in Payload::decode_combined(body.as_ref(), EngineKind::Poll) {
-                        let _ = io.input(sid, EngineInput::Data(Participant::Client, p)).await;
+                        if let Err(e) = io.input(sid, EngineInput::Data(Participant::Client, p)).await {
+                            return Err(e);
+                        }
                     }
-                    Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok"))
+                    Ok(Ok::<HttpResponse, EngineError>(HttpResponse::Ok().body("ok")))
                 }
             }
             )
