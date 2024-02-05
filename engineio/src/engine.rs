@@ -17,6 +17,13 @@ pub enum EngineInput {
     Tock
 }
 
+pub enum EngineCommand {
+    New(Option<TransportConfig>, EngineKind),
+    Message(MessageData),
+    Poll,
+    Close
+}
+
 #[derive(Debug)]
 pub enum EngineOutput {
     Tick { length:Duration },
@@ -85,7 +92,7 @@ pub struct EngineState {
     polling: PollingState, 
     poll_timeout:Duration,
     poll_duration: Duration,
-    max_payload: u32,
+    max_payload: u64,
 }
 
 impl EngineState {

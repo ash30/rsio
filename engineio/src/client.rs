@@ -1,32 +1,25 @@
-
-
 use crate::{MessageData, Payload, PayloadDecodeError, TransportConfig, EngineKind, EngineError, Sid, EngineCloseReason };
 use std::{collections::VecDeque, time::{Instant, Duration}};
 
-pub enum Either<A,B> { 
-    A(A),
-    B(B)
-}
-
-struct Time();
-
+#[derive(Debug, Clone)]
 pub enum EngineIOServerCtrls {
     Close,
-    Noop
 }
 
+#[derive(Debug, Clone)]
 pub enum EngineIOClientCtrls {
     New(Option<TransportConfig>, EngineKind),
     Poll,
     Close
 }
 
+#[derive(Debug)]
 pub enum EngineInput<T> {
     Control(T),
     Data(Result<Payload, PayloadDecodeError>),
 }
 
-
+#[derive(Debug, Clone)]
 pub enum IO {
     Open,
     Close,
@@ -38,11 +31,13 @@ pub enum IO {
 
 // ============================================
 
+#[derive(Debug, Clone)]
 enum Transport {
     Polling { active:Option<(Instant,Duration)> },
     Continuous
 }
 
+#[derive(Debug, Clone)]
 struct Heartbeat {
     last_seen:Instant,
     last_ping:Option<Instant>
@@ -50,13 +45,56 @@ struct Heartbeat {
 
 // ============================================
 
+#[derive(Debug)]
 enum EngineState {
     New, 
-    Connected(Transport, Heartbeat),
-    Closing,
+    Connected(ConnectedState),
     Closed(EngineCloseReason),
 }
 
+impl EngineState {
+    fn has_error(&self) -> Option<&EngineError> {
+        match self {
+            EngineState::Closed(EngineCloseReason::Error(e)) => Some(e),
+            _ => None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConnectedState(Transport, Heartbeat, TransportConfig);
+
+impl ConnectedState {
+        fn new(t:Transport, config:Option<TransportConfig>, now:Instant) -> Self {
+            return Self (t, Heartbeat { last_seen: now, last_ping: None }, config.unwrap_or(TransportConfig::default()))
+        }
+
+        fn update_last_seen(mut self, now:Instant) -> Self {
+            self.1.last_seen = now;
+            self.1.last_ping = None;
+            return self
+        }
+
+        fn update_new_ping(mut self, now:Instant) -> Self {
+            self.1.last_ping = Some(now);
+            return self
+        }
+
+        fn update_new_poll(mut self, now:Instant, length:Duration) -> Self {
+            match self.0 {
+                Transport::Continuous => {},
+                Transport::Polling{ .. } => { self.0 = Transport::Polling{ active:Some((now, length)) }; }
+            };
+            return self
+        }
+
+        fn set_config(mut self, config:TransportConfig) -> Self {
+            self.2 = config;
+            return self
+        }   
+}
+
+#[derive(Debug)]
 struct EngineIOServer {
     pub session: Sid,
     output: VecDeque<IO>,
@@ -65,28 +103,24 @@ struct EngineIOServer {
 }
 
 impl EngineIOServer {
-    pub fn input_send(&self, input:EngineInput<EngineIOServerCtrls>, now:Instant) -> Result<(),EngineError> {
+    pub fn input_send(&mut self, input:EngineInput<EngineIOServerCtrls>, now:Instant) -> Result<(),EngineError> {
 
-        let is_polling = match self.state {
-            EngineState::Connected(Transport::Polling{ .. }) => true,
+        let is_polling = match &self.state {
+            EngineState::Connected(ConnectedState(Transport::Polling{ .. },_,_)) => true,
             _ => false
         };
 
-        let buffer = match is_polling {
-            true => &mut self.poll_buffer,
-            false => &mut self.output
-        };
 
-        let nextState = match input {
-            EngineInput::Data(result) => {
-                match self.state {
+        let next_state = match &input {
+            EngineInput::Data(_) => {
+                match &self.state {
                     EngineState::Connected(..) => Ok(None),
                     _ => Err(EngineError::AlreadyClosed)
                 }
             },
 
             EngineInput::Control(EngineIOServerCtrls::Close) => {
-                match self.state {
+                match &self.state {
                     EngineState::Connected(..) => Ok(Some(EngineState::Closed(EngineCloseReason::Command(crate::Participant::Server)))),
                     _ => Err(EngineError::AlreadyClosed)
                 }
@@ -95,31 +129,39 @@ impl EngineIOServer {
         }?;
 
         if let EngineInput::Data(Ok(p)) = input {
+            let buffer = match is_polling {
+                true => &mut self.poll_buffer,
+                false => &mut self.output
+            };
             buffer.push_back(IO::Send(p));
         }
 
-        if let Some(out) = nextState.and_then(|s| self.update(s)) {
-            buffer.push_back(out);
+        if let Some(s) = next_state { 
+            let buffer = match is_polling {
+                true => &mut self.poll_buffer,
+                false => &mut self.output
+            };
+
+            EngineIOServer::update(self.session, &self.state, &s, &mut self.output);
+            self.state = s;
         }
         Ok(())
     }
 
     pub fn input_recv(&mut self, input:EngineInput<EngineIOClientCtrls>, now:Instant) -> Result<(),EngineError> {
-        let next = match input {
+        let next = match &input {
             EngineInput::Data(Err(e)) => {
                 Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::UnknownPayload)))
             },
             EngineInput::Data(Ok(p)) => {
-                match self.state {
-                    EngineState::Connected(transport, Heartbeat) => {
+                match &self.state {
+                    EngineState::Connected(state) => {
                         match p {
                             Payload::Close(..) => Ok(EngineState::Closed(EngineCloseReason::Command(crate::Participant::Client))),
-                            // Update hearbeat based on any input 
-                            _ => Ok(EngineState::Connected(transport, Heartbeat { last_seen: now, last_ping: None}))
-
+                            _ => Ok(EngineState::Connected(state.clone().update_last_seen(now))
+)
                         }
                     },
-                    // IF we receive data at any other time... error 
                     _ => {
                         Err(EngineError::AlreadyClosed)
                     }
@@ -127,12 +169,12 @@ impl EngineIOServer {
                 }
             },
             EngineInput::Control(EngineIOClientCtrls::Poll) => {
-                match self.state {
-                    EngineState::Connected(transport, Heartbeat) => {
-                        match transport {
-                            Transport::Polling { active:Some(..) } => Err(EngineError::InvalidPoll),
-                            Transport::Polling { active:None } => Ok(EngineState::Connected(Transport::Polling { active: Some((now,Duration::from_secs(1))) }, Heartbeat {last_seen:now, last_ping:None})),
-                            Transport::Continuous => Err(EngineError::InvalidPoll)
+                match &self.state {
+                    EngineState::Connected(s) => {
+                        match s.0 {
+                            Transport::Polling { active:Some(..) } => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll))),
+                            Transport::Polling { active:None } => Ok(EngineState::Connected(s.clone().update_new_poll(now, Duration::from_secs(1)))),
+                            Transport::Continuous => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll)))
                         }
                     },
                     _ => Err(EngineError::AlreadyClosed)
@@ -143,20 +185,114 @@ impl EngineIOServer {
                 Ok(EngineState::Closed(EngineCloseReason::Command(crate::Participant::Client)))
             },
 
-            EngineInput::Control(EngineIOClientCtrls::New(config,kind)) => {}
-            
+            EngineInput::Control(EngineIOClientCtrls::New(config,kind)) => {
+                match &self.state {
+                    EngineState::New => { 
+                        let t = match kind {
+                            EngineKind::Poll => Transport::Polling { active: None },
+                            EngineKind::Continuous => Transport::Continuous
+                        };
+                        Ok(EngineState::Connected(ConnectedState::new( t, *config, now)))
+                    },
+                    EngineState::Connected(..) => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::Generic))),
+                    EngineState::Closed(e) => Err(EngineError::AlreadyClosed)
+                }
+            }
+        }?;
+
+        // IF ERR, return
+        // else udpate 
+        //
+        
+        if let EngineInput::Data(Ok(Payload::Message(msg))) = input {
+            self.output.push_back(IO::Recv(msg))
+        };
+        
+        EngineIOServer::update(self.session, &self.state, &next, &mut self.output);
+        self.state = next;
+
+        // DO WE NEED TO GUARD AGAINT RERUNs ?
+        if let Some(e) = self.state.has_error() {
+            Err(e.clone())
+        }
+        else {
+            Ok(())
+        }
+    }
+
+    fn poll_output(&mut self, now:Instant) -> Option<IO> {
+        // We have to push forward the 'time' element of state so we can trigger timeouts
+        let next = match &self.state {
+            EngineState::Connected(ConnectedState(t,h,c)) => {
+                let next = match t {
+                    Transport::Polling { active:Some((start,length)) } =>  {
+                        if now >= *start+*length {
+                            Some(ConnectedState(Transport::Polling { active: None }, h.clone(), c.clone()))
+                        }
+                        else {
+                            None
+                        }
+                    },
+                    _  => None
+                }.unwrap_or(ConnectedState(t.clone(),h.clone(),c.clone()));
+
+                let next = match h.last_ping {
+                    None => if now > h.last_seen + Duration::from_millis(c.ping_interval) { 
+                        EngineState::Connected(next.update_new_ping(now)) } else { EngineState::Connected(ConnectedState(t.clone(),h.clone(),c.clone())) 
+                    },
+                    Some(start) => if now > start + Duration::from_millis(c.ping_timeout) { 
+                        EngineState::Closed(EngineCloseReason::Timeout) } else { EngineState::Connected(ConnectedState(t.clone(),h.clone(),c.clone()))
+                    }
+                };
+                Some(next)
+            },
+            _ => None
         };
 
-        Ok(())
+        if let Some(new_state) = next {
+            EngineIOServer::update(self.session, &self.state, &new_state, &mut self.output);
+            self.state = new_state;
+        }
+        self.output.pop_front()
     }
 
-    fn poll_output(now:Instant) -> Option<IO> {
+    fn update(sid:Sid, currrent_state:&EngineState, nextState:&EngineState, buffer: &mut VecDeque<IO>) {
+        match (currrent_state, nextState) {
+            // Initial OPEN
+            (EngineState::New, EngineState::Connected(ConnectedState(t,_,config))) => {
+                let upgrades = if let Transport::Polling { .. } = t { vec!["websocket"] } else { vec![] };
+                let data = serde_json::json!({
+                    "upgrades": upgrades,
+                    "maxPayload": config.max_payload,
+                    "pingInterval": config.ping_interval,
+                    "pingTimeout": config.ping_timeout,
+                    "sid":  sid
+                });
+                buffer.push_back(IO::Send(Payload::Open(serde_json::to_vec(&data).unwrap())));
+                if let Transport::Polling { .. } = t { 
+                    buffer.push_back(IO::Close)
+                }
+            },
 
-        None
-    }
+            // Polling Start 
+            (EngineState::Connected(ConnectedState(Transport::Polling { active:None }, _,_ )),
+             EngineState::Connected(ConnectedState(Transport::Polling { active: Some(..) },_,_))) => { 
+                buffer.push_back(IO::Open);
+            }
+            
+            // Polling End
+            (EngineState::Connected(ConnectedState(Transport::Polling { active:Some(..)}, _,_ )),
+             EngineState::Connected(ConnectedState(Transport::Polling { active: None },_,_))) => {
+                buffer.push_back(IO::Close);
+            },
 
-    fn update(&self, nextState:EngineState) -> Option<IO> {
-
+            // Close
+            (_, EngineState::Closed(EngineCloseReason::Command(crate::Participant::Client))) => {},
+            (_, EngineState::Closed(reason)) => {
+                buffer.push_back(IO::Send(Payload::Close(reason.clone())));
+            },
+            _ => {}
+        }
     }
 }
 
@@ -165,4 +301,49 @@ struct EngineIOClient{
     pub session:Sid,
     output: VecDeque<IO>,
     state: EngineState
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Payload;
+
+    fn setup() -> EngineIOServer {
+        return EngineIOServer { output: VecDeque::new(), session:uuid::Uuid::new_v4(), state: EngineState::New, poll_buffer:VecDeque::new() }
+    }
+
+    #[test]
+    fn on_poll_new() {
+        let mut e =  setup();
+        let time = Instant::now();
+        let time_next = time +  Duration::from_millis(1);
+        e.input_recv(EngineInput::Control(EngineIOClientCtrls::New(None, EngineKind::Poll)), time);
+
+        let out = e.poll_output(time_next);
+        let res = if let Some(IO::Send(Payload::Open(..))) = out { true } else { false };
+        assert!(res);
+
+        let out = e.poll_output(time_next);
+        let res = if let Some(IO::Close)  = out { true } else { false };
+        assert!(res);
+    }
+
+    #[test] 
+    fn on_ws_new() {
+        let mut e =  setup();
+        let time = Instant::now();
+        let time_next = time +  Duration::from_millis(1);
+        let _ = e.input_recv(EngineInput::Control(EngineIOClientCtrls::New(None, EngineKind::Continuous)), time);
+
+        let out = e.poll_output(time_next);
+        let res = if let Some(IO::Send(Payload::Open(..))) = out { true } else { false };
+        assert!(res);
+
+        let out = e.poll_output(time_next);
+        let res = if let None = out { true } else { false };
+        assert!(res);
+    }
+
 }

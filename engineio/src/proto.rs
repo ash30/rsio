@@ -113,9 +113,9 @@ impl Payload{
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct TransportConfig { 
-    pub ping_interval: u32,
-    pub ping_timeout: u32,
-    pub max_payload: u32
+    pub ping_interval: u64,
+    pub ping_timeout: u64,
+    pub max_payload: u64,
 }
 
 impl Default for TransportConfig {
