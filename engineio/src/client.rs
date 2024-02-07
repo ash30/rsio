@@ -95,7 +95,7 @@ impl ConnectedState {
 }
 
 #[derive(Debug)]
-struct EngineIOServer {
+pub struct EngineIOServer {
     pub session: Sid,
     output: VecDeque<IO>,
     poll_buffer: VecDeque<IO>,
@@ -103,6 +103,15 @@ struct EngineIOServer {
 }
 
 impl EngineIOServer {
+    pub fn new(id:Sid) -> Self {
+        return Self { 
+            session: id,
+            output: VecDeque::new(),
+            poll_buffer: VecDeque::new(),
+            state: EngineState::New
+        }
+    }
+
     pub fn input_send(&mut self, input:EngineInput<EngineIOServerCtrls>, now:Instant) -> Result<(),EngineError> {
 
         let is_polling = match &self.state {
@@ -220,7 +229,7 @@ impl EngineIOServer {
         }
     }
 
-    fn poll_output(&mut self, now:Instant) -> Option<IO> {
+    pub fn poll_output(&mut self, now:Instant) -> Option<IO> {
         // We have to push forward the 'time' element of state so we can trigger timeouts
         let next = match &self.state {
             EngineState::Connected(ConnectedState(t,h,c)) => {

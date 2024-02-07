@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::time::Duration;
 use std::time::Instant;
 use std::collections::HashMap;
 use futures_util::Stream;
@@ -9,6 +11,8 @@ use crate::EngineCloseReason;
 use crate::EngineInput;
 use crate::EngineOutput;
 use crate::MessageData;
+use crate::client::EngineIOClientCtrls;
+use crate::client::EngineIOServerCtrls;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 use crate::handler::ConnectionMessage;
 
@@ -51,6 +55,114 @@ impl AsyncSession {
 
 type AsyncInputResult = Result<Option<Receiver<Payload>>,EngineError>;
 type AsyncInputSender = tokio::sync::oneshot::Sender<AsyncInputResult>;
+
+enum Either<A,B> {
+    A(A),
+    B(B)
+}
+
+type EngineInput2 = Either<crate::client::EngineInput<EngineIOClientCtrls>, crate::client::EngineInput<EngineIOServerCtrls>>;
+
+pub fn create_async_io2<F>(client:F) -> AsyncIOHandle 
+where F:AsyncConnectionService + 'static + Send
+{
+
+    let (client_input_tx, mut client_input_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOClientCtrls>, AsyncInputSender)>(1024);
+    let (server_input_tx, mut server_input_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOServerCtrls>, AsyncInputSender)>(1024);
+    let mut workers: HashMap<Sid,Sender<(EngineInput2, AsyncInputSender)>> = HashMap::new();
+    
+    tokio::spawn( async move {
+        loop {
+            let (sid,input,res_tx) = tokio::select! {
+                Some(client) = client_input_rx.recv() => (client.0, Either::A(client.1), client.2),
+                Some(server) = server_input_rx.recv() => (server.0, Either::B(server.1), server.2),
+            };
+
+            let worker = match input {
+                Either::A(crate::client::EngineInput::Control(EngineIOClientCtrls::New(..))) => {
+                    // Channel for IO_DISPATCHER to talk to worker
+                    let (tx,rx) = tokio::sync::mpsc::channel::<(EngineInput2,AsyncInputSender)>(32);
+                    workers.insert(sid, tx.clone());
+                    // Channel for END_CLIENT to recv events 
+                    let (server_output_tx, mut server_output_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+                    client.new_connection(
+                        create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(server_output_rx)),
+                        AsyncSession::new(sid.clone(), AsyncIOHandle { input_tx: server_input_tx.clone() } )
+                    );
+                        
+                    tokio::spawn(async move {
+                        let engine = crate::client::EngineIOServer::new(sid);
+                        let mut closing_time = Duration::from_secs(10);
+                        let mut client_out_buffer = VecDeque::new();
+
+                        // TODO: CAN WE MAKE NON OPTIONAL?
+                        let client_out_tx: Option<Sender<Payload>> = None;
+                        //let (res_tx,res_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+                        loop {
+                            let now = Instant::now();
+                            let input = tokio::select! {
+                                Some(input) = rx.recv() => Some(input),
+                                None = rx.recv() => break,
+                                time  = tokio::time::sleep(closing_time) => None
+                            };
+                            if let Some((input,res_tx)) = input {
+                                let r = match input {
+                                    Either::A(client) => engine.input_recv(client, now),
+                                    Either::B(server) => engine.input_send(server, now),
+                                };
+                                if let Err(e) = r {
+                                    res_tx.send(Result::Err(e));
+                                }
+                            }
+                            while let Some(out) = engine.poll_output(now) {
+                                match out {
+                                    crate::client::IO::Send(p) => {
+                                        if let Some(tx) = client_out_tx {
+                                            tx.send(p).await;
+                                        }
+                                        else {
+                                            client_out_buffer.push_back(p);
+                                        }
+                                    },
+                                    crate::client::IO::Open => {
+                                        let (tx,rx) = tokio::sync::mpsc::channel(10);
+                                        client_out_tx = Some(tx);
+                                        if let Some((_, res_tx)) = input {
+                                            res_tx.send(Result::Ok(Some(rx)));
+                                        }
+                                    },
+                                    crate::client::IO::Close => {
+                                        // TODO: CLOSE PROPERLLY
+                                        drop(client_out_tx);
+                                    },
+                                    crate::client::IO::Flush => {
+                                        // TODO: FLUSH BUFFER
+                                        if let Some(
+                                    },
+                                    crate::client::IO::Recv(p) => { server_output_tx.send(p); },
+                                    crate::client::IO::Time(d) => { closing_time = d;},
+                                }
+                            }
+                        }
+                    });
+                    Some(tx)
+                },
+                _ => {
+                    workers.get(&sid).map(|t| t.to_owned())
+                }
+            };
+
+            if let Some(w) = worker {
+               if let Err(e) = w.send_timeout((input,res_tx), Duration::from_secs(1)).await {
+                    res_tx.send(Result::Err(EngineError::Generic));
+               }
+            }
+            else {
+                res_tx.send(Result::Err(EngineError::MissingSession));
+            }
+        }
+    });
+}
 
 pub fn create_async_io<F>(client:F) -> AsyncIOHandle 
 where F:AsyncConnectionService + 'static + Send
