@@ -1,4 +1,4 @@
-use crate::{MessageData, Payload, PayloadDecodeError, TransportConfig, EngineKind, EngineError, Sid, EngineCloseReason };
+use crate::{MessageData, Payload, PayloadDecodeError, TransportConfig, EngineKind, EngineError, Sid, EngineCloseReason, Either };
 use std::{collections::VecDeque, time::{Instant, Duration}};
 
 #[derive(Debug, Clone)]
@@ -26,9 +26,9 @@ pub enum IO {
     Recv(MessageData),
     Send(Payload),
     Flush,
-    Time(Duration),
 }
 
+pub struct Pending(pub Duration);
 // ============================================
 
 #[derive(Debug, Clone)]
@@ -229,7 +229,7 @@ impl EngineIOServer {
         }
     }
 
-    pub fn poll_output(&mut self, now:Instant) -> Option<IO> {
+    pub fn poll_output(&mut self, now:Instant) -> Either<IO,Pending> {
         // We have to push forward the 'time' element of state so we can trigger timeouts
         let next = match &self.state {
             EngineState::Connected(ConnectedState(t,h,c)) => {
@@ -262,7 +262,7 @@ impl EngineIOServer {
             EngineIOServer::update(self.session, &self.state, &new_state, &mut self.output);
             self.state = new_state;
         }
-        self.output.pop_front()
+        self.output.pop_front().map(|o| Either::A(o)).unwrap_or(Either::B(Pending(Duration::from_secs(1))))
     }
 
     fn update(sid:Sid, currrent_state:&EngineState, nextState:&EngineState, buffer: &mut VecDeque<IO>) {

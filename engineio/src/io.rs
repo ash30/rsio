@@ -13,6 +13,7 @@ use crate::EngineOutput;
 use crate::MessageData;
 use crate::client::EngineIOClientCtrls;
 use crate::client::EngineIOServerCtrls;
+use crate::client::IO;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 use crate::handler::ConnectionMessage;
 
@@ -56,7 +57,7 @@ impl AsyncSession {
 type AsyncInputResult = Result<Option<Receiver<Payload>>,EngineError>;
 type AsyncInputSender = tokio::sync::oneshot::Sender<AsyncInputResult>;
 
-enum Either<A,B> {
+pub enum Either<A,B> {
     A(A),
     B(B)
 }
@@ -89,62 +90,56 @@ where F:AsyncConnectionService + 'static + Send
                         create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(server_output_rx)),
                         AsyncSession::new(sid.clone(), AsyncIOHandle { input_tx: server_input_tx.clone() } )
                     );
-                        
+
                     tokio::spawn(async move {
                         let engine = crate::client::EngineIOServer::new(sid);
-                        let mut closing_time = Duration::from_secs(10);
-                        let mut client_out_buffer = VecDeque::new();
-
-                        // TODO: CAN WE MAKE NON OPTIONAL?
-                        let client_out_tx: Option<Sender<Payload>> = None;
-                        //let (res_tx,res_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+                        let mut send_buffer = VecDeque::new();
+                        let mut server_send_tx = None; 
+                        let mut next_tick = Instant::now() + Duration::from_secs(10);
                         loop {
                             let now = Instant::now();
                             let input = tokio::select! {
-                                Some(input) = rx.recv() => Some(input),
-                                None = rx.recv() => break,
-                                time  = tokio::time::sleep(closing_time) => None
+                                input = rx.recv() => if let Some(i) = input { input } else { break },
+                                time  = tokio::time::sleep_until(next_tick.into()) => None
                             };
-                            if let Some((input,res_tx)) = input {
-                                let r = match input {
+
+                            let res = input.map(|(input,res_tx)| {
+                                match input {
                                     Either::A(client) => engine.input_recv(client, now),
                                     Either::B(server) => engine.input_send(server, now),
-                                };
-                                if let Err(e) = r {
-                                    res_tx.send(Result::Err(e));
-                                }
+                                }.map_err(|e| (res_tx,e))
+                            });
+
+                            if let Some(Err((tx,e))) = res {
+                                tx.send(Err(e));
+                                continue;
                             }
-                            while let Some(out) = engine.poll_output(now) {
-                                match out {
-                                    crate::client::IO::Send(p) => {
-                                        if let Some(tx) = client_out_tx {
-                                            tx.send(p).await;
+
+                            let mut res_stream = None;
+                            loop {
+                                match engine.poll_output(now) {
+                                    Either::A(io) => {
+                                        match io {
+                                            IO::Open => {
+                                                let (tx,rx) = tokio::sync::mpsc::channel(10);
+                                                res_stream = rx.into();
+                                                server_send_tx = tx.into();
+                                            },
+                                            IO::Close => { server_send_tx = None; },
+                                            IO::Send(p) => { send_buffer.push_back(p);},
+                                            IO::Recv(p) => { server_output_tx.send(p);},
+                                            IO::Flush => {}
                                         }
-                                        else {
-                                            client_out_buffer.push_back(p);
-                                        }
+                                        send_buffer.push_back(io)
                                     },
-                                    crate::client::IO::Open => {
-                                        let (tx,rx) = tokio::sync::mpsc::channel(10);
-                                        client_out_tx = Some(tx);
-                                        if let Some((_, res_tx)) = input {
-                                            res_tx.send(Result::Ok(Some(rx)));
-                                        }
-                                    },
-                                    crate::client::IO::Close => {
-                                        // TODO: CLOSE PROPERLLY
-                                        drop(client_out_tx);
-                                    },
-                                    crate::client::IO::Flush => {
-                                        // TODO: FLUSH BUFFER
-                                        if let Some(
-                                    },
-                                    crate::client::IO::Recv(p) => { server_output_tx.send(p); },
-                                    crate::client::IO::Time(d) => { closing_time = d;},
+                                    Either::B(pending) => { next_tick =  now + pending.0; break } 
                                 }
-                            }
+                            };
+
+                            if let Some((_, res_tx)) = input { res_tx.send( res_stream)};
                         }
                     });
+            
                     Some(tx)
                 },
                 _ => {
