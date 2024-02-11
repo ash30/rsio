@@ -13,6 +13,7 @@ use crate::EngineOutput;
 use crate::MessageData;
 use crate::client::EngineIOClientCtrls;
 use crate::client::EngineIOServerCtrls;
+use crate::client::EngineDataOutput;
 use crate::client::IO;
 use crate::engine::{Sid, Payload, Engine, Participant} ;
 use crate::handler::ConnectionMessage;
@@ -68,15 +69,15 @@ pub fn create_async_io2<F>(client:F) -> AsyncIOHandle
 where F:AsyncConnectionService + 'static + Send
 {
 
-    let (client_input_tx, mut client_input_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOClientCtrls>, AsyncInputSender)>(1024);
-    let (server_input_tx, mut server_input_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOServerCtrls>, AsyncInputSender)>(1024);
+    let (client_send_tx, mut client_send_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOClientCtrls>, AsyncInputSender)>(1024);
+    let (server_send_tx, mut server_send_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOServerCtrls>, AsyncInputSender)>(1024);
     let mut workers: HashMap<Sid,Sender<(EngineInput2, AsyncInputSender)>> = HashMap::new();
     
     tokio::spawn( async move {
         loop {
             let (sid,input,res_tx) = tokio::select! {
-                Some(client) = client_input_rx.recv() => (client.0, Either::A(client.1), client.2),
-                Some(server) = server_input_rx.recv() => (server.0, Either::B(server.1), server.2),
+                Some(client) = client_send_rx.recv() => (client.0, Either::A(client.1), client.2),
+                Some(server) = server_send_rx.recv() => (server.0, Either::B(server.1), server.2),
             };
 
             let worker = match input {
@@ -85,16 +86,16 @@ where F:AsyncConnectionService + 'static + Send
                     let (tx,rx) = tokio::sync::mpsc::channel::<(EngineInput2,AsyncInputSender)>(32);
                     workers.insert(sid, tx.clone());
                     // Channel for END_CLIENT to recv events 
-                    let (server_output_tx, mut server_output_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+                    let (server_recv_tx, mut server_recv_rx) = tokio::sync::mpsc::channel::<Payload>(10);
                     client.new_connection(
-                        create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(server_output_rx)),
-                        AsyncSession::new(sid.clone(), AsyncIOHandle { input_tx: server_input_tx.clone() } )
+                        create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(server_recv_rx)),
+                        AsyncSession::new(sid.clone(), AsyncIOHandle { input_tx: server_send_tx.clone() } )
                     );
 
                     tokio::spawn(async move {
                         let engine = crate::client::EngineIOServer::new(sid);
-                        let mut send_buffer = VecDeque::new();
-                        let mut server_send_tx = None; 
+                        let mut send_buffer = vec![];
+                        let mut send_tx = None;
                         let mut next_tick = Instant::now() + Duration::from_secs(10);
                         loop {
                             let now = Instant::now();
@@ -103,40 +104,35 @@ where F:AsyncConnectionService + 'static + Send
                                 time  = tokio::time::sleep_until(next_tick.into()) => None
                             };
 
-                            let res = input.map(|(input,res_tx)| {
-                                match input {
+                            input.map(|(input,res_tx)| {
+                                let r = match input {
                                     Either::A(client) => engine.input_recv(client, now),
                                     Either::B(server) => engine.input_send(server, now),
-                                }.map_err(|e| (res_tx,e))
+                                };
+                                match r {
+                                    Ok(Some(IO::Open)) => {
+                                        let (tx,rx) = tokio::sync::mpsc::channel(32);
+                                        send_tx = Some(tx);
+                                        res_tx.send(Ok(Some(rx)));
+                                    },
+                                    Ok(Some(IO::Close)) => {send_tx = None;},
+                                    Ok(None) => {res_tx.send(Ok(None));},
+                                    Err(e) => { res_tx.send(Err(e));}
+                                }
                             });
-
-                            if let Some(Err((tx,e))) = res {
-                                tx.send(Err(e));
-                                continue;
-                            }
-
-                            let mut res_stream = None;
+                            
                             loop {
                                 match engine.poll_output(now) {
-                                    Either::A(io) => {
-                                        match io {
-                                            IO::Open => {
-                                                let (tx,rx) = tokio::sync::mpsc::channel(10);
-                                                res_stream = rx.into();
-                                                server_send_tx = tx.into();
-                                            },
-                                            IO::Close => { server_send_tx = None; },
-                                            IO::Send(p) => { send_buffer.push_back(p);},
-                                            IO::Recv(p) => { server_output_tx.send(p);},
-                                            IO::Flush => {}
+                                    Some(output) => {
+                                        match output {
+                                            EngineDataOutput::Recv(m) => { server_recv_tx.send(m);},
+                                            EngineDataOutput::Send(p) => { },
+                                            EngineDataOutput::Pending(d) => { next_tick = now + d; }
                                         }
-                                        send_buffer.push_back(io)
                                     },
-                                    Either::B(pending) => { next_tick =  now + pending.0; break } 
+                                    None => break
                                 }
                             };
-
-                            if let Some((_, res_tx)) = input { res_tx.send( res_stream)};
                         }
                     });
             
