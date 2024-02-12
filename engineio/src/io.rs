@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 use std::collections::HashMap;
@@ -8,18 +7,13 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::Receiver;
 use crate::EngineError;
 use crate::EngineCloseReason;
-use crate::EngineInput;
-use crate::EngineOutput;
 use crate::MessageData;
-use crate::client::EngineIOClientCtrls;
-use crate::client::EngineIOServerCtrls;
-use crate::client::EngineDataOutput;
-use crate::client::IO;
-use crate::engine::{Sid, Payload, Engine, Participant} ;
+use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, IO, EngineDataOutput} ;
+use crate::server::EngineIOServer;
 use crate::handler::ConnectionMessage;
 
 pub trait AsyncConnectionService { 
-    fn new_connection<S:Stream<Item=ConnectionMessage> + 'static + Send>(&self, connection:S, session:AsyncSession);
+    fn new_connection<S:Stream<Item=ConnectionMessage> + 'static + Send>(&self, connection:S, session:AsyncSessionServerHandle);
 }
 
 fn create_connection_stream(s:impl Stream<Item=Payload>) -> impl Stream<Item=Result<MessageData,EngineCloseReason>> {
@@ -32,25 +26,44 @@ fn create_connection_stream(s:impl Stream<Item=Payload>) -> impl Stream<Item=Res
 
 // =============================================
 
-pub struct AsyncSession {
+pub struct AsyncSessionServerHandle {
     sid:Sid,
-    handle: AsyncIOHandle
+    input_tx: Sender<(Sid, EngineInput<EngineIOServerCtrls>, AsyncInputSender)>,
 }
 
-impl AsyncSession {
-    pub fn new(sid:Sid, handle:AsyncIOHandle) -> Self {
-        Self {
-            sid, handle
-        }
+impl AsyncSessionServerHandle {
+   pub async fn send(&self, data:MessageData) -> Result<(),EngineError> {
+        let (tx,rx) = tokio::sync::oneshot::channel::<AsyncInputResult>();
+        let _ = self.input_tx.send(
+            (self.sid, EngineInput::Data(Ok(Payload::Message(data))), tx)
+        ).await;
+        rx.await.unwrap_or(Err(EngineError::AlreadyClosed))?;
+        Ok(())
+   }
+}
+
+// =============================================
+
+#[derive(Debug, Clone)]
+pub struct AsyncSessionClientHandle {
+    input_tx: Sender<(Sid, EngineInput<EngineIOClientCtrls>, AsyncInputSender)>,
+}
+
+impl AsyncSessionClientHandle {
+    pub async fn input(&self, id:Sid, input:EngineInput<EngineIOClientCtrls>) -> Result<Option<impl Stream<Item =Payload>>,EngineError> {
+        let (tx,rx) = tokio::sync::oneshot::channel::<AsyncInputResult>();
+        let _ = self.input_tx.send((id,input, tx)).await;
+        let res = rx.await.unwrap_or(Err(EngineError::AlreadyClosed))?;
+        Ok(res.map(|r| tokio_stream::wrappers::ReceiverStream::new(r)))
     }
 
-   pub async fn send(&self, data:MessageData) {
-       // TODO: Listen for SEND errors ?
-       self.handle.input(
-           self.sid, 
-           EngineInput::Data(Participant::Server, Ok(Payload::Message(data))),
-        ).await;
-   }
+    pub async fn input_with_response_stream(&self, id:Sid, input:EngineInput<EngineIOClientCtrls>) -> Result<impl Stream<Item=Payload>,EngineError> {
+        match self.input(id, input).await {
+            Err(e) => Err(e),
+            Ok(Some(s)) => Ok(s),
+            Ok(None) => Err(EngineError::Generic)
+        }
+    }
 }
 
 // =============================================
@@ -63,14 +76,14 @@ pub enum Either<A,B> {
     B(B)
 }
 
-type EngineInput2 = Either<crate::client::EngineInput<EngineIOClientCtrls>, crate::client::EngineInput<EngineIOServerCtrls>>;
+type EngineInput2 = Either<EngineInput<EngineIOClientCtrls>, EngineInput<EngineIOServerCtrls>>;
 
-pub fn create_async_io2<F>(client:F) -> AsyncIOHandle 
+pub fn create_async_io2<F>(client:F) -> AsyncSessionClientHandle 
 where F:AsyncConnectionService + 'static + Send
 {
 
-    let (client_send_tx, mut client_send_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOClientCtrls>, AsyncInputSender)>(1024);
-    let (server_send_tx, mut server_send_rx) = tokio::sync::mpsc::channel::<(Sid, crate::client::EngineInput<EngineIOServerCtrls>, AsyncInputSender)>(1024);
+    let (client_send_tx, mut client_send_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, AsyncInputSender)>(1024);
+    let (server_send_tx, mut server_send_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput<EngineIOServerCtrls>, AsyncInputSender)>(1024);
     let mut workers: HashMap<Sid,Sender<(EngineInput2, AsyncInputSender)>> = HashMap::new();
     
     tokio::spawn( async move {
@@ -81,62 +94,19 @@ where F:AsyncConnectionService + 'static + Send
             };
 
             let worker = match input {
-                Either::A(crate::client::EngineInput::Control(EngineIOClientCtrls::New(..))) => {
+                Either::A(EngineInput::Control(EngineIOClientCtrls::New(..))) => {
                     // Channel for IO_DISPATCHER to talk to worker
-                    let (tx,rx) = tokio::sync::mpsc::channel::<(EngineInput2,AsyncInputSender)>(32);
-                    workers.insert(sid, tx.clone());
+                    let (worker_recv_tx, worker_recv_rx) = tokio::sync::mpsc::channel::<(EngineInput2,AsyncInputSender)>(32);
+                    workers.insert(sid, worker_recv_tx.clone());
                     // Channel for END_CLIENT to recv events 
                     let (server_recv_tx, mut server_recv_rx) = tokio::sync::mpsc::channel::<Payload>(10);
                     client.new_connection(
                         create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(server_recv_rx)),
-                        AsyncSession::new(sid.clone(), AsyncIOHandle { input_tx: server_send_tx.clone() } )
+                        AsyncSessionServerHandle{ sid:sid.clone(), input_tx:server_send_tx.clone()  }
                     );
 
-                    tokio::spawn(async move {
-                        let engine = crate::client::EngineIOServer::new(sid);
-                        let mut send_buffer = vec![];
-                        let mut send_tx = None;
-                        let mut next_tick = Instant::now() + Duration::from_secs(10);
-                        loop {
-                            let now = Instant::now();
-                            let input = tokio::select! {
-                                input = rx.recv() => if let Some(i) = input { input } else { break },
-                                time  = tokio::time::sleep_until(next_tick.into()) => None
-                            };
-
-                            input.map(|(input,res_tx)| {
-                                let r = match input {
-                                    Either::A(client) => engine.input_recv(client, now),
-                                    Either::B(server) => engine.input_send(server, now),
-                                };
-                                match r {
-                                    Ok(Some(IO::Open)) => {
-                                        let (tx,rx) = tokio::sync::mpsc::channel(32);
-                                        send_tx = Some(tx);
-                                        res_tx.send(Ok(Some(rx)));
-                                    },
-                                    Ok(Some(IO::Close)) => {send_tx = None;},
-                                    Ok(None) => {res_tx.send(Ok(None));},
-                                    Err(e) => { res_tx.send(Err(e));}
-                                }
-                            });
-                            
-                            loop {
-                                match engine.poll_output(now) {
-                                    Some(output) => {
-                                        match output {
-                                            EngineDataOutput::Recv(m) => { server_recv_tx.send(m);},
-                                            EngineDataOutput::Send(p) => { },
-                                            EngineDataOutput::Pending(d) => { next_tick = now + d; }
-                                        }
-                                    },
-                                    None => break
-                                }
-                            };
-                        }
-                    });
-            
-                    Some(tx)
+                    tokio::spawn(create_worker(sid, worker_recv_rx, server_recv_tx.clone()));
+                    Some(worker_recv_tx)
                 },
                 _ => {
                     workers.get(&sid).map(|t| t.to_owned())
@@ -153,116 +123,68 @@ where F:AsyncConnectionService + 'static + Send
             }
         }
     });
+
+    return AsyncSessionClientHandle { 
+        input_tx: client_send_tx
+    }
 }
 
-pub fn create_async_io<F>(client:F) -> AsyncIOHandle 
-where F:AsyncConnectionService + 'static + Send
-{
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
-    let (time_tx, mut time_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput, Option<AsyncInputSender>)>(1024);
+async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,AsyncInputSender)>, tx: tokio::sync::mpsc::Sender<Payload>) {
+    let mut engine = EngineIOServer::new(id);
+    let mut send_buffer = vec![];
+    let mut send_tx = None;
+    let mut next_tick = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = Instant::now();
+        let inputs = tokio::select! {
+            input = rx.recv() => if let Some(i) = input { Some(i) } else { break },
+            _  = tokio::time::sleep_until(next_tick.into()) => None
+        };
 
-    let mut engines: HashMap<Sid,Engine> = HashMap::new();
-    let mut server_recv: HashMap<Sid, Sender<Payload>> = HashMap::new();
-    let mut client_recv: HashMap<Sid, Sender<Payload>> = HashMap::new();
-
-    let input_tx_server = input_tx.clone();
-    tokio::spawn( async move {
-        loop {
-            let (sid, input, tx)  = tokio::select! {
-                Some(v1) = input_rx.recv() => v1,
-                Some(v3) = time_rx.recv() => v3
+        inputs.map(|(input,res_tx)| {
+            let r = match input {
+                Either::A(client) => engine.input_recv(client, now),
+                Either::B(server) => engine.input_send(server, now),
             };
-
-            let engine = match &input  {
-                EngineInput::New(..) => { 
-                    let (tx,rx) = tokio::sync::mpsc::channel::<Payload>(10);
-                    server_recv.insert(sid.clone(), tx);
-                    client.new_connection(
-                        create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
-                        AsyncSession::new(sid.clone(), AsyncIOHandle { input_tx: input_tx_server.clone() } )
-                    );
-                    Some(engines.entry(sid).or_insert(Engine::new(sid)))
+            match r {
+                Ok(Some(IO::Open)) => {
+                    let (tx,res_rx) = tokio::sync::mpsc::channel(32);
+                    send_tx = Some(tx);
+                    res_tx.send(Ok(Some(res_rx)));
                 },
-                _ => engines.get_mut(&sid)
-            };
-
-            let output = engine.ok_or(EngineError::OpenFailed)
-                .and_then(|e| e.consume(input, Instant::now()).and(Ok(e)))
-                .and_then(|e| { let mut b = vec![]; while let Some(p) = e.poll_output() { b.push(p); }; Ok(b) });
-
-            let response = match output {
-                Err(e) => {
-                    Err(e)
-                },
-                Ok(output) => {
-                    let mut res = None;
-                    for o in output {
-                        match o {
-                            EngineOutput::Data(participant, data) => {
-                                let map = if let Participant::Client = participant { &mut server_recv } else { &mut client_recv };
-                                let sender = map.get(&sid);
-                                dbg!(sender.is_some());
-                                if let Some(sender) = sender {
-                                    dbg!(sender.send(data).await);
-                                };
-                            },
-                            EngineOutput::SetIO(participant, true ) => {
-                                let map = if let Participant::Server = participant { &mut server_recv } else { &mut client_recv };
-                                let (tx,rx) = tokio::sync::mpsc::channel::<Payload>(10);
-                                map.insert(sid, tx);
-                                res = Some(rx);
-                            },
-                            EngineOutput::SetIO(participant, false) => {
-                                let map = if let Participant::Server = participant { &mut server_recv } else { &mut client_recv };
-                                map.remove(&sid);
-                            },
-                            EngineOutput::Tick { length } => {
-                                let tx = time_tx.clone();
-                                tokio::spawn(async move { 
-                                    tokio::time::sleep(length).await; 
-                                    tx.send((sid, EngineInput::Tock, None)).await
-                                });
-                            }
-                        }
-                    }
-                    Ok(res)
-                }
-            };
-
-            if let Some(tx) = tx { 
-                dbg!(&response);
-                tx.send(response);
+                Ok(Some(IO::Close)) => {send_tx = None;},
+                Ok(None) => {res_tx.send(Ok(None));},
+                Err(e) => { res_tx.send(Err(e));}
             }
+        });
+        
+        let next_deadline = loop {
+            match engine.poll_output(now) {
+                Some(output) => {
+                    match output {
+                        EngineDataOutput::Recv(m) => { tx.send(m);},
+                        EngineDataOutput::Send(p) => { 
+                            if let Some(sender) = &send_tx {
+                                sender.send(p).await;
+                            }
+                            else {
+                                send_buffer.push(p);
+                            }   
+                        },
+                        EngineDataOutput::Pending(d) => { break Some(now + d) }
+                    }
+                },
+                None => break None// finished! 
+            }
+        };
 
+        if let Some(nd) = next_deadline  {
+            next_tick = nd;
         }
-    });
-
-    return AsyncIOHandle {
-        input_tx,
+        else { break } // finished
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct AsyncIOHandle {
-    input_tx: Sender<(Sid, EngineInput, Option<AsyncInputSender>)>,
-}
-
-impl AsyncIOHandle {
-    pub async fn input(&self, id:Sid, input:EngineInput) -> Result<Option<impl Stream<Item =Payload>>,EngineError> {
-        let (tx,rx) = tokio::sync::oneshot::channel::<AsyncInputResult>();
-        let _ = self.input_tx.send((id,input, Some(tx))).await;
-        let res = rx.await.unwrap_or(Err(EngineError::AlreadyClosed))?;
-        Ok(res.map(|r| tokio_stream::wrappers::ReceiverStream::new(r)))
-    }
-
-    pub async fn input_with_response_stream(&self, id:Sid, input:EngineInput) -> Result<impl Stream<Item=Payload>,EngineError> {
-        match self.input(id, input).await {
-            Err(e) => Err(e),
-            Ok(Some(s)) => Ok(s),
-            Ok(None) => Err(EngineError::Generic)
-        }
-    }
-}
 
 
 

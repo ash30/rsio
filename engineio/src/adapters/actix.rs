@@ -1,9 +1,10 @@
 use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource};
-use crate::{create_async_io, EngineInput, PayloadDecodeError, MessageData, EngineKind };
-use crate::engine::{Sid, TransportConfig, Payload, Participant, EngineError };
+use crate::{create_async_io2, PayloadDecodeError, MessageData, EngineKind };
+use crate::proto::Payload;
+use crate::engine::{Sid, TransportConfig, EngineError, EngineIOClientCtrls, EngineInput };
 pub use crate::AsyncConnectionService as ConnectionService;
-pub use crate::AsyncSession as Session;
+pub use crate::AsyncSessionServerHandle as Session;
 
 #[derive(serde::Deserialize)]
 struct SessionInfo {
@@ -47,7 +48,7 @@ impl actix_web::ResponseError for EngineError {
 pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: F) -> Resource
 where F: ConnectionService + 'static + Send + Sync 
 {
-    let io = create_async_io(callback);
+    let io = create_async_io2(callback);
     
     // WS 
     let path = {
@@ -64,12 +65,13 @@ where F: ConnectionService + 'static + Send + Sync
                 async move {
                     let sid = uuid::Uuid::new_v4();
                     let mut client_stream = io.input_with_response_stream(
-                        sid, EngineInput::New(Some(config), crate::EngineKind::Continuous)
+                        sid,
+                        EngineInput::Control(EngineIOClientCtrls::New(Some(config), EngineKind::Continuous))
                     ).await?;
 
                     actix_rt::spawn(async move {
                         while let Some(Ok(m)) = msg_stream.next().await {
-                            let _ = io.input(sid, EngineInput::Data(Participant::Client, m.try_into())).await;
+                            let _ = io.input(sid, EngineInput::Data(m.try_into())).await;
                         }
                     });
                     actix_rt::spawn(async move {
@@ -101,7 +103,7 @@ where F: ConnectionService + 'static + Send + Sync
                 let io = io.clone();
                 async move {
                     let sid = session.sid.ok_or(EngineError::MissingSession)?;
-                    let s = io.input_with_response_stream(sid, EngineInput::Poll).await?;
+                    let s = io.input_with_response_stream(sid, EngineInput::Control(EngineIOClientCtrls::Poll)).await?;
                     let all = s.collect::<Vec<Payload>>().await;
                     Ok::<HttpResponse,EngineError>(HttpResponse::Ok().body(Payload::encode_combined(&all, EngineKind::Poll)))
                 }
@@ -121,7 +123,7 @@ where F: ConnectionService + 'static + Send + Sync
                 let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let s = io.input_with_response_stream(sid, EngineInput::New(Some(config), crate::EngineKind::Poll)).await?;
+                    let s = io.input_with_response_stream(sid, EngineInput::Control(EngineIOClientCtrls::New(Some(config), crate::EngineKind::Poll))).await?;
                     let all = s.take(1).collect::<Vec<Payload>>().await;
                     let combined = Payload::encode_combined(&all, EngineKind::Poll);
                     Ok::<HttpResponse,EngineError>(HttpResponse::Ok().body(combined))
@@ -142,7 +144,7 @@ where F: ConnectionService + 'static + Send + Sync
                 async move { 
                     let sid = session.sid.ok_or(EngineError::MissingSession)?;
                     for p in Payload::decode_combined(body.as_ref(), EngineKind::Poll) {
-                        if let Err(e) = io.input(sid, EngineInput::Data(Participant::Client, p)).await {
+                        if let Err(e) = io.input(sid, EngineInput::Data(p)).await {
                             return Err(e);
                         }
                     }
