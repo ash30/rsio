@@ -8,7 +8,7 @@ use tokio::sync::mpsc::Receiver;
 use crate::EngineError;
 use crate::EngineCloseReason;
 use crate::MessageData;
-use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, IO, EngineDataOutput} ;
+use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, EngineOutput} ;
 use crate::server::EngineIOServer;
 use crate::handler::ConnectionMessage;
 
@@ -137,35 +137,31 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
     let mut next_tick = Instant::now() + Duration::from_secs(10);
     loop {
         let now = Instant::now();
-        let inputs = tokio::select! {
+        let (input,res_tx) = tokio::select! {
             input = rx.recv() => if let Some(i) = input { Some(i) } else { break },
             _  = tokio::time::sleep_until(next_tick.into()) => None
-        };
+        }.unzip();
 
-        let mut should_close = false;
-        inputs.map(|(input,res_tx)| {
-            let r = match input {
+        let err = input.and_then(|input| {
+            match input {
                 Either::A(client) => engine.input_recv(client, now),
                 Either::B(server) => engine.input_send(server, now),
-            };
-            match r {
-                Ok(Some(IO::Open)) => {
-                    let (tx,res_rx) = tokio::sync::mpsc::channel(32);
-                    send_tx = Some(tx);
-                    res_tx.send(Ok(Some(res_rx)));
-                },
-                Ok(Some(IO::Close)) => { should_close = true;},
-                Ok(None) => {res_tx.send(Ok(None));},
-                Err(e) => { res_tx.send(Err(e));}
-            }
+            }.err()
         });
         
+        let mut new_stream = None;
         let next_deadline = loop {
             match engine.poll_output(now) {
                 Some(output) => {
                     match output {
-                        EngineDataOutput::Recv(m) => { tx.send(m);},
-                        EngineDataOutput::Send(p) => { 
+                        EngineOutput::Stream(true) => { 
+                            let (tx,rx) = tokio::sync::mpsc::channel(32);
+                            send_tx = Some(tx);
+                            new_stream = Some(rx);
+                        },
+                        EngineOutput::Stream(false) => {send_tx = None;},
+                        EngineOutput::Recv(m) => { tx.send(m).await;},
+                        EngineOutput::Send(p) => { 
                             if let Some(sender) = &send_tx {
                                 sender.send(p).await;
                             }
@@ -173,13 +169,23 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
                                 send_buffer.push(p);
                             }   
                         },
-                        EngineDataOutput::Pending(d) => { break Some(now + d) }
+                        EngineOutput::Pending(d) => { break Some(now + d) }
                     }
                 },
                 None => break None// finished! 
             }
         };
-        if should_close { send_tx = None };
+        // Send result back to input provider
+        if let Some(t) = res_tx { 
+            let res = match (err, new_stream) {
+                (Some(e), _ ) => Err(e),
+                (None, Some(rx)) => Ok(Some(rx)),
+                (None, None) => Ok(None)
+            };
+            dbg!(&res);
+            t.send(res);
+        };
+
         if let Some(nd) = next_deadline  { next_tick = nd; }
         else { break } // finished
     }

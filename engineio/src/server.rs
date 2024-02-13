@@ -4,8 +4,7 @@ use crate::engine::{
     Transport,
     EngineIOClientCtrls,
     EngineIOServerCtrls,
-    EngineDataOutput,
-    IO,
+    EngineOutput,
     EngineInput,
     EngineKind,
     EngineCloseReason,
@@ -65,7 +64,7 @@ impl ConnectedState {
 #[derive(Debug)]
 pub(crate) struct EngineIOServer {
     pub session: Sid,
-    output: VecDeque<EngineDataOutput>,
+    output: VecDeque<EngineOutput>,
     state: EngineState,
 }
 
@@ -79,7 +78,7 @@ impl EngineIOServer {
         }
     }
 
-    pub fn input_send(&mut self, input:EngineInput<EngineIOServerCtrls>, now:Instant) -> Result<Option<IO>,EngineError> {
+    pub fn input_send(&mut self, input:EngineInput<EngineIOServerCtrls>, now:Instant) -> Result<(),EngineError> {
         // For server send data, if invalid input, we return early because no 
         // additional state transition can happen 
         let next_state = match &input {
@@ -100,14 +99,14 @@ impl EngineIOServer {
         }?;
 
         if let EngineInput::Data(Ok(p)) = input {
-            self.output.push_back(EngineDataOutput::Send(p));
+            self.output.push_back(EngineOutput::Send(p));
         }
         // We want to send data depending on state changes
         if let Some(s) = next_state { self.update_state(s) }
-        Ok(None)
+        Ok(())
     }
 
-    pub fn input_recv(&mut self, input:EngineInput<EngineIOClientCtrls>, now:Instant) -> Result<Option<IO>,EngineError> {
+    pub fn input_recv(&mut self, input:EngineInput<EngineIOClientCtrls>, now:Instant) -> Result<(),EngineError> {
         // Invalid Input data from client CAN transition state to closed 
         // so we must compute outputs before returning result 
         let next = match &input {
@@ -161,7 +160,7 @@ impl EngineIOServer {
         }?;
 
         if let EngineInput::Data(Ok(Payload::Message(msg))) = input {
-            self.output.push_back(EngineDataOutput::Recv(Payload::Message(msg)))
+            self.output.push_back(EngineOutput::Recv(Payload::Message(msg)))
         };
         
         self.update_state(next);
@@ -169,11 +168,11 @@ impl EngineIOServer {
             Err(e.clone())
         }
         else {
-            Ok(None)
+            Ok(())
         }
     }
 
-    pub fn poll_output(&mut self, now:Instant) -> Option<EngineDataOutput> {
+    pub fn poll_output(&mut self, now:Instant) -> Option<EngineOutput> {
         // We have to push forward the 'time' element of state so we can trigger timeouts
         let next = match &self.state {
             EngineState::Connected(ConnectedState(t,h,c)) => {
@@ -203,31 +202,33 @@ impl EngineIOServer {
         };
 
         if let Some(new_state) = next { self.update_state(new_state) } 
+        self.output.pop_front().or_else(||{
+            match &self.state {
+                EngineState::New { start_time } => Some(EngineOutput::Pending(now - *start_time + Duration::from_secs(5))),
+                EngineState::Connected(ConnectedState(t,h,c)) => {
+                    let next_poll_deadline = if let Transport::Polling { active:Some((start,length)) } = t { Some(*start + *length) } else { None };
+                    let next_heartbeat_deadline = if let Some(s) = h.last_ping { s + Duration::from_millis(c.ping_timeout) } else { h.last_seen + Duration::from_millis(c.ping_interval) };
 
-        // Return Next Pending Deadline OR NONE if engine is closed 
-        match &self.state {
-            EngineState::New { start_time } => Some(EngineDataOutput::Pending(now - *start_time + Duration::from_secs(5))),
-            EngineState::Connected(ConnectedState(t,h,c)) => {
-                let next_poll_deadline = if let Transport::Polling { active:Some((start,length)) } = t { Some(*start + *length) } else { None };
-                let next_heartbeat_deadline = if let Some(s) = h.last_ping { s + Duration::from_millis(c.ping_timeout) } else { h.last_seen + Duration::from_millis(c.ping_interval) };
+                    let deadline = [ 
+                        next_poll_deadline.map(|d| d - now ),
+                        Some(next_heartbeat_deadline - now)
+                    ]
+                    .into_iter()
+                    .filter_map(|a| a)
+                    .min().unwrap();
 
-                let deadline = [ 
-                    next_poll_deadline.map(|d| d - now ),
-                    Some(next_heartbeat_deadline - now)
-                ]
-                .into_iter()
-                .filter_map(|a| a)
-                .min().unwrap();
-
-                Some(EngineDataOutput::Pending(deadline))
+                    Some(EngineOutput::Pending(deadline))
+                }
+                EngineState::Closed(..) => None
             }
-            EngineState::Closed(..) => None
-        }
+        })
+        // Return Next Pending Deadline OR NONE if engine is closed 
     }
 
     fn update_state(&mut self, next_state:EngineState) {
+        dbg!((&self.state,&next_state));
         // We update state and push any additional output due to state transition 
-        match (&self.state, &next_state) {
+        let io = match (&self.state, &next_state) {
             (EngineState::New {..} , EngineState::Connected(ConnectedState(t,_,config))) => {
                 let upgrades = if let Transport::Polling { .. } = t { vec!["websocket"] } else { vec![] };
                 let data = serde_json::json!({
@@ -237,33 +238,38 @@ impl EngineIOServer {
                     "pingTimeout": config.ping_timeout,
                     "sid":  self.session
                 });
-                self.output.push_back(EngineDataOutput::Send(Payload::Open(serde_json::to_vec(&data).unwrap())));
+                self.output.push_back(EngineOutput::Stream(true));
+                self.output.push_back(EngineOutput::Send(Payload::Open(serde_json::to_vec(&data).unwrap())));
                 if let Transport::Polling { .. } = t { 
-                    //self.output.push_back(EngineDataOutput::Close)
-                }
+                    self.output.push_back(EngineOutput::Stream(false));
+                };
             },
 
             // Polling Start 
             (EngineState::Connected(ConnectedState(Transport::Polling { active:None }, _,_ )),
              EngineState::Connected(ConnectedState(Transport::Polling { active: Some(..) },_,_))) => { 
-                //buffer.push_back(EngineDataOutput::Open);
+                self.output.push_back(EngineOutput::Stream(true));
             }
             
             // Polling End
             (EngineState::Connected(ConnectedState(Transport::Polling { active:Some(..)}, _,_ )),
              EngineState::Connected(ConnectedState(Transport::Polling { active: None },_,_))) => {
-                //buffer.push_back(EngineDataOutput::Close);
+                self.output.push_back(EngineOutput::Stream(false));
             },
 
             // Close
-            (_, EngineState::Closed(EngineCloseReason::ClientClose)) => {},
+            (_, EngineState::Closed(EngineCloseReason::ClientClose)) => {
+                self.output.push_back(EngineOutput::Stream(false));
+            },
             (_, EngineState::Closed(reason)) => {
-                self.output.push_back(EngineDataOutput::Send(Payload::Close(reason.clone())));
+                self.output.push_back(EngineOutput::Send(Payload::Close(reason.clone())));
+                self.output.push_back(EngineOutput::Stream(false));
             },
             _ => {}
-        }
+        };
 
         self.state = next_state;
+        return io
 
     }
 }
@@ -285,7 +291,7 @@ mod tests {
         e.input_recv(EngineInput::Control(EngineIOClientCtrls::New(None, EngineKind::Poll)), time);
 
         let out = e.poll_output(time_next);
-        let res = if let Some(EngineDataOutput::Send(Payload::Open(..))) = out { true } else { false };
+        let res = if let Some(EngineOutput::Send(Payload::Open(..))) = out { true } else { false };
         assert!(res);
     }
 
@@ -297,7 +303,7 @@ mod tests {
         let _ = e.input_recv(EngineInput::Control(EngineIOClientCtrls::New(None, EngineKind::Continuous)), time);
 
         let out = e.poll_output(time_next);
-        let res = if let Some(EngineDataOutput::Send(Payload::Open(..))) = out { true } else { false };
+        let res = if let Some(EngineOutput::Send(Payload::Open(..))) = out { true } else { false };
         assert!(res);
 
         let out = e.poll_output(time_next);

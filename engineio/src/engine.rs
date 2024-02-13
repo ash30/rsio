@@ -28,13 +28,9 @@ pub enum EngineIOClientCtrls {
     Close
 }
 
-pub(crate) enum IO {
-    Open,
-    Close
-}
-
 #[derive(Debug, Clone)]
-pub(crate) enum EngineDataOutput {
+pub(crate) enum EngineOutput {
+    Stream(bool),
     Recv(Payload),
     Send(Payload),
     Pending(Duration)
