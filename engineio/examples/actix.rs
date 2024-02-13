@@ -15,7 +15,7 @@ impl ConnectionService for NewConnectionManager {
                 match stream.next().await {
                     None => break,
                     Some(Ok(data)) => { 
-                        emit.send(data).await
+                        emit.send(data).await;
                     },
                     _ => {}
                 }

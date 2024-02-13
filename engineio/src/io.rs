@@ -99,7 +99,7 @@ where F:AsyncConnectionService + 'static + Send
                     let (worker_recv_tx, worker_recv_rx) = tokio::sync::mpsc::channel::<(EngineInput2,AsyncInputSender)>(32);
                     workers.insert(sid, worker_recv_tx.clone());
                     // Channel for END_CLIENT to recv events 
-                    let (server_recv_tx, mut server_recv_rx) = tokio::sync::mpsc::channel::<Payload>(10);
+                    let (server_recv_tx, server_recv_rx) = tokio::sync::mpsc::channel::<Payload>(10);
                     client.new_connection(
                         create_connection_stream(tokio_stream::wrappers::ReceiverStream::new(server_recv_rx)),
                         AsyncSessionServerHandle{ sid:sid.clone(), input_tx:server_send_tx.clone()  }
@@ -115,7 +115,8 @@ where F:AsyncConnectionService + 'static + Send
 
             if let Some(w) = worker {
                if let Err(e) = w.send_timeout((input,res_tx), Duration::from_secs(1)).await {
-                    res_tx.send(Result::Err(EngineError::Generic));
+                   //TODO: HOW do we time this out?
+                    //res_tx.send(Result::Err(EngineError::Generic));
                }
             }
             else {
@@ -130,7 +131,7 @@ where F:AsyncConnectionService + 'static + Send
 }
 
 async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,AsyncInputSender)>, tx: tokio::sync::mpsc::Sender<Payload>) {
-    let mut engine = EngineIOServer::new(id);
+    let mut engine = EngineIOServer::new(id, Instant::now());
     let mut send_buffer = vec![];
     let mut send_tx = None;
     let mut next_tick = Instant::now() + Duration::from_secs(10);
@@ -141,6 +142,7 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
             _  = tokio::time::sleep_until(next_tick.into()) => None
         };
 
+        let mut should_close = false;
         inputs.map(|(input,res_tx)| {
             let r = match input {
                 Either::A(client) => engine.input_recv(client, now),
@@ -152,7 +154,7 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
                     send_tx = Some(tx);
                     res_tx.send(Ok(Some(res_rx)));
                 },
-                Ok(Some(IO::Close)) => {send_tx = None;},
+                Ok(Some(IO::Close)) => { should_close = true;},
                 Ok(None) => {res_tx.send(Ok(None));},
                 Err(e) => { res_tx.send(Err(e));}
             }
@@ -177,10 +179,8 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
                 None => break None// finished! 
             }
         };
-
-        if let Some(nd) = next_deadline  {
-            next_tick = nd;
-        }
+        if should_close { send_tx = None };
+        if let Some(nd) = next_deadline  { next_tick = nd; }
         else { break } // finished
     }
 }
