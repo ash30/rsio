@@ -156,8 +156,12 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
                     match output {
                         EngineOutput::Stream(true) => { 
                             let (tx,rx) = tokio::sync::mpsc::channel(32);
+                            for p in send_buffer.drain(0..){
+                                tx.send(p).await;
+                            }
                             send_tx = Some(tx);
                             new_stream = Some(rx);
+
                         },
                         EngineOutput::Stream(false) => {send_tx = None;},
                         EngineOutput::Recv(m) => { tx.send(m).await;},
