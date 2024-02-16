@@ -106,6 +106,45 @@ impl Heartbeat {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum EngineState {
+    New { start_time:Instant } , 
+    Connected(ConnectedState),
+    Closed(EngineCloseReason),
+}
+
+impl EngineState {
+    pub fn has_error(&self) -> Option<&EngineError> {
+        match self {
+            EngineState::Closed(EngineCloseReason::Error(e)) => Some(e),
+            _ => None
+        }
+    }
+}
+
+// =====================
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectedState(pub Transport, pub Heartbeat, pub TransportConfig);
+
+impl ConnectedState {
+        pub fn new(t:Transport, config:Option<TransportConfig>, now:Instant) -> Self {
+            return Self (t, Heartbeat { last_seen: now, last_ping: None }, config.unwrap_or(TransportConfig::default()))
+        }
+
+        pub fn update(mut self, f:impl Fn(&mut Transport, &mut Heartbeat) -> ()) -> Self {
+            f(&mut self.0, &mut self.1);
+            self
+        }
+
+        fn set_config(mut self, config:TransportConfig) -> Self {
+            self.2 = config;
+            return self
+        }   
+}
+
+// =====================
+
 #[derive(Debug, Clone)]
 pub enum EngineCloseReason {
     Error(EngineError),

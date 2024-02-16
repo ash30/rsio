@@ -8,55 +8,12 @@ use crate::{engine::{
     EngineInput,
     EngineKind,
     EngineCloseReason,
-    EngineError
+    EngineError,
+    EngineState,
+    ConnectedState
+
 }, PollingState};
 use crate::proto::{Payload, TransportConfig, Sid};
-
-#[derive(Debug)]
-enum EngineState {
-    New { start_time:Instant } , 
-    Connected(ConnectedState),
-    Closed(EngineCloseReason),
-}
-
-impl EngineState {
-    fn has_error(&self) -> Option<&EngineError> {
-        match self {
-            EngineState::Closed(EngineCloseReason::Error(e)) => Some(e),
-            _ => None
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ConnectedState(Transport, Heartbeat, TransportConfig);
-
-impl ConnectedState {
-        fn new(t:Transport, config:Option<TransportConfig>, now:Instant) -> Self {
-            return Self (t, Heartbeat { last_seen: now, last_ping: None }, config.unwrap_or(TransportConfig::default()))
-        }
-
-        fn update(mut self, f:impl Fn(&mut Transport, &mut Heartbeat) -> ()) -> Self {
-            f(&mut self.0, &mut self.1);
-            self
-        }
-
-        fn replace(mut self, f:impl Fn(Transport,Heartbeat) -> (Transport, Heartbeat)) -> Self {
-            let (t,h) = f(self.0, self.1);
-            return ConnectedState (t,h,self.2)
-        }
-
-        fn set_config(mut self, config:TransportConfig) -> Self {
-            self.2 = config;
-            return self
-        }   
-}
-
-impl Default for ConnectedState {
-    fn default() -> Self {
-        return Self(Transport::Continuous, Heartbeat { last_seen: Instant::now(), last_ping: None }, TransportConfig::default())
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct EngineIOServer {
