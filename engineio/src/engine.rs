@@ -71,9 +71,9 @@ impl Default for PollingState {
 impl PollingState {
     pub fn activate_poll(&mut self, start:Instant, max_length:Duration) {
         // TODO: We need to ensure min length > heartbeat
+        self.count = self.count;
         let length = if self.count > 0 { Duration::from_millis(100) } else { max_length };
         self.active = Some((start,length));
-        self.count = 0;
     }
 
     pub fn update_poll(&mut self, now:Instant) {
@@ -83,10 +83,8 @@ impl PollingState {
     }
 
     pub fn increase_count(&mut self) {
-        if self.count == 0 {
-            if let Some((s,length)) = self.active {
-                self.active = Some((s,Duration::from_millis(500)));
-            }
+        if let Some((s,length)) = self.active {
+            if length > Duration::from_millis(100) { self.active = Some((s,Duration::from_millis(100)));}
         }
         self.count += 1;
     }

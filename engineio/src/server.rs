@@ -252,13 +252,25 @@ impl EngineIOServer {
             }
             
             // Polling End
-            (EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(..), ..}),_,_)),
+            (EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(..), count}),_,_)),
              EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:None, .. }),_,_))) => {
+                if *count == 0 { self.output.push_back(EngineOutput::Send(Payload::Ping));}
                 self.output.push_back(EngineOutput::Stream(false));
             },
 
+            // websocket ping pong
+            (EngineState::Connected(ConnectedState(Transport::Continuous, Heartbeat { last_ping:None, .. }, _ )),
+            EngineState::Connected(ConnectedState(Transport::Continuous, Heartbeat { last_ping:Some(_), .. }, _))) => {
+                self.output.push_back(EngineOutput::Send(Payload::Ping));
+            },
+
             // Close
-            (_, EngineState::Closed(EngineCloseReason::ClientClose)) => {
+            (prev, EngineState::Closed(EngineCloseReason::ClientClose)) => {
+                match prev { 
+                    EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(_), count }),_,_)) if *count == 0 => { self.output.push_back(EngineOutput::Send(Payload::Noop))},
+                    _ => {}
+                }
+
                 self.output.push_back(EngineOutput::Stream(false));
             },
 
