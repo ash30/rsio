@@ -56,14 +56,15 @@ impl Transport {
 #[derive(Debug, Clone)]
 pub(crate) struct PollingState {
     pub active: Option<(Instant,Duration)>,
-    pub count: u64
+    pub count: u64,
 }
 
 impl Default for PollingState {
     fn default() -> Self {
         return Self {
             active:None,
-            count:0
+            count:0,
+            //max_length: Duration::from_millis(TransportConfig::default().ping_interval),
         }
     }
 }
@@ -108,7 +109,8 @@ impl Heartbeat {
 
 #[derive(Debug)]
 pub(crate) enum EngineState {
-    New { start_time:Instant } , 
+    New { start_time:Instant },
+    Connecting { start_time:Instant },
     Connected(ConnectedState),
     Closed(EngineCloseReason),
 }
