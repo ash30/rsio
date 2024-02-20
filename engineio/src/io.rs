@@ -9,6 +9,7 @@ use crate::Engine;
 use crate::EngineError;
 use crate::EngineCloseReason;
 use crate::MessageData;
+use crate::TransportConfig;
 use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, EngineOutput} ;
 use crate::server::EngineIOServer;
 use crate::handler::ConnectionMessage;
@@ -79,7 +80,7 @@ pub enum Either<A,B> {
 
 type EngineServerInput = Either<EngineInput<EngineIOServerCtrls>, EngineInput<EngineIOClientCtrls>>;
 
-pub fn create_async_io2<F>(client:F) -> AsyncSessionClientHandle 
+pub fn create_async_io2<F>(client:F, config:TransportConfig) -> AsyncSessionClientHandle 
 where F:AsyncConnectionService + 'static + Send
 {
 
@@ -88,6 +89,7 @@ where F:AsyncConnectionService + 'static + Send
     let mut workers: HashMap<Sid,Sender<(EngineServerInput, AsyncInputSender)>> = HashMap::new();
     
     tokio::spawn( async move {
+        let config = config;
         loop {
             let (sid,input,res_tx) = tokio::select! {
                 Some(server) = server_send_rx.recv() => (server.0, Either::A(server.1), server.2),
@@ -106,7 +108,7 @@ where F:AsyncConnectionService + 'static + Send
                         AsyncSessionServerHandle{ sid:sid.clone(), input_tx:server_send_tx.clone()  }
                     );
 
-                    tokio::spawn(create_worker(sid, worker_recv_rx, server_recv_tx.clone()));
+                    tokio::spawn(create_worker(sid, worker_recv_rx, server_recv_tx.clone(), config.clone()));
                     Some(worker_recv_tx)
                 },
 
@@ -132,10 +134,9 @@ where F:AsyncConnectionService + 'static + Send
     }
 }
 
-async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerInput,AsyncInputSender)>, tx: tokio::sync::mpsc::Sender<Payload>) {
+async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerInput,AsyncInputSender)>, tx: tokio::sync::mpsc::Sender<Payload>, config:TransportConfig) {
 
     let now = Instant::now();
-    let config = crate::TransportConfig::default();
     let mut engine = Engine::new(EngineIOServer::new(id, now));
     let mut send_buffer = vec![];
     let mut send_tx = None;

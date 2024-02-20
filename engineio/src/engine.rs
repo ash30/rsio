@@ -25,7 +25,7 @@ pub enum EngineIOServerCtrls {
 
 #[derive(Debug, Clone)]
 pub enum EngineIOClientCtrls {
-    New(Option<TransportConfig>, EngineKind),
+    New(EngineKind),
     Poll,
     Close
 }
@@ -111,22 +111,17 @@ impl Heartbeat {
 
 // =====================
 #[derive(Debug, Clone)]
-pub(crate) struct ConnectedState(pub Transport, pub Heartbeat, pub TransportConfig);
+pub(crate) struct ConnectedState(pub Transport, pub Heartbeat);
 
 impl ConnectedState {
-        pub fn new(t:Transport, config:Option<TransportConfig>, now:Instant) -> Self {
-            return Self (t, Heartbeat { last_seen: now, last_ping: None }, config.unwrap_or(TransportConfig::default()))
+        pub fn new(t:Transport, now:Instant) -> Self {
+            return Self (t, Heartbeat { last_seen: now, last_ping: None })
         }
 
         pub fn update(mut self, f:impl Fn(&mut Transport, &mut Heartbeat) -> ()) -> Self {
             f(&mut self.0, &mut self.1);
             self
         }
-
-        fn set_config(mut self, config:TransportConfig) -> Self {
-            self.2 = config;
-            return self
-        }   
 }
 
 
@@ -156,7 +151,7 @@ pub(crate) trait EngineStateEntity {
     fn send(&self, input:&EngineInput<Self::Sender>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
     fn recv(&self, input:&EngineInput<Self::Receiver>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
     fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<EngineOutput>, config:&TransportConfig) -> &EngineState;
-    fn next_deadline(&self) -> Option<Instant>;
+    fn next_deadline(&self, config:&TransportConfig) -> Option<Instant>;
 }
 
 // =====================
@@ -177,7 +172,7 @@ where T:EngineStateEntity {
     }
 
     fn advance_time(&mut self, now:Instant, config:&TransportConfig) {
-        while let Some(d) = self.state.next_deadline() {
+        while let Some(d) = self.state.next_deadline(config) {
             if now < d { break };
             if let Some(s) = self.state.time(now, config) {
                 self.state.update(s, &mut self.output, config);
@@ -217,7 +212,7 @@ where T:EngineStateEntity {
         let next_state = self.state.time(now, config);
         self.output.pop_front().or_else(||{
             self.advance_time(now, config);
-            self.state.next_deadline().map(|d| EngineOutput::Wait(d))
+            self.state.next_deadline(config).map(|d| EngineOutput::Wait(d))
         })
 
     }

@@ -1,7 +1,13 @@
 use std::{collections::VecDeque, time::{Instant, Duration}};
-use crate::{Sid, EngineOutput, EngineState, EngineInput, EngineIOClientCtrls, EngineError, ConnectedState, Transport, PollingState, Heartbeat, TransportConfig, EngineCloseReason, EngineIOServerCtrls, Payload, EngineKind, Either, EngineStateEntity};
+use crate::{Sid, EngineOutput, EngineState, EngineInput, EngineIOClientCtrls, EngineError, ConnectedState, Transport, PollingState, TransportConfig, EngineCloseReason, EngineIOServerCtrls, EngineStateEntity};
 
-struct EngineIOClient(EngineState);
+pub (crate) struct EngineIOClient(EngineState,Sid);
+
+impl EngineIOClient {
+    pub fn new(sid:Sid,now:Instant) -> Self {
+       return Self(EngineState::New { start_time: now }, sid)
+    }
+}
 
 impl EngineStateEntity for EngineIOClient {
     type Receiver = EngineIOServerCtrls;
@@ -20,7 +26,7 @@ impl EngineStateEntity for EngineIOClient {
             },
             EngineInput::Control(EngineIOClientCtrls::Poll) => {
                 match &self.0 {
-                    EngineState::Connected(s@ConnectedState(Transport::Polling(PollingState { active:None, count }),_,_)) => {
+                    EngineState::Connected(s@ConnectedState(Transport::Polling(PollingState { active:None, count }),_)) => {
                         Ok(Some(EngineState::Connected(s.clone().update(|t,h| {
                             t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(config.ping_interval)));
                         }))))
@@ -28,7 +34,7 @@ impl EngineStateEntity for EngineIOClient {
                     _ => Err(EngineError::InvalidPoll)
                 }
             },
-            EngineInput::Control(EngineIOClientCtrls::New(config, kind)) => {
+            EngineInput::Control(EngineIOClientCtrls::New(kind)) => {
                 match &self.0 { 
                     EngineState::New { .. } => Ok(Some(EngineState::Connecting { start_time: now })),
                     _ => Err(EngineError::OpenFailed)
@@ -52,7 +58,7 @@ impl EngineStateEntity for EngineIOClient {
         return &self.0
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self, config:&TransportConfig) -> Option<Instant> {
         None
     }
 

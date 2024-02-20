@@ -48,7 +48,7 @@ impl actix_web::ResponseError for EngineError {
 pub fn socket_io<F>(path:actix_web::Resource, config:TransportConfig, callback: F) -> Resource
 where F: ConnectionService + 'static + Send + Sync 
 {
-    let io = create_async_io2(callback);
+    let io = create_async_io2(callback, config);
     
     // WS 
     let path = {
@@ -66,7 +66,7 @@ where F: ConnectionService + 'static + Send + Sync
                     let sid = uuid::Uuid::new_v4();
                     let mut client_stream = io.input_with_response_stream(
                         sid,
-                        EngineInput::Control(EngineIOClientCtrls::New(Some(config), EngineKind::Continuous))
+                        EngineInput::Control(EngineIOClientCtrls::New(EngineKind::Continuous))
                     ).await?;
 
                     actix_rt::spawn(async move {
@@ -114,16 +114,14 @@ where F: ConnectionService + 'static + Send + Sync
     // NEW LONG POLL
     let path = {
         let io = io.clone();
-        let config = config.clone();
         path.route(
             web::route()
             .guard(guard::Get())
             .to(move | _session: web::Query<SessionInfo>| { 
                 let io = io.clone();
-                let config = config.clone();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let s = io.input_with_response_stream(sid, EngineInput::Control(EngineIOClientCtrls::New(Some(config), crate::EngineKind::Poll))).await?;
+                    let s = io.input_with_response_stream(sid, EngineInput::Control(EngineIOClientCtrls::New(crate::EngineKind::Poll))).await?;
                     let all = s.take(1).collect::<Vec<Payload>>().await;
                     let combined = Payload::encode_combined(&all, EngineKind::Poll);
                     Ok::<HttpResponse,EngineError>(HttpResponse::Ok().body(combined))

@@ -29,13 +29,13 @@ impl EngineStateEntity for EngineIOServer {
 
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState> {
         match &self.0 {
-            EngineState::Connected(ConnectedState(_, Heartbeat { last_ping:Some(i), .. }, config)) if now > *i + Duration::from_millis(config.ping_timeout) => {
+            EngineState::Connected(ConnectedState(_, Heartbeat { last_ping:Some(i), .. })) if now > *i + Duration::from_millis(config.ping_timeout) => {
                 Some(EngineState::Closed(EngineCloseReason::Timeout))
             },
             EngineState::Connected(state) => {
                 Some(EngineState::Connected(state.clone().update(|transport,heartbeat| {
                     if let None = heartbeat.last_ping {
-                        if now > heartbeat.last_seen + Duration::from_millis(state.2.ping_interval) { heartbeat.pinged_at(now) };
+                        if now > heartbeat.last_seen + Duration::from_millis(config.ping_interval) { heartbeat.pinged_at(now) };
                     }
                     if let Transport::Polling(p@PollingState { active:Some(..), .. }) = transport {
                         p.update_poll(now)
@@ -49,16 +49,16 @@ impl EngineStateEntity for EngineIOServer {
         }
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self, config:&TransportConfig) -> Option<Instant> {
         match &self.0 {
             EngineState::New { start_time } => Some(*start_time + Duration::from_secs(5)),
-            EngineState::Connected(ConnectedState(t,h,c)) => {
-                let next_poll_deadline = if let Transport::Polling(PollingState { active:Some((start,length)), count }) = t { Some(*start + *length) } else { None };
-                let next_heartbeat_deadline = if let Some(s) = h.last_ping { s + Duration::from_millis(c.ping_timeout) } else { h.last_seen + Duration::from_millis(c.ping_interval) };
+            EngineState::Connected(ConnectedState(t,h)) => {
+                let next_poll_deadline = if let Transport::Polling(PollingState { active:Some((start,length)), .. }) = t { Some(*start + *length) } else { None };
+                let next_heartbeat_deadline = if let Some(s) = h.last_ping { s + Duration::from_millis(config.ping_timeout) } else { h.last_seen + Duration::from_millis(config.ping_interval) };
                 [ next_poll_deadline, Some(next_heartbeat_deadline) ].into_iter().filter_map(|d|d).min()
             }
             EngineState::Closed(..) => None,
-            EngineState::Connecting { start_time } => todo!()
+            EngineState::Connecting { .. } => todo!()
         }
     }
 
@@ -108,7 +108,7 @@ impl EngineStateEntity for EngineIOServer {
                             Transport::Polling(PollingState{ active:None, ..}) => {
                                 Ok(EngineState::Connected(s.clone().update(|t,h| {
                                     h.seen_at(now);
-                                    t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(s.2.ping_timeout)));
+                                    t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(config.ping_timeout)));
                                 })))
                             },
                             Transport::Continuous => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll)))
@@ -122,7 +122,7 @@ impl EngineStateEntity for EngineIOServer {
                 Ok(EngineState::Closed(EngineCloseReason::ClientClose))
             },
 
-            EngineInput::Control(EngineIOClientCtrls::New(config,kind)) => {
+            EngineInput::Control(EngineIOClientCtrls::New(kind)) => {
                 match &self.0 {
                     EngineState::Connecting { start_time } => todo!(),
                     EngineState::New{ .. }  => { 
@@ -130,7 +130,7 @@ impl EngineStateEntity for EngineIOServer {
                             EngineKind::Poll => Transport::Polling(PollingState::default()),
                             EngineKind::Continuous => Transport::Continuous
                         };
-                        Ok(EngineState::Connected(ConnectedState::new( t, *config, now)))
+                        Ok(EngineState::Connected(ConnectedState::new(t, now)))
                     },
                     EngineState::Connected(..) => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::Generic))),
                     EngineState::Closed(e) => Err(EngineError::AlreadyClosed)
@@ -143,7 +143,7 @@ impl EngineStateEntity for EngineIOServer {
         match (&self.0, &next_state) {
             (EngineState::Closed(_), _ ) => {},
 
-            (EngineState::New {..} , EngineState::Connected(ConnectedState(t,_,config))) => {
+            (EngineState::New {..} , EngineState::Connected(ConnectedState(t,_))) => {
                 let upgrades = if let Transport::Polling { .. } = t { vec!["websocket"] } else { vec![] };
                 let data = serde_json::json!({
                     "upgrades": upgrades,
@@ -160,28 +160,28 @@ impl EngineStateEntity for EngineIOServer {
             },
 
             // Polling Start 
-            (EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:None, .. }), _,_ )),
-             EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(..), ..}),_,_))) => { 
+            (EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:None, .. }),_)),
+             EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(..), ..}),_))) => { 
                 out_buffer.push_back(EngineOutput::Stream(true));
             }
             
             // Polling End
-            (EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(..), count}),_,_)),
-             EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:None, .. }),_,_))) => {
+            (EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(..), count}),_)),
+             EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:None, .. }),_))) => {
                 if *count == 0 { out_buffer.push_back(EngineOutput::Send(Payload::Ping));}
                 out_buffer.push_back(EngineOutput::Stream(false));
             },
 
             // websocket ping pong
-            (EngineState::Connected(ConnectedState(Transport::Continuous, Heartbeat { last_ping:None, .. }, _ )),
-            EngineState::Connected(ConnectedState(Transport::Continuous, Heartbeat { last_ping:Some(_), .. }, _))) => {
+            (EngineState::Connected(ConnectedState(Transport::Continuous, Heartbeat { last_ping:None, .. })),
+            EngineState::Connected(ConnectedState(Transport::Continuous, Heartbeat { last_ping:Some(_), .. }))) => {
                 out_buffer.push_back(EngineOutput::Send(Payload::Ping));
             },
 
             // Close
             (prev, EngineState::Closed(EngineCloseReason::ClientClose)) => {
                 match prev { 
-                    EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(_), count }),_,_)) if *count == 0 => { 
+                    EngineState::Connected(ConnectedState(Transport::Polling(PollingState { active:Some(_), count }),_)) if *count == 0 => { 
                         out_buffer.push_back(EngineOutput::Send(Payload::Noop))
                     },
                     _ => {}
