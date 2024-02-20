@@ -5,6 +5,7 @@ use futures_util::Stream;
 use tokio_stream::StreamExt;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::Receiver;
+use crate::Engine;
 use crate::EngineError;
 use crate::EngineCloseReason;
 use crate::MessageData;
@@ -76,7 +77,7 @@ pub enum Either<A,B> {
     B(B)
 }
 
-type EngineInput2 = Either<EngineInput<EngineIOClientCtrls>, EngineInput<EngineIOServerCtrls>>;
+type EngineServerInput = Either<EngineInput<EngineIOServerCtrls>, EngineInput<EngineIOClientCtrls>>;
 
 pub fn create_async_io2<F>(client:F) -> AsyncSessionClientHandle 
 where F:AsyncConnectionService + 'static + Send
@@ -84,19 +85,19 @@ where F:AsyncConnectionService + 'static + Send
 
     let (client_send_tx, mut client_send_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, AsyncInputSender)>(1024);
     let (server_send_tx, mut server_send_rx) = tokio::sync::mpsc::channel::<(Sid, EngineInput<EngineIOServerCtrls>, AsyncInputSender)>(1024);
-    let mut workers: HashMap<Sid,Sender<(EngineInput2, AsyncInputSender)>> = HashMap::new();
+    let mut workers: HashMap<Sid,Sender<(EngineServerInput, AsyncInputSender)>> = HashMap::new();
     
     tokio::spawn( async move {
         loop {
             let (sid,input,res_tx) = tokio::select! {
-                Some(client) = client_send_rx.recv() => (client.0, Either::A(client.1), client.2),
-                Some(server) = server_send_rx.recv() => (server.0, Either::B(server.1), server.2),
+                Some(server) = server_send_rx.recv() => (server.0, Either::A(server.1), server.2),
+                Some(client) = client_send_rx.recv() => (client.0, Either::B(client.1), client.2),
             };
 
             let worker = match input {
-                Either::A(EngineInput::Control(EngineIOClientCtrls::New(..))) => {
+                Either::B(EngineInput::Control(EngineIOClientCtrls::New(..))) => {
                     // Channel for IO_DISPATCHER to talk to worker
-                    let (worker_recv_tx, worker_recv_rx) = tokio::sync::mpsc::channel::<(EngineInput2,AsyncInputSender)>(32);
+                    let (worker_recv_tx, worker_recv_rx) = tokio::sync::mpsc::channel::<(EngineServerInput,AsyncInputSender)>(32);
                     workers.insert(sid, worker_recv_tx.clone());
                     // Channel for END_CLIENT to recv events 
                     let (server_recv_tx, server_recv_rx) = tokio::sync::mpsc::channel::<Payload>(10);
@@ -108,6 +109,7 @@ where F:AsyncConnectionService + 'static + Send
                     tokio::spawn(create_worker(sid, worker_recv_rx, server_recv_tx.clone()));
                     Some(worker_recv_tx)
                 },
+
                 _ => {
                     workers.get(&sid).map(|t| t.to_owned())
                 }
@@ -130,8 +132,11 @@ where F:AsyncConnectionService + 'static + Send
     }
 }
 
-async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,AsyncInputSender)>, tx: tokio::sync::mpsc::Sender<Payload>) {
-    let mut engine = EngineIOServer::new(id, Instant::now());
+async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerInput,AsyncInputSender)>, tx: tokio::sync::mpsc::Sender<Payload>) {
+
+    let now = Instant::now();
+    let config = crate::TransportConfig::default();
+    let mut engine = Engine::new(EngineIOServer::new(id, now));
     let mut send_buffer = vec![];
     let mut send_tx = None;
     let mut next_tick = Instant::now() + Duration::from_secs(10);
@@ -143,15 +148,12 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
         }.unzip();
 
         let err = input.and_then(|input| {
-            match input {
-                Either::A(client) => engine.input_recv(client, now),
-                Either::B(server) => engine.input_send(server, now),
-            }.err()
+            engine.input(input, now, &config).err()
         });
         
         let mut new_stream = None;
         let next_deadline = loop {
-            match engine.poll_output(now) {
+            match engine.poll(now, &config) {
                 Some(output) => {
                     match output {
                         EngineOutput::Stream(true) => { 
@@ -173,7 +175,7 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineInput2,
                                 send_buffer.push(p);
                             }   
                         },
-                        EngineOutput::Pending(d) => { break Some(now + d) }
+                        EngineOutput::Wait(d) => { break Some(d) }
                     }
                 },
                 None => break None// finished! 

@@ -35,7 +35,7 @@ pub(crate) enum EngineOutput {
     Stream(bool),
     Recv(Payload),
     Send(Payload),
-    Pending(Duration)
+    Wait(Instant)
 }
 
 // =======================
@@ -153,27 +153,26 @@ pub(crate) trait EngineStateEntity {
     type Sender;
     type Receiver;
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState>;
-    fn send(&self, input:EngineInput<Self::Sender>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
-    fn recv(&self, input:EngineInput<Self::Receiver>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
-    fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<EngineOutput>) -> &EngineState;
+    fn send(&self, input:&EngineInput<Self::Sender>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
+    fn recv(&self, input:&EngineInput<Self::Receiver>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
+    fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<EngineOutput>, config:&TransportConfig) -> &EngineState;
     fn next_deadline(&self) -> Option<Instant>;
 }
 
 // =====================
 
+#[derive(Debug)]
 pub (crate) struct Engine<T> {
-    pub session: Sid,
     output: VecDeque<EngineOutput>,
     state: T,
 }
 
 impl<T> Engine<T>
 where T:EngineStateEntity {
-    pub fn new(id:Sid, now:Instant, start_state:T) -> Self {
+    pub fn new(initial_state:T) -> Self {
         return Self { 
-            session: id,
             output: VecDeque ::new(),
-            state: start_state,
+            state: initial_state,
         }
     }
 
@@ -181,14 +180,14 @@ where T:EngineStateEntity {
         while let Some(d) = self.state.next_deadline() {
             if now < d { break };
             if let Some(s) = self.state.time(now, config) {
-                self.state.update(s, &mut self.output);
+                self.state.update(s, &mut self.output, config);
             }
         }
     }
 
     pub fn input(&mut self, i:Either<EngineInput<T::Sender>,EngineInput<T::Receiver>>, now:Instant, config:&TransportConfig) -> Result<(),EngineError> {
         self.advance_time(now, config);
-        let next_state = match i {
+        let next_state = match &i {
             Either::A(a) => self.state.send(a, now, config),
             Either::B(b) => self.state.recv(b, now, config)
         };
@@ -204,7 +203,7 @@ where T:EngineStateEntity {
                     _ => {}
                 }
                 if let Some(s) = next_state {
-                    let e = self.state.update(s, &mut self.output).has_error();
+                    let e = self.state.update(s, &mut self.output, config).has_error();
                     if let Some(e) = e { Err(e.clone()) } else { Ok(()) }
                 }
                 else {
@@ -218,7 +217,7 @@ where T:EngineStateEntity {
         let next_state = self.state.time(now, config);
         self.output.pop_front().or_else(||{
             self.advance_time(now, config);
-            self.state.next_deadline().map(|d| EngineOutput::Pending(d))
+            self.state.next_deadline().map(|d| EngineOutput::Wait(d))
         })
 
     }

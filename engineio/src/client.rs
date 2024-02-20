@@ -11,7 +11,7 @@ impl EngineStateEntity for EngineIOClient {
         todo!()
     }
 
-    fn send(&self, input:EngineInput<EngineIOClientCtrls>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>,EngineError> {
+    fn send(&self, input:&EngineInput<EngineIOClientCtrls>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>,EngineError> {
         match input {
             EngineInput::Data(Err(e)) => Err(EngineError::UnknownPayload),
 
@@ -19,7 +19,7 @@ impl EngineStateEntity for EngineIOClient {
                 Ok(None)
             },
             EngineInput::Control(EngineIOClientCtrls::Poll) => {
-                match self.0 {
+                match &self.0 {
                     EngineState::Connected(s@ConnectedState(Transport::Polling(PollingState { active:None, count }),_,_)) => {
                         Ok(Some(EngineState::Connected(s.clone().update(|t,h| {
                             t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(config.ping_interval)));
@@ -29,7 +29,7 @@ impl EngineStateEntity for EngineIOClient {
                 }
             },
             EngineInput::Control(EngineIOClientCtrls::New(config, kind)) => {
-                match self.0 { 
+                match &self.0 { 
                     EngineState::New { .. } => Ok(Some(EngineState::Connecting { start_time: now })),
                     _ => Err(EngineError::OpenFailed)
                 }
@@ -40,11 +40,11 @@ impl EngineStateEntity for EngineIOClient {
         }
     }
 
-    fn recv(&self, input:EngineInput<EngineIOServerCtrls>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
+    fn recv(&self, input:&EngineInput<EngineIOServerCtrls>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
         todo!()
     }
 
-    fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<EngineOutput>) -> &EngineState {
+    fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<EngineOutput>, config:&TransportConfig) -> &EngineState {
         match (&self.0, &next_state) {
             _ => {}
         }
