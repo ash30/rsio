@@ -1,11 +1,11 @@
 use std::{collections::VecDeque, time::{Instant, Duration}};
-use crate::{Sid, EngineOutput, EngineState, EngineInput, EngineIOClientCtrls, EngineError, ConnectedState, Transport, PollingState, TransportConfig, EngineCloseReason, EngineIOServerCtrls, EngineStateEntity};
+use crate::{Sid, IO, EngineState, EngineInput, EngineIOClientCtrls, EngineError, ConnectedState, Transport, PollingState, TransportConfig, EngineCloseReason, EngineIOServerCtrls, EngineStateEntity};
 
-pub (crate) struct EngineIOClient(EngineState,Sid);
+pub (crate) struct EngineIOClient(EngineState, Option<Sid>);
 
 impl EngineIOClient {
-    pub fn new(sid:Sid,now:Instant) -> Self {
-       return Self(EngineState::New { start_time: now }, sid)
+    pub fn new(now:Instant) -> Self {
+       return Self(EngineState::New { start_time: now }, None)
     }
 }
 
@@ -50,7 +50,7 @@ impl EngineStateEntity for EngineIOClient {
         todo!()
     }
 
-    fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<EngineOutput>, config:&TransportConfig) -> &EngineState {
+    fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<IO>, config:&TransportConfig) -> &EngineState {
         match (&self.0, &next_state) {
             _ => {}
         }

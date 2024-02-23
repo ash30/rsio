@@ -5,6 +5,7 @@ mod proto;
 mod handler;
 mod client;
 mod server;
+mod transport;
 
 pub use proto::*;
 pub use io::*;

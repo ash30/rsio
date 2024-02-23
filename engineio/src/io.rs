@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::time::Duration;
 use std::time::Instant;
 use std::collections::HashMap;
@@ -8,9 +9,13 @@ use tokio::sync::mpsc::Receiver;
 use crate::Engine;
 use crate::EngineError;
 use crate::EngineCloseReason;
+use crate::TransportKind;
+use crate::EngineStateEntity;
 use crate::MessageData;
 use crate::TransportConfig;
-use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, EngineOutput} ;
+use crate::TransportError;
+use crate::client::EngineIOClient;
+use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, IO} ;
 use crate::server::EngineIOServer;
 use crate::handler::ConnectionMessage;
 
@@ -44,6 +49,76 @@ impl AsyncSessionServerHandle {
    }
 }
 
+
+// THE AIM here is to wrap engine client inside of some IO Primitive
+// I think TASK is still relevant - because we need to time things
+// and move drive things forward.... and deliver callbacks based 
+//
+// Create Cliemt()
+// client.connect().await -> Stream + Session ?
+// 
+
+
+async fn create_client_session(transport:impl AsyncTransportClient, kind:TransportKind)  -> Result<impl Stream<Item=Payload>,TransportError>{ // need to return session + stream 
+
+    let (tx,rx) = tokio::sync::mpsc::channel(1024);
+    let mut engine = Engine::new(EngineIOClient::new(Instant::now()));
+
+    tokio::spawn(async move {
+        let mut session = None;
+        let mut stream = None;
+        loop {
+            let now = Instant::now();
+            let config = TransportConfig::default();
+            let wait = loop {
+                match engine.poll(now, &config) {
+                    Some(output) => match output {
+                        IO::Connect(sid) => {
+                            let (session, stream) = transport.connect(sid, kind).await;
+                            session = session;
+                            stream = stream;
+                        },
+                        IO::Close => { transport.close() }
+                        IO::Send(p) => {
+                            if let Some(s) = session {
+                                s.send(p); //send to transport
+                            }
+                            else {
+                                // HOW TO HNDLE ERROR???
+                            }
+                        },
+                        IO::Recv(p) => { tx.send(p); }, // send to customer stream
+                        IO::Wait(until) => break Some(until),
+                   },
+                   None => break None
+               }
+            };
+            let Some(t) = wait else { break };
+            let next = tokio::select! {
+                _ = tokio::time::sleep_until(t.into()) => None,
+                input = if let Some(s) = stream { s.next() } else { futures_util::future::pending() } => input 
+            };
+            if let Some(input) = next { engine.input(input, now, &config) }
+        }
+    });
+
+    return Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+// WE WANT (SESSION + STREAM
+// CONNECT() => Result<Session + STREAM >
+//
+
+pub(crate) struct AsyncSessionSENDER {}
+
+pub (crate) trait AsyncTransportClient {
+
+    async fn connect(&self, id:Option<Sid>, kind:TransportKind) -> Result<(AsyncSessionSENDER,impl Stream<Item = Payload>), TransportError> ;
+    fn close(&mut self);
+    
+}
+
+
 // =============================================
 
 #[derive(Debug, Clone)]
@@ -73,10 +148,13 @@ impl AsyncSessionClientHandle {
 type AsyncInputResult = Result<Option<Receiver<Payload>>,EngineError>;
 type AsyncInputSender = tokio::sync::oneshot::Sender<AsyncInputResult>;
 
+
+#[derive(Debug)]
 pub enum Either<A,B> {
     A(A),
     B(B)
 }
+
 
 type EngineServerInput = Either<EngineInput<EngineIOServerCtrls>, EngineInput<EngineIOClientCtrls>>;
 
@@ -157,7 +235,7 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerI
             match engine.poll(now, &config) {
                 Some(output) => {
                     match output {
-                        EngineOutput::Stream(true) => { 
+                        IO::Stream(true) => { 
                             let (tx,rx) = tokio::sync::mpsc::channel(32);
                             for p in send_buffer.drain(0..){
                                 tx.send(p).await;
@@ -166,9 +244,9 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerI
                             new_stream = Some(rx);
 
                         },
-                        EngineOutput::Stream(false) => {send_tx = None;},
-                        EngineOutput::Recv(m) => { tx.send(m).await;},
-                        EngineOutput::Send(p) => { 
+                        IO::Stream(false) => {send_tx = None;},
+                        IO::Recv(m) => { tx.send(m).await;},
+                        IO::Send(p) => { 
                             if let Some(sender) = &send_tx {
                                 sender.send(p).await;
                             }
@@ -176,7 +254,7 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerI
                                 send_buffer.push(p);
                             }   
                         },
-                        EngineOutput::Wait(d) => { break Some(d) }
+                        IO::Wait(d) => { break Some(d) }
                     }
                 },
                 None => break None// finished! 
@@ -189,7 +267,6 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerI
                 (None, Some(rx)) => Ok(Some(rx)),
                 (None, None) => Ok(None)
             };
-            dbg!(&res);
             t.send(res);
         };
 
@@ -199,6 +276,9 @@ async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerI
 }
 
 
+pub fn create_async_client(service:impl AsyncConnectionService +'static + Send) {
+
+}
 
 
 

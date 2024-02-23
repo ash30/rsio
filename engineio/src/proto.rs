@@ -1,7 +1,7 @@
 use std::u8;
 use std::vec;
 use crate::EngineCloseReason;
-use crate::EngineKind;
+use crate::TransportKind;
 pub type Sid = uuid::Uuid;
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +52,7 @@ impl Payload{
         }
     }
 
-    pub fn encode(&self, transport: EngineKind) -> Vec<u8> {
+    pub fn encode(&self, transport: TransportKind) -> Vec<u8> {
         let header:Option<u8> = match self {
             Payload::Open(..) => b'0'.into(),
             Payload::Close(..) => b'1'.into(),
@@ -61,8 +61,8 @@ impl Payload{
             Payload::Message(MessageData::String(..)) => b'4'.into(), 
             Payload::Message(MessageData::Binary(..)) => { 
                 match transport {
-                    EngineKind::Poll => b'b'.into(),
-                    EngineKind::Continuous => None,
+                    TransportKind::Poll => b'b'.into(),
+                    TransportKind::Continuous => None,
                 }
             }, 
             Payload::Upgrade => b'5'.into(),
@@ -75,7 +75,7 @@ impl Payload{
         return v
     }
 
-    pub fn decode(data:&[u8], transport: EngineKind) -> Result<Payload, PayloadDecodeError> {
+    pub fn decode(data:&[u8], transport: TransportKind) -> Result<Payload, PayloadDecodeError> {
         let t = data.first();
         match t {
             None => Err(PayloadDecodeError::InvalidFormat),
@@ -97,13 +97,13 @@ impl Payload{
 
     }
 
-    pub fn decode_combined(v:&[u8], t: EngineKind) -> Vec<Result<Payload,PayloadDecodeError>> {
+    pub fn decode_combined(v:&[u8], t: TransportKind) -> Vec<Result<Payload,PayloadDecodeError>> {
         v.split(|c| *c == b'\x1e').into_iter()
             .map(|d| Payload::decode(d, t))
             .collect()
     }
 
-    pub fn encode_combined(v:&[Payload], t:EngineKind) -> Vec<u8> {
+    pub fn encode_combined(v:&[Payload], t:TransportKind) -> Vec<u8> {
         let seperator:u8 = b'\x1e';
         let start = v.first().map(|p| p.encode(t));
         let rest = v.get(1..).map(|s| s.iter().flat_map(|p| vec![vec![seperator], p.encode(t).to_vec()].concat()).collect::<Vec<u8>>());
