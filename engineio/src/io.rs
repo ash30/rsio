@@ -2,121 +2,110 @@ use std::fmt::Debug;
 use std::time::Duration;
 use std::time::Instant;
 use std::collections::HashMap;
-use futures_util::Stream;
-use tokio_stream::StreamExt;
+use futures_util::TryFutureExt;
+use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::Receiver;
+use tokio_stream::{StreamExt, empty};
 use crate::Engine;
 use crate::EngineError;
 use crate::EngineCloseReason;
-use crate::TransportKind;
 use crate::EngineStateEntity;
 use crate::MessageData;
 use crate::TransportConfig;
-use crate::TransportError;
 use crate::client::EngineIOClient;
 use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, IO} ;
 use crate::server::EngineIOServer;
 use crate::handler::ConnectionMessage;
+use crate::transport::TransportKind;
 
-pub trait AsyncConnectionService { 
-    fn new_connection<S:Stream<Item=ConnectionMessage> + 'static + Send>(&self, connection:S, session:AsyncSessionServerHandle);
+
+
+
+enum IOError<T> {
+    SendError(T),
+    TransportError(T)
 }
 
-fn create_connection_stream(s:impl Stream<Item=Payload>) -> impl Stream<Item=Result<MessageData,EngineCloseReason>> {
-    s.filter_map(|p| match p { 
-        Payload::Message(d) => Some(Ok(d)),
-        Payload::Close(r) => Some(Err(r)),
-        _ => None,
-    })
+trait Transport { 
+    async fn get_stream(sid:Option<Sid>) -> Result<impl tokio_stream::Stream<Item = Payload>,IOError>;
+    async fn send(m:Payload) -> Result<(),IOError>;
 }
 
-// =============================================
-
-pub struct AsyncSessionServerHandle {
-    sid:Sid,
-    input_tx: Sender<(Sid, EngineInput<EngineIOServerCtrls>, AsyncInputSender)>,
-}
-
-impl AsyncSessionServerHandle {
-   pub async fn send(&self, data:MessageData) -> Result<(),EngineError> {
-        let (tx,rx) = tokio::sync::oneshot::channel::<AsyncInputResult>();
-        let _ = self.input_tx.send(
-            (self.sid, EngineInput::Data(Ok(Payload::Message(data))), tx)
-        ).await;
-        rx.await.unwrap_or(Err(EngineError::AlreadyClosed))?;
-        Ok(())
-   }
-}
+enum IOCloseReason {}
+struct FOOBAR {}
 
 
-// THE AIM here is to wrap engine client inside of some IO Primitive
-// I think TASK is still relevant - because we need to time things
-// and move drive things forward.... and deliver callbacks based 
-//
-// Create Cliemt()
-// client.connect().await -> Stream + Session ?
-// 
+// SO we return from the task UNSENT 
+fn create_async_clientio() -> (FOOBAR, impl tokio_stream::Stream<Item = Result<Payload,IOCloseReason>>) {
 
+    let (down_send_tx, down_send_rx) = tokio::sync::mpsc::channel(1);
+    let (down_revc_tx, down_recv_rx) = tokio::sync::mpsc::channel(1);
+    let (up_send_tx, up_send_rx) = tokio::sync::mpsc::channel(1);
+    let (up_revc_tx, up_recv_rx) = tokio::sync::mpsc::channel(1);
 
-async fn create_client_session(transport:impl AsyncTransportClient, kind:TransportKind)  -> Result<impl Stream<Item=Payload>,TransportError>{ // need to return session + stream 
+    let mut engine = Engine::new(EngineIOClient::new(tokio::time::Instant::now()));
+    let config = TransportConfig::default();
 
-    let (tx,rx) = tokio::sync::mpsc::channel(1024);
-    let mut engine = Engine::new(EngineIOClient::new(Instant::now()));
-
-    tokio::spawn(async move {
-        let mut session = None;
-        let mut stream = None;
+    let a = tokio::spawn(async move { 
         loop {
-            let now = Instant::now();
             let config = TransportConfig::default();
-            let wait = loop {
+            let now = tokio::time::Instant::now();        
+
+            let next = loop {
                 match engine.poll(now, &config) {
-                    Some(output) => match output {
-                        IO::Connect(sid) => {
-                            let (session, stream) = transport.connect(sid, kind).await;
-                            session = session;
-                            stream = stream;
-                        },
-                        IO::Close => { transport.close() }
-                        IO::Send(p) => {
-                            if let Some(s) = session {
-                                s.send(p); //send to transport
-                            }
-                            else {
-                                // HOW TO HNDLE ERROR???
-                            }
-                        },
-                        IO::Recv(p) => { tx.send(p); }, // send to customer stream
-                        IO::Wait(until) => break Some(until),
-                   },
-                   None => break None
-               }
+                    Some(IO::Wait(d)) => {
+                        break Ok(Some(d))
+                    }
+                    Some(_) => {
+                        let (res_tx, res_rx) = tokio::sync::oneshot::channel::<Option<(IOError, Payload)>>();
+                        if let Err(e) = down_send_tx.send((res_tx,Payload::Ping)).await {
+                            break Err(IOError::SendError(e.0))
+                        }
+                        if let Some((err,p)) = res_rx {
+                            break Err(IOError::TransportError(p))
+                        }
+                    },
+                    None => {
+                        break(Ok(None))
+                    }
+                }
             };
-            let Some(t) = wait else { break };
-            let next = tokio::select! {
-                _ = tokio::time::sleep_until(t.into()) => None,
-                input = if let Some(s) = stream { s.next() } else { futures_util::future::pending() } => input 
+
+            let next_deadline = match next {
+                Ok(None) => break, // engine closed 
+                Ok(Some(d)) => Some(d),
+                Err(e) => {
+                    engine.input(e, now, &config);
+                    None
+                }
             };
-            if let Some(input) = next { engine.input(input, now, &config) }
-        }
+            let input = select! {
+                _ = tokio::time::sleep_until(next_deadline.unwrap_or(tokio::time::Instant::now())) => None,
+                s = up_recv_rx.recv() => s,
+                r = down_recv_rx.recv() => r 
+            };
+            if let Some((i,res_tx)) = input {
+                res_tx.send(engine.input(i, now, &config)).await;
+            }
+        };
     });
 
-    return Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
+
+    // output is rx Stream
+    // it can drop and we don't care?
+    // session holds tasks, so drop =kill 
+
+
+
 }
 
-// WE WANT (SESSION + STREAM
-// CONNECT() => Result<Session + STREAM >
-//
 
-pub(crate) struct AsyncSessionSENDER {}
 
-pub (crate) trait AsyncTransportClient {
 
-    async fn connect(&self, id:Option<Sid>, kind:TransportKind) -> Result<(AsyncSessionSENDER,impl Stream<Item = Payload>), TransportError> ;
-    fn close(&mut self);
-    
-}
+
+
+
 
 
 // =============================================
