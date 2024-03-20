@@ -1,7 +1,5 @@
 use std::time::{Instant, Duration};
 
-use crate::Sid;
-
 #[derive(Debug, Clone)]
 pub (crate) enum TransportError { 
 }

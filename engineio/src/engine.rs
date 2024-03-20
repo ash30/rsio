@@ -1,6 +1,9 @@
-use std::time::{Instant, Duration};
+use std::time::Instant;
 use std::fmt;
-use crate::{Either};
+use crate::io::Either;
+use crate::transport::Connection;
+use crate::transport::TransportError;
+use crate::transport::TransportKind;
 pub use crate::proto::*;
 use std::collections::VecDeque;
 
@@ -26,7 +29,7 @@ pub enum EngineIOClientCtrls {
 
 #[derive(Debug, Clone)]
 pub(crate) enum IO {
-    Connect(Option<Sid>),
+    Open(Option<Sid>),
     Close,
     Recv(Payload),
     Send(Payload),
@@ -42,7 +45,7 @@ pub(crate) enum IO {
 pub(crate) enum EngineState {
     New { start_time:Instant },
     Connecting { start_time:Instant },
-    Connected(ConnectedState),
+    Connected(Connection),
     Closed(EngineCloseReason),
 }
 
@@ -56,16 +59,17 @@ impl EngineState {
 }
 
 pub(crate) trait EngineStateEntity {
-    type Sender;
-    type Receiver;
+    type Send;
+    type Receive;
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState>;
-    fn send(&self, input:&EngineInput<Self::Sender>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
-    fn recv(&self, input:&Either<EngineInput<Self::Receiver>, TransportError>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
+    fn send(&self, input:&EngineInput<Self::Send>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
+    fn recv(&self, input:&EngineInput<Self::Receive>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
     fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<IO>, config:&TransportConfig) -> &EngineState;
     fn next_deadline(&self, config:&TransportConfig) -> Option<Instant>;
 }
 
 // =====================
+
 
 #[derive(Debug)]
 pub (crate) struct Engine<T> {
@@ -91,7 +95,7 @@ where T:EngineStateEntity {
         }
     }
 
-    pub fn input(&mut self, i:Either<EngineInput<T::Sender>, Either<EngineInput<T::Receiver>, TransportError>>, now:Instant, config:&TransportConfig) -> Result<(),EngineError> {
+    pub fn input(&mut self, i:Either<EngineInput<T::Send>, EngineInput<T::Receive>>, now:Instant, config:&TransportConfig) -> Result<(),EngineError> {
         self.advance_time(now, config);
         let next_state = match &i {
             Either::A(a) => self.state.send(a, now, config),
@@ -105,7 +109,7 @@ where T:EngineStateEntity {
                 // Buffer Data Input AND action state transitions
                 match i {
                     Either::A(EngineInput::Data(Ok(msg))) => { self.output.push_back(IO::Send(msg)) },
-                    Either::B(Either::A(EngineInput::Data(Ok(msg)))) => { self.output.push_back(IO::Recv(msg)) }
+                    Either::B(EngineInput::Data(Ok(msg))) => { self.output.push_back(IO::Recv(msg)) }
                     _ => {}
                 }
                 if let Some(s) = next_state {

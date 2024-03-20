@@ -1,7 +1,7 @@
 use std::u8;
 use std::vec;
-use crate::EngineCloseReason;
-use crate::TransportKind;
+use crate::engine::EngineCloseReason;
+use crate::transport::TransportKind;
 pub type Sid = uuid::Uuid;
 use serde::{Deserialize, Serialize};
 

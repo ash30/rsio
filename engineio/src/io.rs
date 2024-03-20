@@ -1,161 +1,19 @@
 use std::fmt::Debug;
-use std::time::Duration;
-use std::time::Instant;
-use futures_util::TryFutureExt;
+use std::task::Poll;
+use futures_util::Future;
+use futures_util::Stream;
 use tokio::select;
-use tokio::sync::mpsc::Receiver;
-use crate::Engine;
-use crate::EngineError;
-use crate::EngineStateEntity;
-use crate::TransportConfig;
-use crate::client::EngineIOClient;
-use crate::engine::{Sid, Payload, EngineInput, EngineIOClientCtrls, EngineIOServerCtrls, IO} ;
-use crate::server::EngineIOServer;
-
-pub enum IOError<T> {
-    InternalError,
-    SendError(T),
-    TransportError(T)
-}
-
-pub enum IOCloseReason {}
-
+use crate::proto::PayloadDecodeError;
+use crate::proto::Payload;
+use crate::proto::TransportConfig;
+use crate::engine::EngineInput;
+use crate::engine::Engine;
+use crate::engine::EngineError;
+use crate::engine::EngineStateEntity;
+use crate::engine::IO;
+use std::pin::Pin;
 use tokio::sync::oneshot;
 use tokio::sync::mpsc;
-
-pub(crate) type AsyncDownStreamIOPair = (
-    mpsc::Sender<(Payload, oneshot::Sender<Result<(),IOError<Payload>>>)>,
-    mpsc::Receiver<(Result<Payload,IOCloseReason>, oneshot::Sender<Result<(),EngineError>>)>
-    );
-
-pub(crate) type AsyncDownStreamIOPairOther = (
-    mpsc::Receiver<(Payload, oneshot::Sender<Result<(),IOError<Payload>>>)>,
-    mpsc::Sender<(Result<Payload,IOCloseReason>, oneshot::Sender<Result<(),EngineError>>)>
-    );
-
-type AsyncUpStreamIOPair = (
-    mpsc::Sender<Result<Payload,IOCloseReason>>, // change to engine close reason
-    mpsc::Receiver<(Payload, oneshot::Sender<Result<(),EngineError>>)>
-    );
-
-type AsyncUpStreamIOPairOTHER = (
-    mpsc::Receiver<Result<Payload,IOCloseReason>>, // change to engine close reason
-    mpsc::Sender<(Payload, oneshot::Sender<Result<(),EngineError>>)>
-    );
-
-pub trait Transport { 
-    fn connect(&self) -> AsyncDownStreamIOPair;
-}
-
-pub fn setup_client_io(t:impl Transport) -> AsyncUpStreamIOPairOTHER {
-    let (up_send_tx, up_send_rx) = tokio::sync::mpsc::channel(1);
-    let (up_recv_tx, up_recv_rx) = tokio::sync::mpsc::channel(1);
-
-    // TODO: We need to return used engine so people can drain?
-    let task = setup_io(t.connect(), (up_send_tx, up_recv_rx));
-    return (up_recv_tx, up_send_rx);
-}
-
-async fn setup_io(
-    down_stream:AsyncDownStreamIOPair,
-    up_stream:AsyncUpStreamIOPair
-) -> Engine {
-    let (down_send, down_recv) = down_stream;
-    let (up_send, up_recv) = up_stream;
-
-    let mut engine = Engine::new(EngineIOClient::new(tokio::time::Instant::now()));
-    let config = TransportConfig::default();
-
-    let a = tokio::spawn(async move { 
-        loop {
-            let config = TransportConfig::default();
-            let now = tokio::time::Instant::now();        
-
-            let next = loop {
-                match engine.poll(now, &config) {
-                    Some(IO::Wait(d)) => {
-                        break Ok(Some(d))
-                    }
-                    Some(IO::Send(p)) => {
-                        let (res_tx, res_rx) = tokio::sync::oneshot::channel::<Option<(IOError, Payload)>>();
-                        if let Err(e) = down_send.send((res_tx,Payload::Ping)).await {
-                            break Err(IOError::SendError(e.0))
-                        }
-                        match res_rx.await {
-                            Err(e) => break Err(IOError::InternalError),
-                            Ok(Err(e)) => break Err(e),
-                            Ok(_) => continue 
-                        }
-                    },
-                    Some(IO::Recv(p)) => {
-                        // We don't mind if upstream has dropped
-                        let _ = up_send.send(Ok(p)).await;
-                    }
-                    Some(_) => {
-                        // we ingore others for now ...
-                    }
-                    None => {
-                        break(Ok(None))
-                    }
-                }
-            };
-
-            let next_deadline = match next {
-                Ok(None) => break, // engine closed 
-                Ok(Some(d)) => Some(d),
-                Err(e) => {
-                    // TODO: Send errors back into the engine....
-                    // HOW do we input error? CTRLs 
-                    engine.input(e, now, &config);
-                }
-            };
-            select! {
-                _ = tokio::time::sleep_until(next_deadline.unwrap_or(tokio::time::Instant::now())) => {},
-                up = up_recv.recv() => {
-                    // TODO: dropping channel cleanup 
-                    // We report invalid input to local sender
-                    let Some((p,res_tx)) = up else { 
-                        // IF upstream closes... what do do ?
-                        break
-                    };
-                    res_tx.send(engine.input(p,now,&config)).await;
-                },
-                down = down_recv.recv() => {
-                    // TODO: dropping channel cleanup 
-                    // We report invalid input to remote sender
-                    let Some((p,res_tx)) = down else { 
-                        // when down stream closes, we can break right away
-                        // and let owner drain ...
-                        break 
-                    };
-                    res_tx.send(engine.input(p,now,&config)).await;
-                    // Data - command to show stuff 
-                    // POLL -> command from other side...
-                    // New -> command from other side as well
-                    // Close -> THIS
-                    // data stream has close in it, close at this level is for server,client??;
-                }
-            };
-        };
-        engine
-    });
-
-}
-
-
-
-
-
-
-
-
-
-
-// =============================================
-
-type AsyncInputResult = Result<Option<Receiver<Payload>>,EngineError>;
-type AsyncInputSender = tokio::sync::oneshot::Sender<AsyncInputResult>;
-
 
 #[derive(Debug)]
 pub enum Either<A,B> {
@@ -163,72 +21,158 @@ pub enum Either<A,B> {
     B(B)
 }
 
+pub enum IOError<T> {
+    InternalError,
+    SendError(T),
+    TransportError(T)
+}
+pub enum IOCloseReason {}
+type EngineChannelReq<T> = (mpsc::Sender<(EngineInput<T>, oneshot::Sender<Result<(),EngineError>>)>, mpsc::Receiver<Payload>);
+type EngineChannelRes<T> = (mpsc::Sender<Payload>, mpsc::Receiver<(EngineInput<T>, oneshot::Sender<Result<(),EngineError>>)>);
+type EngineChannelPair<T> = (EngineChannelReq<T>, EngineChannelRes<T>);
 
-type EngineServerInput = Either<EngineInput<EngineIOServerCtrls>, EngineInput<EngineIOClientCtrls>>;
+fn engine_channel<T>() -> EngineChannelPair<T> {
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(1);
+    let (res_tx, res_rx) = tokio::sync::mpsc::channel(1);
+    return (
+        (req_tx, res_rx),
+        (res_tx, req_rx)
+    )
+}
 
 
-async fn create_worker(id:Sid, mut rx:tokio::sync::mpsc::Receiver<(EngineServerInput,AsyncInputSender)>, tx: tokio::sync::mpsc::Sender<Payload>, config:TransportConfig) {
+#[pin_project::pin_project]
+pub struct Session<T> { 
+    #[pin]
+    handle: tokio::task::JoinHandle<SessionCloseReason>,
+    tx: mpsc::Sender<(EngineInput<T>, oneshot::Sender<Result<(),EngineError>>)>,
+    rx: mpsc::Receiver<Payload>
+}
 
-    let now = Instant::now();
-    let mut engine = Engine::new(EngineIOServer::new(id, now));
-    let mut send_buffer = vec![];
-    let mut send_tx = None;
-    let mut next_tick = Instant::now() + Duration::from_secs(10);
-    loop {
-        let now = Instant::now();
-        let (input,res_tx) = tokio::select! {
-            input = rx.recv() => if let Some(i) = input { Some(i) } else { break },
-            _  = tokio::time::sleep_until(next_tick.into()) => None
-        }.unzip();
+pub enum SessionCloseReason {
+    Unknown
+}
 
-        let err = input.and_then(|input| {
-            engine.input(input, now, &config).err()
-        });
-        
-        let mut new_stream = None;
-        let next_deadline = loop {
-            match engine.poll(now, &config) {
-                Some(output) => {
-                    match output {
-                        IO::Stream(true) => { 
-                            let (tx,rx) = tokio::sync::mpsc::channel(32);
-                            for p in send_buffer.drain(0..){
-                                tx.send(p).await;
-                            }
-                            send_tx = Some(tx);
-                            new_stream = Some(rx);
+impl <T> Session<T> {
 
-                        },
-                        IO::Stream(false) => {send_tx = None;},
-                        IO::Recv(m) => { tx.send(m).await;},
-                        IO::Send(p) => { 
-                            if let Some(sender) = &send_tx {
-                                sender.send(p).await;
-                            }
-                            else {
-                                send_buffer.push(p);
-                            }   
-                        },
-                        IO::Wait(d) => { break Some(d) }
-                    }
-                },
-                None => break None// finished! 
-            }
-        };
-        // Send result back to input provider
-        if let Some(t) = res_tx { 
-            let res = match (err, new_stream) {
-                (Some(e), _ ) => Err(e),
-                (None, Some(rx)) => Ok(Some(rx)),
-                (None, None) => Ok(None)
-            };
-            t.send(res);
-        };
-
-        if let Some(nd) = next_deadline  { next_tick = nd; }
-        else { break } // finished
+    async fn send<P:TryInto<Payload, Error=PayloadDecodeError>>(&self, payload:P) -> Result<(),EngineError> {
+        let (res_tx, res_rx) = oneshot::channel();
+        let p = EngineInput::Data(payload.try_into());
+        self.tx.send((p,res_tx));
+        res_rx.await.unwrap_or_else(|_| Err(EngineError::Generic))
     }
 }
+
+impl <T> Stream for Session<T> {
+    type Item = Payload;
+    
+    fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        match this.rx.poll_recv(cx){
+            // TODO: WORK OUT PINNING API PLEASE 
+            Poll::Ready(None) => {
+                Poll::Ready(None)
+                //match this.handle.as_mut().poll(cx) {
+                //    Poll::Pending => Poll::Pending,
+                //    Poll::Ready(Ok(s)) => Poll::Ready(Some(Err(s))),
+                //    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(SessionCloseReason::Unknown)))
+                //}
+            },
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(p)) => Poll::Ready(Some(p))
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+       return (1, None) 
+    }
+}
+
+pub fn plex() -> () {
+    let (tx,rx) = tokio::sync::mpsc::channel(0);
+
+    tokio::spawn(async move {
+
+    });
+
+}
+
+
+pub fn create_session<T,Fut>(
+    engine: Engine<T>, 
+    transport: impl FnOnce(mpsc::Sender<(EngineInput<T::Receive>, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
+) -> Session<T::Send>
+where Fut: Future<Output = SessionCloseReason> + Send,
+      T:EngineStateEntity + Send + Unpin,
+      T::Receive: Send,
+      T::Send: Send
+      
+{
+    let (up_req, up_res) = engine_channel::<T::Send>();
+    let (down_req, down_res) = engine_channel::<T::Receive>();
+    let t = transport(down_req.0, down_req.1);
+
+    let handle = tokio::spawn(async move {
+        let e = tokio::spawn(bind_engine(engine, down_res, up_res));
+        let t = tokio::spawn(t);
+        tokio::select! {
+            t = &mut t => SessionCloseReason::Unknown,
+            engine = &mut t=> SessionCloseReason::Unknown
+        }
+        // HERE we should drain the engine as needed ...
+    });
+
+    return Session { handle, tx:up_req.0, rx:up_req.1 };
+}
+
+async fn bind_engine<T:EngineStateEntity>(mut engine:Engine<T>, down_stream:EngineChannelRes<T::Receive>, up_stream:EngineChannelRes<T::Send>) -> Engine<T> {
+    let (down_send, mut down_recv) = down_stream;
+    let (up_send, mut up_recv) = up_stream;
+    let config = TransportConfig::default();
+
+    loop {
+        let config = TransportConfig::default();
+        let now = tokio::time::Instant::now();        
+
+        let next = loop {
+            match engine.poll(now.into(), &config) {
+                Some(IO::Wait(d)) => {
+                    break Ok(Some(d))
+                }
+                Some(IO::Send(p)) => {
+                    if let Err(e) = down_send.send(Payload::Ping).await {
+                        break Err(IOError::SendError(e.0))
+                    }
+                },
+                Some(IO::Recv(p)) => {
+                    // We don't mind if upstream has dropped
+                    let _ = up_send.send(p).await;
+                }
+                Some(_) => {
+                    // we ingore others for now ...
+                }
+                None => {
+                    break(Ok(None))
+                }
+            }
+        };
+        let Ok(Some(next_deadline)) = next else { break };
+        let input = select! {
+            _ = tokio::time::sleep_until(next_deadline.into()) => None,
+            Some((up,tx)) = up_recv.recv() => Some((Either::A(up), tx)),
+            Some((down,tx)) = down_recv.recv() => Some((Either::B(down), tx)),
+        };
+        if let Some((p,res_tx)) = input {
+           res_tx.send(engine.input(p,now.into(),&config)); 
+        }
+    };
+    return engine
+
+}
+
+
+
+
 
 
 

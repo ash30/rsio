@@ -20,6 +20,9 @@ tokio-stream = { version = "0.1.14", optional = true, features = ["sync"] }
 actix-web = { version = "4.4.0", optional = true }
 actix-ws = { version = "0.2.5", optional = true }
 actix-rt = { optional = true }
+reqwest = { version = "0.11.25", optional = true } 
+url = { version = "2.5.0", optional = true }
+pin-project = "1.1.5"
 
 [dev-dependencies]
 # Examples Shared 
@@ -30,9 +33,12 @@ env_logger = "0.10.0"
 actix-rt = "2.9.0"
 
 [features]
-default = ["actix"]
+default = ["actix", "reqwest"]
+client = ["dep:url"]
 async = ["dep:tokio", "dep:tokio-stream", "dep:futures-util"]
 actix = ["dep:actix-ws", "dep:actix-web", "dep:actix-rt", "async"]
+# TODO: can we just reimport url from requests ?
+reqwest = ["dep:reqwest", "async", "client"]
 
 [[example]]
 name = "actix"

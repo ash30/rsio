@@ -1,12 +1,11 @@
 use std::{collections::VecDeque, time::{Instant, Duration}};
-use crate::{transport::{
+use crate::transport::{
     Heartbeat, 
     Transport, 
     TransportKind, 
     PollingState,
-    TransportError, 
     Connection
-}, Either};
+};
 
 use crate::engine::{
     EngineIOClientCtrls,
@@ -29,8 +28,8 @@ impl EngineIOServer {
 }
 
 impl EngineStateEntity for EngineIOServer {
-    type Sender = EngineIOServerCtrls;
-    type Receiver = EngineIOClientCtrls;
+    type Send = EngineIOServerCtrls;
+    type Receive = EngineIOClientCtrls;
 
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState> {
         match &self.0 {
@@ -67,7 +66,7 @@ impl EngineStateEntity for EngineIOServer {
         }
     }
 
-    fn send(&self, input:&EngineInput<Self::Sender>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
+    fn send(&self, input:&EngineInput<Self::Send>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
         match input {
             EngineInput::Data(_) => {
                 match &self.0 {
@@ -86,67 +85,62 @@ impl EngineStateEntity for EngineIOServer {
         }
     }
     
-    fn recv(&self, input:&Either<EngineInput<Self::Receiver>,TransportError>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
-
+    fn recv(&self, input:&EngineInput<Self::Receive>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
         match &input {
-            Either::A(input) => match input {
-                EngineInput::Data(Err(e)) => {
-                    Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::UnknownPayload)))
-                },
-                EngineInput::Data(Ok(p)) => {
-                    match &self.0 {
-                        EngineState::Connected(state) => {
-                            match p {
-                                Payload::Close(..) => Ok(EngineState::Closed(EngineCloseReason::ClientClose)),
-                                _ => Ok(EngineState::Connected(state.clone().update(|_,heartbeat| heartbeat.seen_at(now)))
-    )
-                            }
-                        },
-                        _ => {
-                            Err(EngineError::AlreadyClosed)
+            EngineInput::Data(Err(e)) => {
+                Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::UnknownPayload)))
+            },
+            EngineInput::Data(Ok(p)) => {
+                match &self.0 {
+                    EngineState::Connected(state) => {
+                        match p {
+                            Payload::Close(..) => Ok(EngineState::Closed(EngineCloseReason::ClientClose)),
+                            _ => Ok(EngineState::Connected(state.clone().update(|_,heartbeat| heartbeat.seen_at(now)))
+)
                         }
-                    }
-                },
-                EngineInput::Control(EngineIOClientCtrls::Poll) => {
-                    match &self.0 {
-                        EngineState::Connected(s) => {
-                            match &s.0 {
-                                Transport::Polling(PollingState { active:Some(..), ..}) => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll))),
-                                Transport::Polling(PollingState{ active:None, ..}) => {
-                                    Ok(EngineState::Connected(s.clone().update(|t,h| {
-                                        h.seen_at(now);
-                                        t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(config.ping_timeout)));
-                                    })))
-                                },
-                                Transport::Continuous => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll)))
-                            }
-                        },
-                        _ => Err(EngineError::AlreadyClosed)
-                    }
-                },
-                // Transport has closed without sending payload
-                EngineInput::Control(EngineIOClientCtrls::Close) => {
-                    Ok(EngineState::Closed(EngineCloseReason::ClientClose))
-                },
-
-                EngineInput::Control(EngineIOClientCtrls::New(kind)) => {
-                    match &self.0 {
-                        EngineState::Connecting { start_time } => todo!(),
-                        EngineState::New{ .. }  => { 
-                            let t = match kind {
-                                TransportKind::Poll => Transport::Polling(PollingState::default()),
-                                TransportKind::Continuous => Transport::Continuous
-                            };
-                            Ok(EngineState::Connected(Connection::new(t, now)))
-                        },
-                        EngineState::Connected(..) => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::Generic))),
-                        EngineState::Closed(e) => Err(EngineError::AlreadyClosed)
+                    },
+                    _ => {
+                        Err(EngineError::AlreadyClosed)
                     }
                 }
-            }.map(|r| Some(r)),
+            },
+            EngineInput::Control(EngineIOClientCtrls::Poll) => {
+                match &self.0 {
+                    EngineState::Connected(s) => {
+                        match &s.0 {
+                            Transport::Polling(PollingState { active:Some(..), ..}) => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll))),
+                            Transport::Polling(PollingState{ active:None, ..}) => {
+                                Ok(EngineState::Connected(s.clone().update(|t,h| {
+                                    h.seen_at(now);
+                                    t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(config.ping_timeout)));
+                                })))
+                            },
+                            Transport::Continuous => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll)))
+                        }
+                    },
+                    _ => Err(EngineError::AlreadyClosed)
+                }
+            },
+            // Transport has closed without sending payload
+            EngineInput::Control(EngineIOClientCtrls::Close) => {
+                Ok(EngineState::Closed(EngineCloseReason::ClientClose))
+            },
 
-            Either::B(error) => Ok(None)
-        }
+            EngineInput::Control(EngineIOClientCtrls::New(kind)) => {
+                match &self.0 {
+                    EngineState::Connecting { start_time } => todo!(),
+                    EngineState::New{ .. }  => { 
+                        let t = match kind {
+                            TransportKind::Poll => Transport::Polling(PollingState::default()),
+                            TransportKind::Continuous => Transport::Continuous
+                        };
+                        Ok(EngineState::Connected(Connection::new(t, now)))
+                    },
+                    EngineState::Connected(..) => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::Generic))),
+                    EngineState::Closed(e) => Err(EngineError::AlreadyClosed)
+                }
+            }
+        }.map(|r| Some(r))
     }
 
     fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<IO>, config:&TransportConfig) -> &EngineState {

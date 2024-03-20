@@ -1,5 +1,20 @@
 use std::{collections::VecDeque, time::{Instant, Duration}};
-use crate::{Sid, IO, EngineState, EngineInput, EngineIOClientCtrls, EngineError, ConnectedState, Transport, PollingState, TransportConfig, EngineCloseReason, EngineIOServerCtrls, EngineStateEntity};
+
+use crate::engine::EngineState;
+use crate::engine::EngineError;
+use crate::engine::EngineCloseReason;
+use crate::engine::EngineInput;
+use crate::engine::IO;
+use crate::engine::EngineIOClientCtrls;
+use crate::engine::EngineIOServerCtrls;
+use crate::engine::EngineStateEntity;
+use crate::engine::Engine;
+use crate::transport::TransportKind;
+use crate::proto::TransportConfig;
+use crate::proto::Sid;
+use crate::transport::Transport;
+use crate::transport::PollingState;
+use crate::transport::Connection;
 
 pub (crate) struct EngineIOClient(EngineState, Option<Sid>);
 
@@ -10,8 +25,8 @@ impl EngineIOClient {
 }
 
 impl EngineStateEntity for EngineIOClient {
-    type Receiver = EngineIOServerCtrls;
-    type Sender = EngineIOClientCtrls;
+    type Receive = EngineIOServerCtrls;
+    type Send = EngineIOClientCtrls;
 
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState> {
         todo!()
@@ -26,7 +41,7 @@ impl EngineStateEntity for EngineIOClient {
             },
             EngineInput::Control(EngineIOClientCtrls::Poll) => {
                 match &self.0 {
-                    EngineState::Connected(s@ConnectedState(Transport::Polling(PollingState { active:None, count }),_)) => {
+                    EngineState::Connected(s@Connection(Transport::Polling(PollingState { active:None, count }),_)) => {
                         Ok(Some(EngineState::Connected(s.clone().update(|t,h| {
                             t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(config.ping_interval)));
                         }))))
