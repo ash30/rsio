@@ -1,13 +1,14 @@
 use tokio::time::Instant;
-use actix_web::{guard, web, HttpResponse, Resource, Either, ResponseError};
+use actix_web::{guard, web, HttpResponse, Resource, ResponseError};
 use tokio_stream::StreamExt;
-use crate::io::{self, SessionCloseReason, create_session_local};
+use crate::io::{self, SessionCloseReason, create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::server::EngineIOServer;
 use crate::transport::{TransportKind};
 use crate::engine::{EngineError, self, Engine, EngineIOClientCtrls, EngineInput};
 
 pub use crate::proto::TransportConfig;
+pub type IOEngine = Session<EngineIOClientCtrls>;
 
 #[derive(serde::Deserialize)]
 struct SessionInfo {
@@ -48,7 +49,7 @@ impl actix_web::ResponseError for EngineError {
 
 }
 
-fn engine_io(path:actix_web::Resource, config:TransportConfig) -> Resource {
+pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:impl Fn(IOEngine)) -> Resource {
     let polling = io::create_multiplex();
 
     let path = { 

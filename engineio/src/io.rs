@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::task::Poll;
 use futures_util::Future;
 use futures_util::Stream;
+use futures_util::TryFutureExt;
 use tokio::select;
 use tokio::time::Instant;
 use crate::engine::EngineIOClientCtrls;
@@ -60,10 +61,10 @@ pub enum SessionCloseReason {
 
 impl <T> Session<T> {
 
-    async fn send<P:TryInto<Payload, Error=PayloadDecodeError>>(&self, payload:P) -> Result<(),EngineError> {
+    pub async fn send(&self, payload:Payload) -> Result<(),EngineError> {
         let (res_tx, res_rx) = oneshot::channel();
-        let p = EngineInput::Data(payload.try_into());
-        self.tx.send((p,res_tx));
+        let p = EngineInput::Data(Ok(payload));
+        self.tx.send((p,res_tx)).map_err(|e|EngineError::Generic).await?;
         res_rx.await.unwrap_or_else(|_| Err(EngineError::Generic))
     }
 }
@@ -121,9 +122,9 @@ impl MultiPlex {
 }
 
 pub fn create_multiplex() -> MultiPlex {
-    let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session<EngineIOClientCtrls>>)>(0);
-    let mut input_data = mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>(0);
-    let mut input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(0);
+    let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session<EngineIOClientCtrls>>)>(1024);
+    let mut input_data = mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>(1024);
+    let mut input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(1024);
 
     tokio::spawn(async move {
         let mut tx_map: HashMap<Sid,mpsc::Sender<(EngineInput<EngineIOClientCtrls>,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();

@@ -1,26 +1,20 @@
 use actix_web::{middleware::Logger, App, HttpServer };
-use engineio::adapters::actix::{TransportConfig};
+use engineio::adapters::actix::{engine_io, IOEngine, TransportConfig};
 use futures_util::StreamExt;
-use futures_util::Stream;
 use futures_util::pin_mut;
 
-struct NewConnectionManager {}
-impl ConnectionService for NewConnectionManager {
-    fn new_connection<S:Stream<Item=Result<MessageData,engineio::EngineCloseReason>> +'static + Send>(&self, stream:S, emit:Session) {
-
-        tokio::spawn(async move {
-            pin_mut!(stream);
-            loop {
-                match stream.next().await {
-                    None => break,
-                    Some(Ok(data)) => { 
-                        emit.send(data).await;
-                    },
-                    _ => {}
+fn on_connection(connection:IOEngine) {
+    tokio::spawn(async move {
+        pin_mut!(connection);
+        loop {
+            match connection.next().await {
+                None => break,
+                Some(data) => {
+                    connection.send(data).await;
                 }
-            }
-        });
-    }
+            };
+        }
+    });
 }
 
 #[actix_web::main]
@@ -37,7 +31,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || 
            App::new()
            .wrap(Logger::default())
-           .service(socket_io(actix_web::Resource::new("/engine.io/"), config, NewConnectionManager {} ))
+           .service(engine_io(actix_web::Resource::new("/engine.io/"), config, on_connection ))
         )
         .workers(1)
         .bind(("127.0.0.1", 3000))?
