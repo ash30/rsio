@@ -156,30 +156,30 @@ impl EngineStateEntity for EngineIOServer {
                     "pingTimeout": config.ping_timeout,
                     "sid":  self.1
                 });
-                out_buffer.push_back(IO::Stream(true));
+                //out_buffer.push_back(IO::Stream(true));
                 out_buffer.push_back(IO::Send(Payload::Open(serde_json::to_vec(&data).unwrap())));
                 if let Transport::Polling { .. } = t { 
-                    out_buffer.push_back(IO::Stream(false));
+                    //out_buffer.push_back(IO::Stream(false));
                 };
             },
 
             // Polling Start 
             (EngineState::Connected(Connection(Transport::Polling(PollingState { active:None, .. }),_)),
              EngineState::Connected(Connection(Transport::Polling(PollingState { active:Some(..), ..}),_))) => { 
-                out_buffer.push_back(IO::Stream(true));
+                //out_buffer.push_back(IO::Stream(true));
             }
             
             // Polling End
             (EngineState::Connected(Connection(Transport::Polling(PollingState { active:Some(..), count}),_)),
              EngineState::Connected(Connection(Transport::Polling(PollingState { active:None, .. }),_))) => {
                 if *count == 0 { out_buffer.push_back(IO::Send(Payload::Ping));}
-                out_buffer.push_back(IO::Stream(false));
+                //out_buffer.push_back(IO::Stream(false));
             },
 
             // websocket ping pong
             (EngineState::Connected(Connection(Transport::Continuous, Heartbeat { last_ping:None, .. })),
             EngineState::Connected(Connection(Transport::Continuous, Heartbeat { last_ping:Some(_), .. }))) => {
-                out_buffer.push_back(IO::Send(Payload::Ping));
+                //out_buffer.push_back(IO::Send(Payload::Ping));
             },
 
             // Close
@@ -190,12 +190,12 @@ impl EngineStateEntity for EngineIOServer {
                     },
                     _ => {}
                 }
-                out_buffer.push_back(IO::Stream(false));
+                //out_buffer.push_back(IO::Stream(false));
             },
 
             (_, EngineState::Closed(reason)) => {
                 out_buffer.push_back(IO::Send(Payload::Close(reason.clone())));
-                out_buffer.push_back(IO::Stream(false));
+                //out_buffer.push_back(IO::Stream(false));
             },
             _ => {}
         };

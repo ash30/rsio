@@ -1,6 +1,5 @@
 use actix_web::{middleware::Logger, App, HttpServer };
-use engineio::{TransportConfig, MessageData};
-use engineio::adapters::actix::{ socket_io, ConnectionService, Session};
+use engineio::adapters::actix::{TransportConfig};
 use futures_util::StreamExt;
 use futures_util::Stream;
 use futures_util::pin_mut;

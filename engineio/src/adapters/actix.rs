@@ -1,12 +1,13 @@
 use tokio::time::Instant;
-use tokio_stream::StreamExt;
 use actix_web::{guard, web, HttpResponse, Resource, Either, ResponseError};
+use tokio_stream::StreamExt;
 use crate::io::{self, SessionCloseReason, create_session_local};
-use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData, TransportConfig};
+use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::server::EngineIOServer;
 use crate::transport::{TransportKind};
 use crate::engine::{EngineError, self, Engine, EngineIOClientCtrls, EngineInput};
 
+pub use crate::proto::TransportConfig;
 
 #[derive(serde::Deserialize)]
 struct SessionInfo {
@@ -62,7 +63,7 @@ fn engine_io(path:actix_web::Resource, config:TransportConfig) -> Resource {
                 async move {
                     let sid = uuid::Uuid::new_v4();
                     let engine = Engine::new(EngineIOServer::new(sid,Instant::now().into()));
-                    let session = create_session_local(engine, |tx,rx| {
+                    let session = create_session_local(engine, |tx,mut rx| {
                         async move {
                             loop {
                                 tokio::select! {

@@ -103,7 +103,7 @@ pub struct MultiPlex {
 impl MultiPlex {
     pub async fn create(&self, sid:Sid) -> Result<Session<EngineIOClientCtrls>, EngineError> {
         let res = oneshot::channel();
-        self.tx_new.send((sid, res.0));
+        self.tx_new.send((sid, res.0)).await;
         res.1.await.map_err(|_| EngineError::Generic).map(|s| Ok(s))?
     }
 
@@ -115,27 +115,32 @@ impl MultiPlex {
 
     pub async fn listen(&self, sid:Sid) -> Result<Vec<Payload>,EngineError> {
         let res = oneshot::channel();
-        self.tx_listen.send((sid, res.0));
+        self.tx_listen.send((sid, res.0)).await;
         res.1.await.map_err(|_| EngineError::Generic)?
     }
 }
 
 pub fn create_multiplex() -> MultiPlex {
-    let tx_map: HashMap<Sid,mpsc::Sender<(EngineInput<EngineIOClientCtrls>,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();
-    let rx_map: HashMap<Sid,mpsc::Receiver<Payload>>;
-    let input_new = mpsc::channel::<(Sid, oneshot::Sender<Session<EngineIOClientCtrls>>)>(0);
-    let input_data = mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>(0);
-    let input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(0);
+    let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session<EngineIOClientCtrls>>)>(0);
+    let mut input_data = mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>(0);
+    let mut input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(0);
 
     tokio::spawn(async move {
+        let mut tx_map: HashMap<Sid,mpsc::Sender<(EngineInput<EngineIOClientCtrls>,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();
+        let mut rx_map: HashMap<Sid,mpsc::Receiver<Payload>> = HashMap::new();
+        let mut in_flight = tokio::task::JoinSet::<mpsc::Receiver<Payload>>::new();
+
         loop {
             tokio::select! {
                 Some((sid,tx)) = input_new.1.recv() => {
                     let engine = Engine::new(EngineIOServer::new(sid, Instant::now().into()));
                     //let (close_tx, close_rx) = oneshot::channel();
+                    //
+                    let a = &mut tx_map;
+                    let b= &mut rx_map;
                     let session = create_session(engine, |tx,rx| {
-                        tx_map.insert(sid, tx);
-                        rx_map.insert(sid, rx);
+                        a.insert(sid, tx);
+                        b.insert(sid, rx);
                         // TODO: return proper close 
                         return async move {
                             return SessionCloseReason::Unknown
@@ -149,24 +154,31 @@ pub fn create_multiplex() -> MultiPlex {
                         continue
                     };
                     // Don't block main loop
-                    tokio::spawn(t.send((data,tx)));
+                    let x = (*t).clone();
+                    tokio::spawn(async move {
+                        x.send((data,tx)).await
+                    });
                 },
                 Some((sid,tx)) = input_listen.1.recv() => {
-                    let Some(r) = rx_map.get(&sid) else { 
+                    if !rx_map.contains_key(&sid) {
                         tx.send(Err(EngineError::Generic));
-                        continue
-                    };
-                    tokio::spawn(async move {
+                        continue 
+                    }   
+                    let (replace_tx,replace_rx) = mpsc::channel(0);
+                    let mut rx = rx_map.remove(&sid).unwrap();
+                    rx_map.insert(sid, replace_rx);
+                    
+                    in_flight.spawn(async move {
                         let mut res:Vec<Payload> = vec![];
-                        let Some(first) = r.recv().await else { 
+                        let Some(first) = rx.recv().await else { 
                             tx.send(Err(EngineError::Generic));
-                            return
+                            return rx
                         };
                         res.push(first);
                         loop {
                             tokio::select! {
                                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {},
-                                output = r.recv() => {
+                                output = rx.recv() => {
                                     match output {
                                         None => break,
                                         Some(o) => res.push(o)
@@ -175,6 +187,7 @@ pub fn create_multiplex() -> MultiPlex {
                             }
                         }
                         tx.send(Ok(res));
+                        rx
                     });
                 },
                 else => break
@@ -191,15 +204,12 @@ pub fn create_multiplex() -> MultiPlex {
     
 }
 
-
-
-
 pub fn create_session<T,Fut>(
     engine: Engine<T>, 
     transport: impl FnOnce(mpsc::Sender<(EngineInput<T::Receive>, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
 ) -> Session<T::Send>
-where Fut: Future<Output = SessionCloseReason> + Send,
-      T:EngineStateEntity + Send + Unpin,
+where Fut: Future<Output = SessionCloseReason> + Send + 'static,
+      T:EngineStateEntity + Send + Unpin + 'static,
       T::Receive: Send,
       T::Send: Send
 {
@@ -208,10 +218,10 @@ where Fut: Future<Output = SessionCloseReason> + Send,
     let t = transport(down_req.0, down_req.1);
 
     let handle = tokio::spawn(async move {
-        let e = tokio::spawn(bind_engine(engine, down_res, up_res));
-        let t = tokio::spawn(t);
+        let mut e = tokio::spawn(bind_engine(engine, down_res, up_res));
+        let mut t = tokio::spawn(t);
         tokio::select! {
-            t = &mut t => SessionCloseReason::Unknown,
+            t = &mut e => SessionCloseReason::Unknown,
             engine = &mut t=> SessionCloseReason::Unknown
         }
         // HERE we should drain the engine as needed ...
@@ -220,13 +230,12 @@ where Fut: Future<Output = SessionCloseReason> + Send,
     return Session { handle, tx:up_req.0, rx:up_req.1 };
 }
 
-// TODO: Can we refactor this ??
 pub fn create_session_local<T,Fut>(
     engine: Engine<T>, 
     transport: impl FnOnce(mpsc::Sender<(EngineInput<T::Receive>, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
 ) -> Session<T::Send>
-where Fut: Future<Output = SessionCloseReason>,
-      T:EngineStateEntity + Send + Unpin,
+where Fut: Future<Output = SessionCloseReason> + 'static,
+      T:EngineStateEntity + Send + Unpin + 'static,
       T::Receive: Send,
       T::Send: Send
 {
@@ -235,10 +244,10 @@ where Fut: Future<Output = SessionCloseReason>,
     let t = transport(down_req.0, down_req.1);
 
     let handle = tokio::task::spawn_local(async move {
-        let e = tokio::spawn(bind_engine(engine, down_res, up_res));
-        let t = tokio::task::spawn_local(t);
+        let mut e = tokio::spawn(bind_engine(engine, down_res, up_res));
+        let mut t = tokio::task::spawn_local(t);
         tokio::select! {
-            t = &mut t => SessionCloseReason::Unknown,
+            t = &mut e => SessionCloseReason::Unknown,
             engine = &mut t=> SessionCloseReason::Unknown
         }
         // HERE we should drain the engine as needed ...
