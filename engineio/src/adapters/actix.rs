@@ -5,10 +5,10 @@ use crate::io::{self, SessionCloseReason, create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::server::EngineIOServer;
 use crate::transport::{TransportKind};
-use crate::engine::{EngineError, self, Engine, EngineIOClientCtrls, EngineInput};
+use crate::engine::{EngineError, self, Engine, EngineIOClientCtrls, EngineInput, EngineIOServerCtrls};
 
 pub use crate::proto::TransportConfig;
-pub type IOEngine = Session<EngineIOClientCtrls>;
+pub type IOEngine = Session<EngineIOServerCtrls>;
 
 #[derive(serde::Deserialize)]
 struct SessionInfo {
@@ -49,7 +49,7 @@ impl actix_web::ResponseError for EngineError {
 
 }
 
-pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:impl Fn(IOEngine)) -> Resource {
+pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IOEngine)) -> Resource {
     let polling = io::create_multiplex();
 
     let path = { 
@@ -69,28 +69,33 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:impl 
                             loop {
                                 tokio::select! {
                                     recv = msg_stream.next() => {
-                                        let Some(r) = recv else { break };
+                                        let Some(r) = recv else { break SessionCloseReason::TransportClose};
                                         let res = tokio::sync::oneshot::channel();
                                         let input  = match r {
                                             Ok(m) => EngineInput::Data(m.try_into()),
-                                            Err(e) => EngineInput::Control(EngineIOClientCtrls::Close)
+                                            Err(_) => EngineInput::Data(Err(PayloadDecodeError::InvalidFormat))
                                         };
-                                        let s = tx.send((input,res.0)).await;
+                                        if let Err(_) =  tx.send((input,res.0)).await {
+                                            break SessionCloseReason::Unknown;
+                                        }
+                                        if let Err(_) = res.1.await {
+                                            break SessionCloseReason::Unknown;
+                                        }
                                     },
                                     send = rx.recv() => {
-                                        let Some(s) = send else { break };
+                                        let Some(s) = send else { break SessionCloseReason::Unknown } ;
                                         let d = s.encode(TransportKind::Continuous);
-                                        let _ = match s {
+                                        let res = match s {
                                             Payload::Message(MessageData::Binary(..)) => session.binary(d).await,
                                             _ => session.text(String::from_utf8(d).unwrap()).await
                                         };
+                                        if let Err(_) = res { break SessionCloseReason::TransportClose } 
                                     }
                                 } 
                             }
-                            //TODO 
-                            SessionCloseReason::Unknown
                         }
                     } );
+                    service(session);
                     return Ok::<HttpResponse, EngineError>(response);
                 }
             })
@@ -107,8 +112,10 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:impl 
                 let polling = polling.clone();
                 async move {
                     let sid = Sid::new_v4();
-                    let session = polling.create(sid).await;
-                    // DO something with session
+                    let Ok(session) = polling.create(sid).await else {
+                        return HttpResponse::InternalServerError().finish();
+                    };
+                    service(session);
                     match polling.listen(sid).await {
                         Ok(vec) => HttpResponse::Ok().body(Payload::encode_combined(&vec, TransportKind::Poll)),
                         Err(e) => e.error_response()

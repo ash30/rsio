@@ -7,7 +7,7 @@ use futures_util::TryFutureExt;
 use tokio::select;
 use tokio::time::Instant;
 use crate::engine::EngineIOClientCtrls;
-use crate::proto::PayloadDecodeError;
+use crate::engine::EngineIOServerCtrls;
 use crate::proto::Payload;
 use crate::proto::Sid;
 use crate::proto::TransportConfig;
@@ -28,11 +28,9 @@ pub enum Either<A,B> {
 }
 
 pub enum IOError<T> {
-    InternalError,
     SendError(T),
-    TransportError(T)
 }
-pub enum IOCloseReason {}
+
 type EngineChannelReq<T,R,E> = (mpsc::Sender<(T, oneshot::Sender<Result<(),E>>)>, mpsc::Receiver<R>);
 type EngineChannelRes<T,R,E> = (mpsc::Sender<R>, mpsc::Receiver<(T, oneshot::Sender<Result<(),E>>)>);
 type EngineChannelPair<T,R,E> = (EngineChannelReq<T,R,E>, EngineChannelRes<T,R,E>);
@@ -56,7 +54,8 @@ pub struct Session<T> {
 }
 
 pub enum SessionCloseReason {
-    Unknown
+    Unknown,
+    TransportClose
 }
 
 impl <T> Session<T> {
@@ -96,13 +95,13 @@ impl <T> Stream for Session<T> {
 
 #[derive(Clone)]
 pub struct MultiPlex {
-    tx_new: mpsc::Sender<(Sid, oneshot::Sender<Session<EngineIOClientCtrls>>)>,
+    tx_new: mpsc::Sender<(Sid, oneshot::Sender<Session<EngineIOServerCtrls>>)>,
     tx_input: mpsc::Sender<(Sid,EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>,
     tx_listen: mpsc::Sender<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>
 }
 
 impl MultiPlex {
-    pub async fn create(&self, sid:Sid) -> Result<Session<EngineIOClientCtrls>, EngineError> {
+    pub async fn create(&self, sid:Sid) -> Result<Session<EngineIOServerCtrls>, EngineError> {
         let res = oneshot::channel();
         self.tx_new.send((sid, res.0)).await;
         res.1.await.map_err(|_| EngineError::Generic).map(|s| Ok(s))?
@@ -122,7 +121,7 @@ impl MultiPlex {
 }
 
 pub fn create_multiplex() -> MultiPlex {
-    let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session<EngineIOClientCtrls>>)>(1024);
+    let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session<EngineIOServerCtrls>>)>(1024);
     let mut input_data = mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>(1024);
     let mut input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(1024);
 
@@ -135,34 +134,38 @@ pub fn create_multiplex() -> MultiPlex {
             tokio::select! {
                 Some((sid,tx)) = input_new.1.recv() => {
                     let engine = Engine::new(EngineIOServer::new(sid, Instant::now().into()));
-                    //let (close_tx, close_rx) = oneshot::channel();
-                    //
-                    let a = &mut tx_map;
-                    let b= &mut rx_map;
                     let session = create_session(engine, |tx,rx| {
-                        a.insert(sid, tx);
-                        b.insert(sid, rx);
-                        // TODO: return proper close 
+                        let _ = &tx_map.insert(sid, tx);
+                        let _ = &rx_map.insert(sid, rx);
                         return async move {
                             return SessionCloseReason::Unknown
                         }
                     });
-                    //tx.send(session);
+                    if let Err(session) = tx.send(session) {
+                        // failed to send back session, clean up please
+                       drop(session);
+                       let _ = tx_map.remove(&sid);
+                       let _ = rx_map.remove(&sid);
+                    }
                 },
                 Some((sid,data,tx)) = input_data.1.recv() => {
                     let Some(t) = tx_map.get(&sid) else { 
-                        tx.send(Err(EngineError::Generic));
+                        let _ = tx.send(Err(EngineError::MissingSession));
                         continue
                     };
                     // Don't block main loop
-                    let x = (*t).clone();
+                    let sender = (*t).clone();
                     tokio::spawn(async move {
-                        x.send((data,tx)).await
+                        // IF we fail to send to engine, assume its dead?
+                        if let Err(e) = sender.send((data,tx)).await {
+                            let (_,tx) = e.0;
+                            let _ = tx.send(Err(EngineError::Generic));
+                        }
                     });
                 },
                 Some((sid,tx)) = input_listen.1.recv() => {
                     if !rx_map.contains_key(&sid) {
-                        tx.send(Err(EngineError::Generic));
+                        tx.send(Err(EngineError::MissingSession));
                         continue 
                     }   
                     let (replace_tx,replace_rx) = mpsc::channel(0);
