@@ -174,7 +174,7 @@ impl EngineStateEntity for EngineIOServer {
             // websocket ping pong
             (EngineState::Connected(Connection(Transport::Continuous, Heartbeat { last_ping:None, .. })),
             EngineState::Connected(Connection(Transport::Continuous, Heartbeat { last_ping:Some(_), .. }))) => {
-                //out_buffer.push_back(IO::Send(Payload::Ping));
+                out_buffer.push_back(IO::Send(Payload::Ping));
             },
 
             // Close

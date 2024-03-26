@@ -1,10 +1,10 @@
 use tokio::time::Instant;
 use actix_web::{guard, web, HttpResponse, Resource, ResponseError};
 use tokio_stream::StreamExt;
-use crate::io::{self, SessionCloseReason, create_session_local, Session, Either};
+use crate::io::{self, SessionCloseReason, create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::server::EngineIOServer;
-use crate::transport::{TransportKind};
+use crate::transport::TransportKind;
 use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal};
 
 pub use crate::proto::TransportConfig;
@@ -50,7 +50,7 @@ impl actix_web::ResponseError for EngineError {
 }
 
 pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IOEngine)) -> Resource {
-    let polling = io::create_multiplex();
+    let polling = io::create_multiplex(config.clone());
 
     let path = { 
         path.route(
@@ -67,7 +67,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                     let mut engine = Engine::new(EngineIOServer::new(sid,Instant::now().into()));
                     engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Continuous)), Instant::now().into(), &config);
 
-                    let session = create_session_local(engine, |tx,mut rx| {
+                    let session = create_session_local(engine, config.clone(), |tx,mut rx| {
                         async move {
                             //tx.send(EngineInput::Control(EngineIOClientCtrls::New(TransportKind::Continuous))).await;
                             loop {

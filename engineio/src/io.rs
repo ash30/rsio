@@ -19,11 +19,6 @@ use std::pin::Pin;
 use tokio::sync::oneshot;
 use tokio::sync::mpsc;
 
-#[derive(Debug)]
-pub enum Either<A,B> {
-    A(A),
-    B(B)
-}
 
 pub enum IOError<T> {
     SendError(T),
@@ -118,7 +113,7 @@ impl MultiPlex {
     }
 }
 
-pub fn create_multiplex() -> MultiPlex {
+pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
     let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session>)>(1024);
     let mut input_data = mpsc::channel::<(Sid, EngineInput, oneshot::Sender<Result<(),EngineError>>)>(1024);
     let mut input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(1024);
@@ -132,7 +127,7 @@ pub fn create_multiplex() -> MultiPlex {
             tokio::select! {
                 Some((sid,tx)) = input_new.1.recv() => {
                     let engine = Engine::new(EngineIOServer::new(sid, Instant::now().into()));
-                    let session = create_session(engine, |tx,rx| {
+                    let session = create_session(engine, config, |tx,rx| {
                         let _ = &tx_map.insert(sid, tx);
                         let _ = &rx_map.insert(sid, rx);
                         return async move {
@@ -208,6 +203,7 @@ pub fn create_multiplex() -> MultiPlex {
 
 pub fn create_session<T,Fut>(
     engine: Engine<T>, 
+    config: TransportConfig,
     transport: impl FnOnce(mpsc::Sender<(EngineInput, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
 ) -> Session
 where Fut: Future<Output = SessionCloseReason> + Send + 'static,
@@ -218,7 +214,7 @@ where Fut: Future<Output = SessionCloseReason> + Send + 'static,
     let t = transport(down_req.0, down_req.1);
 
     let handle = tokio::spawn(async move {
-        let mut e = tokio::spawn(bind_engine(engine, down_res, up_res));
+        let mut e = tokio::spawn(bind_engine(engine, config, down_res, up_res));
         let mut t = tokio::spawn(t);
         tokio::select! {
             t = &mut e => SessionCloseReason::Unknown,
@@ -232,6 +228,7 @@ where Fut: Future<Output = SessionCloseReason> + Send + 'static,
 
 pub fn create_session_local<T,Fut>(
     engine: Engine<T>, 
+    config: TransportConfig,
     transport: impl FnOnce(mpsc::Sender<(EngineInput, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
 ) -> Session
 where Fut: Future<Output = SessionCloseReason> + 'static,
@@ -242,7 +239,7 @@ where Fut: Future<Output = SessionCloseReason> + 'static,
     let t = transport(down_req.0, down_req.1);
 
     let handle = tokio::task::spawn_local(async move {
-        let mut e = tokio::spawn(bind_engine(engine, down_res, up_res));
+        let mut e = tokio::spawn(bind_engine(engine, config, down_res, up_res));
         let mut t = tokio::task::spawn_local(t);
         tokio::select! {
             t = &mut e => SessionCloseReason::Unknown,
@@ -256,6 +253,7 @@ where Fut: Future<Output = SessionCloseReason> + 'static,
 
 async fn bind_engine<T:EngineStateEntity>(
     mut engine:Engine<T>,
+    mut config:TransportConfig,
     down_stream:EngineChannelRes<EngineInput,Payload,EngineError>,
     up_stream:EngineChannelRes<EngineInput,Payload,EngineError>) -> Engine<T>
 {
@@ -263,9 +261,7 @@ async fn bind_engine<T:EngineStateEntity>(
     let (up_send, mut up_recv) = up_stream;
 
     loop {
-        let config = TransportConfig::default();
         let now = tokio::time::Instant::now();        
-
         let next = loop {
             dbg!();
             match engine.poll(now.into(), &config) {
@@ -280,9 +276,6 @@ async fn bind_engine<T:EngineStateEntity>(
                 Some(IO::Recv(p)) => {
                     // We don't mind if upstream has dropped
                     let _ = up_send.send(p).await;
-                }
-                Some(_) => {
-                    // we ingore others for now ...
                 }
                 None => {
                     break(Ok(None))
