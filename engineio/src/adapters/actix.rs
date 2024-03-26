@@ -1,14 +1,14 @@
 use tokio::time::Instant;
 use actix_web::{guard, web, HttpResponse, Resource, ResponseError};
 use tokio_stream::StreamExt;
-use crate::io::{self, SessionCloseReason, create_session_local, Session};
+use crate::io::{self, SessionCloseReason, create_session_local, Session, Either};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::server::EngineIOServer;
 use crate::transport::{TransportKind};
-use crate::engine::{EngineError, self, Engine, EngineIOClientCtrls, EngineInput, EngineIOServerCtrls};
+use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal};
 
 pub use crate::proto::TransportConfig;
-pub type IOEngine = Session<EngineIOServerCtrls>;
+pub type IOEngine = Session;
 
 #[derive(serde::Deserialize)]
 struct SessionInfo {
@@ -62,10 +62,14 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
             .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
                 async move {
+                    dbg!();
                     let sid = uuid::Uuid::new_v4();
-                    let engine = Engine::new(EngineIOServer::new(sid,Instant::now().into()));
+                    let mut engine = Engine::new(EngineIOServer::new(sid,Instant::now().into()));
+                    engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Continuous)), Instant::now().into(), &config);
+
                     let session = create_session_local(engine, |tx,mut rx| {
                         async move {
+                            //tx.send(EngineInput::Control(EngineIOClientCtrls::New(TransportKind::Continuous))).await;
                             loop {
                                 tokio::select! {
                                     recv = msg_stream.next() => {
@@ -140,7 +144,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };
-                    if let Err(err) = polling.input(sid, engine::EngineInput::Control(EngineIOClientCtrls::Poll)).await {
+                    if let Err(_) = polling.input(sid, engine::EngineInput::Control(EngineSignal::Poll)).await {
                         return (EngineError::MissingSession).error_response()
                     }
                     match polling.listen(sid).await {

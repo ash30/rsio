@@ -1,15 +1,13 @@
 use std::{collections::VecDeque, time::{Instant, Duration}};
-use crate::transport::{
+use crate::{transport::{
     Heartbeat, 
     Transport, 
     TransportKind, 
     PollingState,
     Connection
-};
+}, engine::EngineSignal};
 
 use crate::engine::{
-    EngineIOClientCtrls,
-    EngineIOServerCtrls,
     IO,
     EngineInput,
     EngineCloseReason,
@@ -28,9 +26,6 @@ impl EngineIOServer {
 }
 
 impl EngineStateEntity for EngineIOServer {
-    type Send = EngineIOServerCtrls;
-    type Receive = EngineIOClientCtrls;
-
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState> {
         match &self.0 {
             EngineState::Connected(Connection(_, Heartbeat { last_ping:Some(i), .. })) if now > *i + Duration::from_millis(config.ping_timeout) => {
@@ -66,7 +61,7 @@ impl EngineStateEntity for EngineIOServer {
         }
     }
 
-    fn send(&self, input:&EngineInput<Self::Send>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
+    fn send(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
         match input {
             EngineInput::Data(_) => {
                 match &self.0 {
@@ -75,7 +70,7 @@ impl EngineStateEntity for EngineIOServer {
                 }
             },
 
-            EngineInput::Control(EngineIOServerCtrls::Close) => {
+            EngineInput::Control(EngineSignal::Close) => {
                 match &self.0 {
                     EngineState::Connected(..) => Ok(Some(EngineState::Closed(EngineCloseReason::ServerClose))),
                     _ => Err(EngineError::AlreadyClosed)
@@ -85,7 +80,7 @@ impl EngineStateEntity for EngineIOServer {
         }
     }
     
-    fn recv(&self, input:&EngineInput<Self::Receive>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
+    fn recv(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
         match &input {
             EngineInput::Data(Err(e)) => {
                 Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::UnknownPayload)))
@@ -104,7 +99,7 @@ impl EngineStateEntity for EngineIOServer {
                     }
                 }
             },
-            EngineInput::Control(EngineIOClientCtrls::Poll) => {
+            EngineInput::Control(EngineSignal::Poll) => {
                 match &self.0 {
                     EngineState::Connected(s) => {
                         match &s.0 {
@@ -122,11 +117,11 @@ impl EngineStateEntity for EngineIOServer {
                 }
             },
             // Transport has closed without sending payload
-            EngineInput::Control(EngineIOClientCtrls::Close) => {
+            EngineInput::Control(EngineSignal::Close) => {
                 Ok(EngineState::Closed(EngineCloseReason::ClientClose))
             },
 
-            EngineInput::Control(EngineIOClientCtrls::New(kind)) => {
+            EngineInput::Control(EngineSignal::New(kind)) => {
                 match &self.0 {
                     EngineState::Connecting { start_time } => todo!(),
                     EngineState::New{ .. }  => { 

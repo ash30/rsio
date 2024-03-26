@@ -1,15 +1,11 @@
 use std::{collections::VecDeque, time::{Instant, Duration}};
 
-use crate::engine::EngineState;
+use crate::engine::{EngineState, EngineSignal};
 use crate::engine::EngineError;
 use crate::engine::EngineCloseReason;
 use crate::engine::EngineInput;
 use crate::engine::IO;
-use crate::engine::EngineIOClientCtrls;
-use crate::engine::EngineIOServerCtrls;
 use crate::engine::EngineStateEntity;
-use crate::engine::Engine;
-use crate::transport::TransportKind;
 use crate::proto::TransportConfig;
 use crate::proto::Sid;
 use crate::transport::Transport;
@@ -25,21 +21,18 @@ impl EngineIOClient {
 }
 
 impl EngineStateEntity for EngineIOClient {
-    type Receive = EngineIOServerCtrls;
-    type Send = EngineIOClientCtrls;
-
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState> {
         todo!()
     }
 
-    fn send(&self, input:&EngineInput<EngineIOClientCtrls>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>,EngineError> {
+    fn send(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>,EngineError> {
         match input {
             EngineInput::Data(Err(e)) => Err(EngineError::UnknownPayload),
 
             EngineInput::Data(Ok(p)) => {
                 Ok(None)
             },
-            EngineInput::Control(EngineIOClientCtrls::Poll) => {
+            EngineInput::Control(EngineSignal::Poll) => {
                 match &self.0 {
                     EngineState::Connected(s@Connection(Transport::Polling(PollingState { active:None, count }),_)) => {
                         Ok(Some(EngineState::Connected(s.clone().update(|t,h| {
@@ -49,19 +42,19 @@ impl EngineStateEntity for EngineIOClient {
                     _ => Err(EngineError::InvalidPoll)
                 }
             },
-            EngineInput::Control(EngineIOClientCtrls::New(kind)) => {
+            EngineInput::Control(EngineSignal::New(kind)) => {
                 match &self.0 { 
                     EngineState::New { .. } => Ok(Some(EngineState::Connecting { start_time: now })),
                     _ => Err(EngineError::OpenFailed)
                 }
             },
-            EngineInput::Control(EngineIOClientCtrls::Close) => {
+            EngineInput::Control(EngineSignal::Close) => {
                 Ok(Some(EngineState::Closed(EngineCloseReason::ClientClose)))
             }
         }
     }
 
-    fn recv(&self, input:&EngineInput<EngineIOServerCtrls>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
+    fn recv(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
         todo!()
     }
 

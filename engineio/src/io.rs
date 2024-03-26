@@ -6,8 +6,6 @@ use futures_util::Stream;
 use futures_util::TryFutureExt;
 use tokio::select;
 use tokio::time::Instant;
-use crate::engine::EngineIOClientCtrls;
-use crate::engine::EngineIOServerCtrls;
 use crate::proto::Payload;
 use crate::proto::Sid;
 use crate::proto::TransportConfig;
@@ -46,10 +44,10 @@ fn engine_channel<T,R,E>() -> EngineChannelPair<T,R,E> {
 
 
 #[pin_project::pin_project]
-pub struct Session<T> { 
+pub struct Session { 
     #[pin]
     handle: tokio::task::JoinHandle<SessionCloseReason>,
-    tx: mpsc::Sender<(EngineInput<T>, oneshot::Sender<Result<(),EngineError>>)>,
+    tx: mpsc::Sender<(EngineInput, oneshot::Sender<Result<(),EngineError>>)>,
     rx: mpsc::Receiver<Payload>
 }
 
@@ -58,7 +56,7 @@ pub enum SessionCloseReason {
     TransportClose
 }
 
-impl <T> Session<T> {
+impl  Session {
 
     pub async fn send(&self, payload:Payload) -> Result<(),EngineError> {
         let (res_tx, res_rx) = oneshot::channel();
@@ -68,7 +66,7 @@ impl <T> Session<T> {
     }
 }
 
-impl <T> Stream for Session<T> {
+impl Stream for Session {
     type Item = Payload;
     
     fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
@@ -95,19 +93,19 @@ impl <T> Stream for Session<T> {
 
 #[derive(Clone)]
 pub struct MultiPlex {
-    tx_new: mpsc::Sender<(Sid, oneshot::Sender<Session<EngineIOServerCtrls>>)>,
-    tx_input: mpsc::Sender<(Sid,EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>,
+    tx_new: mpsc::Sender<(Sid, oneshot::Sender<Session>)>,
+    tx_input: mpsc::Sender<(Sid,EngineInput, oneshot::Sender<Result<(),EngineError>>)>,
     tx_listen: mpsc::Sender<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>
 }
 
 impl MultiPlex {
-    pub async fn create(&self, sid:Sid) -> Result<Session<EngineIOServerCtrls>, EngineError> {
+    pub async fn create(&self, sid:Sid) -> Result<Session, EngineError> {
         let res = oneshot::channel();
         self.tx_new.send((sid, res.0)).await;
         res.1.await.map_err(|_| EngineError::Generic).map(|s| Ok(s))?
     }
 
-    pub async fn input(&self, sid:Sid, input:EngineInput<EngineIOClientCtrls>) -> Result<(),EngineError> {
+    pub async fn input(&self, sid:Sid, input:EngineInput) -> Result<(),EngineError> {
         let res = oneshot::channel();
         self.tx_input.send((sid, input,res.0 )).await.map_err(|_| EngineError::Generic)?;
         res.1.await.map_err(|_| EngineError::Generic)?
@@ -121,12 +119,12 @@ impl MultiPlex {
 }
 
 pub fn create_multiplex() -> MultiPlex {
-    let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session<EngineIOServerCtrls>>)>(1024);
-    let mut input_data = mpsc::channel::<(Sid, EngineInput<EngineIOClientCtrls>, oneshot::Sender<Result<(),EngineError>>)>(1024);
+    let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session>)>(1024);
+    let mut input_data = mpsc::channel::<(Sid, EngineInput, oneshot::Sender<Result<(),EngineError>>)>(1024);
     let mut input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(1024);
 
     tokio::spawn(async move {
-        let mut tx_map: HashMap<Sid,mpsc::Sender<(EngineInput<EngineIOClientCtrls>,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();
+        let mut tx_map: HashMap<Sid,mpsc::Sender<(EngineInput,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();
         let mut rx_map: HashMap<Sid,mpsc::Receiver<Payload>> = HashMap::new();
         let mut in_flight = tokio::task::JoinSet::<mpsc::Receiver<Payload>>::new();
 
@@ -210,12 +208,10 @@ pub fn create_multiplex() -> MultiPlex {
 
 pub fn create_session<T,Fut>(
     engine: Engine<T>, 
-    transport: impl FnOnce(mpsc::Sender<(EngineInput<T::Receive>, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
-) -> Session<T::Send>
+    transport: impl FnOnce(mpsc::Sender<(EngineInput, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
+) -> Session
 where Fut: Future<Output = SessionCloseReason> + Send + 'static,
       T:EngineStateEntity + Send + Unpin + 'static,
-      T::Receive: Send,
-      T::Send: Send
 {
     let (up_req, up_res) = engine_channel();
     let (down_req, down_res) = engine_channel();
@@ -236,12 +232,10 @@ where Fut: Future<Output = SessionCloseReason> + Send + 'static,
 
 pub fn create_session_local<T,Fut>(
     engine: Engine<T>, 
-    transport: impl FnOnce(mpsc::Sender<(EngineInput<T::Receive>, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
-) -> Session<T::Send>
+    transport: impl FnOnce(mpsc::Sender<(EngineInput, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
+) -> Session
 where Fut: Future<Output = SessionCloseReason> + 'static,
       T:EngineStateEntity + Send + Unpin + 'static,
-      T::Receive: Send,
-      T::Send: Send
 {
     let (up_req, up_res) = engine_channel();
     let (down_req, down_res) = engine_channel();
@@ -262,24 +256,24 @@ where Fut: Future<Output = SessionCloseReason> + 'static,
 
 async fn bind_engine<T:EngineStateEntity>(
     mut engine:Engine<T>,
-    down_stream:EngineChannelRes<EngineInput<T::Receive>,Payload,EngineError>,
-    up_stream:EngineChannelRes<EngineInput<T::Send>,Payload,EngineError>) -> Engine<T>
+    down_stream:EngineChannelRes<EngineInput,Payload,EngineError>,
+    up_stream:EngineChannelRes<EngineInput,Payload,EngineError>) -> Engine<T>
 {
     let (down_send, mut down_recv) = down_stream;
     let (up_send, mut up_recv) = up_stream;
-    let config = TransportConfig::default();
 
     loop {
         let config = TransportConfig::default();
         let now = tokio::time::Instant::now();        
 
         let next = loop {
+            dbg!();
             match engine.poll(now.into(), &config) {
                 Some(IO::Wait(d)) => {
                     break Ok(Some(d))
                 }
                 Some(IO::Send(p)) => {
-                    if let Err(e) = down_send.send(Payload::Ping).await {
+                    if let Err(e) = down_send.send(p).await {
                         break Err(IOError::SendError(e.0))
                     }
                 },
@@ -296,14 +290,15 @@ async fn bind_engine<T:EngineStateEntity>(
             }
         };
         let Ok(Some(next_deadline)) = next else { break };
-        let input = select! {
-            _ = tokio::time::sleep_until(next_deadline.into()) => None,
-            Some((up,tx)) = up_recv.recv() => Some((Either::A(up), tx)),
-            Some((down,tx)) = down_recv.recv() => Some((Either::B(down), tx)),
+        select! {
+            _ = tokio::time::sleep_until(next_deadline.into()) => {},
+            Some((up,tx)) = up_recv.recv() => {
+                tx.send(engine.send(up, now.into(), &config));
+            }
+            Some((down,tx)) = down_recv.recv() =>  {
+                tx.send(engine.send(down, now.into(), &config));
+            }
         };
-        if let Some((p,res_tx)) = input {
-           res_tx.send(engine.input(p,now.into(),&config)); 
-        }
     };
     return engine
 

@@ -1,8 +1,6 @@
 use std::time::Instant;
 use std::fmt;
-use crate::io::Either;
 use crate::transport::Connection;
-use crate::transport::TransportError;
 use crate::transport::TransportKind;
 pub use crate::proto::*;
 use std::collections::VecDeque;
@@ -10,34 +8,24 @@ use std::collections::VecDeque;
 // =======================
 
 #[derive(Debug)]
-pub enum EngineInput<T> {
-    Control(T),
+pub enum EngineInput {
+    Control(EngineSignal),
     Data(Result<Payload, PayloadDecodeError>),
 }
 
 #[derive(Debug, Clone)]
-pub enum EngineIOServerCtrls {
-    Close,
-}
-
-#[derive(Debug, Clone)]
-pub enum EngineIOClientCtrls {
+pub enum EngineSignal {
     New(TransportKind),
     Poll,
-    Close
+    Close,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum IO {
-    Open(Option<Sid>),
-    Close,
     Recv(Payload),
     Send(Payload),
     Wait(Instant)
 }
-
-// =======================
-
 
 // =====================
 
@@ -59,11 +47,9 @@ impl EngineState {
 }
 
 pub(crate) trait EngineStateEntity {
-    type Send;
-    type Receive;
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState>;
-    fn send(&self, input:&EngineInput<Self::Send>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
-    fn recv(&self, input:&EngineInput<Self::Receive>, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
+    fn send(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
+    fn recv(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
     fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<IO>, config:&TransportConfig) -> &EngineState;
     fn next_deadline(&self, config:&TransportConfig) -> Option<Instant>;
 }
@@ -85,7 +71,6 @@ where T:EngineStateEntity {
             state: initial_state,
         }
     }
-
     fn advance_time(&mut self, now:Instant, config:&TransportConfig) {
         while let Some(d) = self.state.next_deadline(config) {
             if now < d { break };
@@ -94,40 +79,34 @@ where T:EngineStateEntity {
             }
         }
     }
-
-    pub fn input(&mut self, i:Either<EngineInput<T::Send>, EngineInput<T::Receive>>, now:Instant, config:&TransportConfig) -> Result<(),EngineError> {
+    pub fn send(&mut self, input:EngineInput, now:Instant, config:&TransportConfig) -> Result<(), EngineError> {
         self.advance_time(now, config);
-        let next_state = match &i {
-            Either::A(a) => self.state.send(a, now, config),
-            Either::B(b) => self.state.recv(b, now, config)
-        };
-        match next_state {
-            Err(e) => {
-                Err(e)
-            },
-            Ok(next_state) => {
-                // Buffer Data Input AND action state transitions
-                match i {
-                    Either::A(EngineInput::Data(Ok(msg))) => { self.output.push_back(IO::Send(msg)) },
-                    Either::B(EngineInput::Data(Ok(msg))) => { self.output.push_back(IO::Recv(msg)) }
-                    _ => {}
-                }
-                if let Some(s) = next_state {
-                    let e = self.state.update(s, &mut self.output, config).has_error();
-                    if let Some(e) = e { Err(e.clone()) } else { Ok(()) }
-                }
-                else {
-                    Ok(())
-                }
-            }
+        match self.state.send(&input,now,config) { 
+            Err(e) => Err(e),
+            Ok(s) => { 
+                if let EngineInput::Data(Ok(p)) = input { self.output.push_back(IO::Send(p)) };
+                let e = s.and_then(|s| self.state.update(s, &mut self.output, config).has_error());
+                if let Some(e) = e { Err(e.clone()) } else { Ok(()) }
+            } 
+        }
+    }
+    pub fn recv(&mut self, input:EngineInput, now:Instant, config:&TransportConfig) -> Result<(), EngineError> {
+        self.advance_time(now, config);
+        match self.state.recv(&input,now,config){ 
+            Err(e) => Err(e),
+            Ok(s) => { 
+                if let EngineInput::Data(Ok(p)) = input { self.output.push_back(IO::Recv(p)) };
+                let e = s.and_then(|s| self.state.update(s, &mut self.output, config).has_error());
+                if let Some(e) = e { Err(e.clone()) } else { Ok(()) }
+            } 
         }
     }
 
     pub fn poll(&mut self,now:Instant, config:&TransportConfig) -> Option<IO> {
         self.advance_time(now, config);
-        self.output.pop_front().or_else(||{
+        dbg!(self.output.pop_front().or_else(||{
             self.state.next_deadline(config).map(|d| IO::Wait(d))
-        })
+        }))
 
     }
 
