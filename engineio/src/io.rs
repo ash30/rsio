@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::fmt::Debug;
 use std::task::Poll;
 use futures_util::Future;
 use futures_util::Stream;
 use futures_util::TryFutureExt;
 use tokio::select;
 use tokio::time::Instant;
+use crate::proto::MessageData;
 use crate::proto::Payload;
 use crate::proto::Sid;
 use crate::proto::TransportConfig;
@@ -31,8 +31,8 @@ type EngineChannelRes<T,R,E> = (mpsc::Sender<R>, mpsc::Receiver<(T, oneshot::Sen
 type EngineChannelPair<T,R,E> = (EngineChannelReq<T,R,E>, EngineChannelRes<T,R,E>);
 
 fn engine_channel<T,R,E>() -> EngineChannelPair<T,R,E> {
-    let (req_tx, req_rx) = tokio::sync::mpsc::channel(1);
-    let (res_tx, res_rx) = tokio::sync::mpsc::channel(1);
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(10);
+    let (res_tx, res_rx) = tokio::sync::mpsc::channel(10);
     return (
         (req_tx, res_rx),
         (res_tx, req_rx)
@@ -54,17 +54,16 @@ pub enum SessionCloseReason {
 }
 
 impl  Session {
-
-    pub async fn send(&self, payload:Payload) -> Result<(),EngineError> {
+    pub async fn send(&self, payload:MessageData) -> Result<(),EngineError> {
         let (res_tx, res_rx) = oneshot::channel();
-        let p = EngineInput::Data(Ok(payload));
+        let p = EngineInput::Data(Ok(Payload::Message(payload)));
         self.tx.send((p,res_tx)).map_err(|e|EngineError::Generic).await?;
         res_rx.await.unwrap_or_else(|_| Err(EngineError::Generic))
     }
 }
 
 impl Stream for Session {
-    type Item = Payload;
+    type Item = MessageData;
     
     fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -79,7 +78,12 @@ impl Stream for Session {
                 //}
             },
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(p)) => Poll::Ready(Some(p))
+            Poll::Ready(Some(p)) => {
+                match p {
+                    Payload::Message(m) => Poll::Ready(Some(m)),
+                    _ => Poll::Pending,
+                }
+            }
         }
     }
 
@@ -139,6 +143,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                         let _ = &tx_map.insert(sid, tx);
                         let _ = &rx_map.insert(sid, rx);
                         return async move {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1000000)).await;
                             return SessionCloseReason::Unknown
                         }
                     });
@@ -169,7 +174,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                         tx.send(Err(EngineError::MissingSession));
                         continue 
                     }   
-                    let (replace_tx,replace_rx) = mpsc::channel(1);
+                    let (_,replace_rx) = mpsc::channel(1);
                     let mut rx = rx_map.remove(&sid).unwrap();
                     rx_map.insert(sid, replace_rx);
                     
@@ -182,7 +187,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                         res.push(first);
                         loop {
                             tokio::select! {
-                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => break,
+                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => break,
                                 output = rx.recv() => {
                                     match output {
                                         None => break,
@@ -271,7 +276,6 @@ async fn bind_engine<T:EngineStateEntity>(
     loop {
         let now = tokio::time::Instant::now();        
         let next = loop {
-            dbg!();
             match engine.poll(now.into(), &config) {
                 Some(IO::Wait(d)) => {
                     break Ok(Some(d))
@@ -297,7 +301,7 @@ async fn bind_engine<T:EngineStateEntity>(
                 tx.send(engine.send(up, now.into(), &config));
             }
             Some((down,tx)) = down_recv.recv() =>  {
-                tx.send(engine.send(down, now.into(), &config));
+                tx.send(engine.recv(down, now.into(), &config));
             }
         };
     };

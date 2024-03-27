@@ -62,7 +62,6 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
             .to(move |req: actix_web::HttpRequest, body: web::Payload| { 
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
                 async move {
-                    dbg!();
                     let sid = uuid::Uuid::new_v4();
                     let mut engine = Engine::new(EngineIOServer::new(sid,Instant::now().into()));
                     engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Continuous)), Instant::now().into(), &config);
@@ -106,29 +105,6 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
         )
     };
 
-    // LONG POLL CREATE
-    let path = {
-        let polling = polling.clone();
-        path.route(
-            web::route()
-            .guard(guard::Get())
-            .to(move | _session: web::Query<SessionInfo>| {
-                let polling = polling.clone();
-                async move {
-                    let sid = Sid::new_v4();
-                    let Ok(session) = polling.create(sid).await else {
-                        return HttpResponse::InternalServerError().finish();
-                    };
-                    service(session);
-                    match polling.listen(sid).await {
-                        Ok(vec) => HttpResponse::Ok().body(Payload::encode_combined(&vec, TransportKind::Poll)),
-                        Err(e) => e.error_response()
-                    }
-                }
-            })
-        )
-    };
-
     // LONG POLL GET 
     let path = { 
         let polling = polling.clone();
@@ -156,6 +132,29 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
         )
     };
 
+    // LONG POLL CREATE
+    let path = {
+        let polling = polling.clone();
+        path.route(
+            web::route()
+            .guard(guard::Get())
+            .to(move | _session: web::Query<SessionInfo>| {
+                let polling = polling.clone();
+                async move {
+                    let sid = Sid::new_v4();
+                    let Ok(session) = polling.create(sid).await else {
+                        return HttpResponse::InternalServerError().finish();
+                    };
+                    service(session);
+                    match polling.listen(sid).await {
+                        Ok(vec) => HttpResponse::Ok().body(Payload::encode_combined(&vec, TransportKind::Poll)),
+                        Err(e) => e.error_response()
+                    }
+                }
+            })
+        )
+    };
+
     // POST MSG LONG POLL
     let path = { 
         let polling = polling.clone();
@@ -172,7 +171,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                         // TODO: Handle errors please
                         polling.input(sid, EngineInput::Data(p)).await;
                     }
-                    HttpResponse::Ok().finish()
+                    HttpResponse::Ok().body("ok")
                 }
             }
             )

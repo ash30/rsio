@@ -104,9 +104,9 @@ where T:EngineStateEntity {
 
     pub fn poll(&mut self,now:Instant, config:&TransportConfig) -> Option<IO> {
         self.advance_time(now, config);
-        dbg!(self.output.pop_front().or_else(||{
+        self.output.pop_front().or_else(||{
             self.state.next_deadline(config).map(|d| IO::Wait(d))
-        }))
+        })
 
     }
 

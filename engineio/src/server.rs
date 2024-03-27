@@ -197,8 +197,6 @@ impl EngineStateEntity for EngineIOServer {
 
         self.0 = next_state;
         return &self.0
-
-        
     }
 }
 
