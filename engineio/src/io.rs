@@ -91,7 +91,7 @@ impl Stream for Session {
 #[derive(Clone)]
 pub struct MultiPlex {
     tx_new: mpsc::Sender<(Sid, oneshot::Sender<Session>)>,
-    tx_input: mpsc::Sender<(Sid,EngineInput, oneshot::Sender<Result<(),EngineError>>)>,
+    tx_data: mpsc::Sender<(Sid,EngineInput, oneshot::Sender<Result<(),EngineError>>)>,
     tx_listen: mpsc::Sender<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>
 }
 
@@ -104,7 +104,7 @@ impl MultiPlex {
 
     pub async fn input(&self, sid:Sid, input:EngineInput) -> Result<(),EngineError> {
         let res = oneshot::channel();
-        self.tx_input.send((sid, input,res.0 )).await.map_err(|_| EngineError::Generic)?;
+        self.tx_data.send((sid, input,res.0 )).await.map_err(|_| EngineError::Generic)?;
         res.1.await.map_err(|_| EngineError::Generic)?
     }
 
@@ -123,11 +123,15 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
     tokio::spawn(async move {
         let mut tx_map: HashMap<Sid,mpsc::Sender<(EngineInput,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();
         let mut rx_map: HashMap<Sid,mpsc::Receiver<Payload>> = HashMap::new();
-        let mut in_flight = tokio::task::JoinSet::<mpsc::Receiver<Payload>>::new();
+        let mut in_flight = tokio::task::JoinSet::<(Sid,mpsc::Receiver<Payload>)>::new();
         
         loop {
             let now = Instant::now();
             tokio::select! {
+                Some(Ok((sid,rx))) = in_flight.join_next() => {
+                    &rx_map.insert(sid, rx);
+                }
+
                 Some((sid,tx)) = input_new.1.recv() => {
                     let mut engine = Engine::new(EngineIOServer::new(sid, Instant::now().into()));
                     let _ = engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Poll)), now.into(), &config);
@@ -173,7 +177,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                         let mut res:Vec<Payload> = vec![];
                         let Some(first) = rx.recv().await else { 
                             tx.send(Err(EngineError::Generic));
-                            return rx
+                            return (sid,rx)
                         };
                         res.push(first);
                         loop {
@@ -188,7 +192,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                             }
                         }
                         tx.send(Ok(res));
-                        rx
+                        (sid,rx)
                     });
                 },
                 else => break
@@ -198,7 +202,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
     });
 
     return MultiPlex {
-        tx_input: input_data.0,
+        tx_data: input_data.0,
         tx_listen: input_listen.0,
         tx_new: input_new.0
     }
