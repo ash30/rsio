@@ -9,9 +9,11 @@ use tokio::time::Instant;
 use crate::proto::Payload;
 use crate::proto::Sid;
 use crate::proto::TransportConfig;
+use crate::transport::TransportKind;
 use crate::engine::EngineInput;
 use crate::engine::Engine;
 use crate::engine::EngineError;
+use crate::engine::EngineSignal;
 use crate::engine::EngineStateEntity;
 use crate::engine::IO;
 use crate::server::EngineIOServer;
@@ -122,11 +124,13 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
         let mut tx_map: HashMap<Sid,mpsc::Sender<(EngineInput,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();
         let mut rx_map: HashMap<Sid,mpsc::Receiver<Payload>> = HashMap::new();
         let mut in_flight = tokio::task::JoinSet::<mpsc::Receiver<Payload>>::new();
-
+        
         loop {
+            let now = Instant::now();
             tokio::select! {
                 Some((sid,tx)) = input_new.1.recv() => {
-                    let engine = Engine::new(EngineIOServer::new(sid, Instant::now().into()));
+                    let mut engine = Engine::new(EngineIOServer::new(sid, Instant::now().into()));
+                    let _ = engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Poll)), now.into(), &config);
                     let session = create_session(engine, config, |tx,rx| {
                         let _ = &tx_map.insert(sid, tx);
                         let _ = &rx_map.insert(sid, rx);
@@ -161,7 +165,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                         tx.send(Err(EngineError::MissingSession));
                         continue 
                     }   
-                    let (replace_tx,replace_rx) = mpsc::channel(0);
+                    let (replace_tx,replace_rx) = mpsc::channel(1);
                     let mut rx = rx_map.remove(&sid).unwrap();
                     rx_map.insert(sid, replace_rx);
                     
@@ -174,7 +178,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                         res.push(first);
                         loop {
                             tokio::select! {
-                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {},
+                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => break,
                                 output = rx.recv() => {
                                     match output {
                                         None => break,
