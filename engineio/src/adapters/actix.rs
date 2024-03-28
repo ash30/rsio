@@ -177,6 +177,26 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
             )
         )
     };
+
+    let path = {
+        let polling = polling.clone();
+        path.route(
+            web::route()
+            .guard(guard::Delete())
+            .to(move | session:web::Query<SessionInfo>| {
+                let polling = polling.clone();
+                async move { 
+                    let Some(sid) = session.sid else {
+                        return EngineError::MissingSession.error_response()
+                    };
+                    match polling.delete(sid).await {
+                        Ok(_) => HttpResponse::Ok().finish(),
+                        Err(e) => e.error_response()
+                    }
+                }
+            })
+        )
+    };
     
     // Catch all - to appease clients expecting 400 not 404
     let path = {

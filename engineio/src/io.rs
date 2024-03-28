@@ -96,7 +96,8 @@ impl Stream for Session {
 pub struct MultiPlex {
     tx_new: mpsc::Sender<(Sid, oneshot::Sender<Session>)>,
     tx_data: mpsc::Sender<(Sid,EngineInput, oneshot::Sender<Result<(),EngineError>>)>,
-    tx_listen: mpsc::Sender<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>
+    tx_listen: mpsc::Sender<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>,
+    tx_delete: mpsc::Sender<(Sid,oneshot::Sender<Result<(),EngineError>>)>
 }
 
 impl MultiPlex {
@@ -117,21 +118,39 @@ impl MultiPlex {
         self.tx_listen.send((sid, res.0)).await;
         res.1.await.map_err(|_| EngineError::Generic)?
     }
+
+    pub async fn delete(&self, sid:Sid) -> Result<(),EngineError> {
+        let res = oneshot::channel();
+        self.tx_delete.send((sid,res.0)).await;
+        res.1.await.map_err(|_| EngineError::Generic)?
+    }
 }
 
 pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
     let mut input_new = mpsc::channel::<(Sid, oneshot::Sender<Session>)>(1024);
     let mut input_data = mpsc::channel::<(Sid, EngineInput, oneshot::Sender<Result<(),EngineError>>)>(1024);
     let mut input_listen = mpsc::channel::<(Sid, oneshot::Sender<Result<Vec<Payload>,EngineError>>)>(1024);
+    let mut input_delete = mpsc::channel::<(Sid, oneshot::Sender<Result<(),EngineError>>)>(1024);
 
     tokio::spawn(async move {
         let mut tx_map: HashMap<Sid,mpsc::Sender<(EngineInput,oneshot::Sender<Result<(),EngineError>>)>> = HashMap::new();
         let mut rx_map: HashMap<Sid,mpsc::Receiver<Payload>> = HashMap::new();
         let mut in_flight = tokio::task::JoinSet::<(Sid,mpsc::Receiver<Payload>)>::new();
+        let mut stop_map: HashMap<Sid,oneshot::Sender<()>> = HashMap::new();
         
         loop {
             let now = Instant::now();
             tokio::select! {
+                Some((sid,res_tx)) = input_delete.1.recv() => {
+                    if let Some(tx) =  stop_map.remove(&sid) {
+                        let r = tx.send(()).map_err(|_| EngineError::Generic);
+                        res_tx.send(r);
+                    }
+                    else {
+                        res_tx.send(Err(EngineError::MissingSession));
+                    }
+                }
+
                 Some(Ok((sid,rx))) = in_flight.join_next() => {
                     &rx_map.insert(sid, rx);
                 }
@@ -142,8 +161,10 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                     let session = create_session(engine, config, |tx,rx| {
                         let _ = &tx_map.insert(sid, tx);
                         let _ = &rx_map.insert(sid, rx);
+                        let (stop_tx,stop_rx) = oneshot::channel();
+                        let _ = &stop_map.insert(sid,stop_tx);
                         return async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1000000)).await;
+                            stop_rx.await;
                             return SessionCloseReason::Unknown
                         }
                     });
@@ -209,7 +230,8 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
     return MultiPlex {
         tx_data: input_data.0,
         tx_listen: input_listen.0,
-        tx_new: input_new.0
+        tx_new: input_new.0,
+        tx_delete: input_delete.0,
     }
     
 }
