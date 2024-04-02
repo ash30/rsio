@@ -28,13 +28,11 @@ impl EngineIOServer {
 impl EngineStateEntity for EngineIOServer {
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState> {
         match &self.0 {
-            EngineState::Connected(Connection(_, Heartbeat { last_ping:Some(i), .. })) if now > *i + Duration::from_millis(config.ping_timeout) => {
-                Some(EngineState::Closed(EngineCloseReason::Timeout))
-            },
+            EngineState::Connected(Connection(_,Heartbeat::Unknown { since,.. })) if now > *since + Duration::from_millis(config.ping_timeout) => Some(EngineState::Closed(EngineCloseReason::Timeout)),
             EngineState::Connected(state) => {
                 Some(EngineState::Connected(state.clone().update(|transport,heartbeat| {
-                    if let None = heartbeat.last_ping {
-                        if now >= heartbeat.last_seen + Duration::from_millis(config.ping_interval) { heartbeat.pinged_at(now) };
+                    if heartbeat.is_alive() && now >= heartbeat.last_beat() + Duration::from_millis(config.ping_interval){
+                        *heartbeat = heartbeat.to_unknown(now)
                     }
                     if let Transport::Polling(p@PollingState { active:Some(..), .. }) = transport {
                         p.update_poll(now)
@@ -53,7 +51,8 @@ impl EngineStateEntity for EngineIOServer {
             EngineState::New { start_time } => Some(*start_time + Duration::from_secs(5)),
             EngineState::Connected(Connection(t,h)) => {
                 let next_poll_deadline = if let Transport::Polling(PollingState { active:Some((start,length)), .. }) = t { Some(*start + *length) } else { None };
-                let next_heartbeat_deadline = if let Some(s) = h.last_ping { s + Duration::from_millis(config.ping_timeout) } else { h.last_seen + Duration::from_millis(config.ping_interval) };
+                let next_heartbeat_deadline = if !h.is_alive() { h.since() + Duration::from_millis(config.ping_timeout) } else { h.last_beat()+ Duration::from_millis(config.ping_interval) };
+
                 [ next_poll_deadline, Some(next_heartbeat_deadline) ].into_iter().filter_map(|d|d).min()
             }
             EngineState::Closed(..) => None,
@@ -90,7 +89,7 @@ impl EngineStateEntity for EngineIOServer {
                     EngineState::Connected(state) => {
                         match p {
                             Payload::Close(..) => Ok(EngineState::Closed(EngineCloseReason::ClientClose)),
-                            _ => Ok(EngineState::Connected(state.clone().update(|_,heartbeat| heartbeat.seen_at(now)))
+                            _ => Ok(EngineState::Connected(state.clone().update(|_,heartbeat| *heartbeat = Heartbeat::new(now)))
 )
                         }
                     },
@@ -106,7 +105,7 @@ impl EngineStateEntity for EngineIOServer {
                             Transport::Polling(PollingState { active:Some(..), ..}) => Ok(EngineState::Closed(EngineCloseReason::Error(EngineError::InvalidPoll))),
                             Transport::Polling(PollingState{ active:None, ..}) => {
                                 Ok(EngineState::Connected(s.clone().update(|t,h| {
-                                    h.seen_at(now);
+                                    *h = Heartbeat::new(now);
                                     t.poll_state().map(|p| p.activate_poll(now, Duration::from_millis(config.ping_timeout)));
                                 })))
                             },
@@ -172,8 +171,8 @@ impl EngineStateEntity for EngineIOServer {
             },
 
             // websocket ping pong
-            (EngineState::Connected(Connection(Transport::Continuous, Heartbeat { last_ping:None, .. })),
-            EngineState::Connected(Connection(Transport::Continuous, Heartbeat { last_ping:Some(_), .. }))) => {
+            (EngineState::Connected(Connection(Transport::Continuous, Heartbeat::Alive { .. })),
+            EngineState::Connected(Connection(Transport::Continuous, Heartbeat::Unknown { .. }))) => {
                 out_buffer.push_back(IO::Send(Payload::Ping));
             },
 

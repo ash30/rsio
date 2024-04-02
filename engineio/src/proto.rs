@@ -83,7 +83,7 @@ impl Payload{
                 let data = data.get(1..).and_then(|a| Some(a.to_vec())).unwrap_or(vec![]);
                 match n {
                     b'0' => Ok(Payload::Open(data)),
-                    b'1' => Ok(Payload::Close(EngineCloseReason::Timeout)),
+                    b'1' => Ok(Payload::Close(EngineCloseReason::ClientClose)),
                     b'2' => Ok(Payload::Ping),
                     b'3' => Ok(Payload::Pong),
                     b'4' => Ok(Payload::Message(MessageData::String(data))),

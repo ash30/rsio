@@ -74,18 +74,41 @@ impl PollingState {
 // ===============================================
 
 #[derive(Debug, Clone)]
-pub(crate) struct Heartbeat {
-    pub last_seen: Instant,
-    pub last_ping:Option<Instant>
+pub(crate) enum Heartbeat {
+    Alive { since: Instant },
+    Unknown { since: Instant, last_beat:Instant }
 }
 
 impl Heartbeat {
-    pub fn seen_at(&mut self, at:Instant){
-        self.last_seen = at;
-        self.last_ping = None;
+    pub fn last_beat(&self) -> Instant {
+        match self {
+            Self::Alive { since } => *since,
+            Self::Unknown { last_beat, .. } => *last_beat
+        }
     }
-    pub fn pinged_at(&mut self, at:Instant){
-        self.last_ping = Some(at);
+
+    pub fn is_alive(&self) -> bool {
+        match self { 
+            Self::Alive { .. } => true,
+            Self::Unknown { .. } => false
+        }
+    }
+    pub fn since(&self) -> Instant {
+        match self { 
+            Self::Alive { since } => *since,
+            Self::Unknown { since,.. } => *since
+        }
+    }
+
+    pub fn new(now:Instant) -> Self {
+        Self::Alive { since: now}
+    }
+
+    pub fn to_unknown(&self, now:Instant) -> Self {
+        match self {
+            Self::Alive { since } => Heartbeat::Unknown { since: now, last_beat: *since },
+            Self::Unknown { since , last_beat } => Heartbeat::Unknown { since:*since, last_beat:*last_beat }
+        }
     }
 }
 
@@ -96,7 +119,7 @@ pub(crate) struct Connection(pub Transport, pub Heartbeat);
 
 impl Connection {
         pub fn new(t:Transport, now:Instant) -> Self {
-            return Self (t, Heartbeat { last_seen: now, last_ping: None })
+            return Self (t, Heartbeat::Alive { since: now })
         }
 
         pub fn update(mut self, f:impl Fn(&mut Transport, &mut Heartbeat) -> ()) -> Self {

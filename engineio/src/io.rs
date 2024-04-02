@@ -60,6 +60,15 @@ impl  Session {
         self.tx.send((p,res_tx)).map_err(|e|EngineError::Generic).await?;
         res_rx.await.unwrap_or_else(|_| Err(EngineError::Generic))
     }
+
+    pub async fn send_binary(&self, data:Vec<u8>) -> Result<(),EngineError> {
+        self.send(MessageData::Binary(data)).await
+    }
+
+    pub async fn send_text(&self, data:impl Into<String>) -> Result<(),EngineError> {
+        // TODO: better conversion?
+        self.send(MessageData::String(data.into().as_bytes().to_vec())).await
+    }
 }
 
 impl Stream for Session {
@@ -295,38 +304,47 @@ async fn bind_engine<T:EngineStateEntity>(
     let (down_send, mut down_recv) = down_stream;
     let (up_send, mut up_recv) = up_stream;
 
+    dbg!("start");
     loop {
         let now = tokio::time::Instant::now();        
         let next = loop {
             match engine.poll(now.into(), &config) {
                 Some(IO::Wait(d)) => {
+                    dbg!();
                     break Ok(Some(d))
                 }
                 Some(IO::Send(p)) => {
+                    dbg!(&p);
                     if let Err(e) = down_send.send(p).await {
+                        dbg!();
                         break Err(IOError::SendError(e.0))
                     }
                 },
                 Some(IO::Recv(p)) => {
+                    dbg!(&p);
                     // We don't mind if upstream has dropped
                     let _ = up_send.send(p).await;
                 }
                 None => {
+                    dbg!();
                     break(Ok(None))
                 }
             }
         };
-        let Ok(Some(next_deadline)) = next else { break };
+        let Ok(Some(next_deadline)) = next else { dbg!(); break };
         select! {
             _ = tokio::time::sleep_until(next_deadline.into()) => {},
             Some((up,tx)) = up_recv.recv() => {
+                dbg!(&up);
                 tx.send(engine.send(up, now.into(), &config));
             }
             Some((down,tx)) = down_recv.recv() =>  {
+                dbg!(&down);
                 tx.send(engine.recv(down, now.into(), &config));
             }
         };
     };
+    dbg!("finish");
     return engine
 
 }

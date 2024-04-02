@@ -1,3 +1,4 @@
+use actix_ws::CloseReason;
 use tokio::time::Instant;
 use actix_web::{guard, web, HttpResponse, Resource, ResponseError};
 use tokio_stream::StreamExt;
@@ -5,7 +6,7 @@ use crate::io::{self, SessionCloseReason, create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::server::EngineIOServer;
 use crate::transport::TransportKind;
-use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal};
+use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal, EngineCloseReason};
 
 pub use crate::proto::TransportConfig;
 pub type IOEngine = Session;
@@ -68,16 +69,17 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
 
                     let session = create_session_local(engine, config.clone(), |tx,mut rx| {
                         async move {
-                            //tx.send(EngineInput::Control(EngineIOClientCtrls::New(TransportKind::Continuous))).await;
-                            loop {
+                            let reason = loop {
                                 tokio::select! {
                                     recv = msg_stream.next() => {
+                                        dbg!(&recv);
                                         let Some(r) = recv else { break SessionCloseReason::TransportClose};
                                         let res = tokio::sync::oneshot::channel();
                                         let input  = match r {
                                             Ok(m) => EngineInput::Data(m.try_into()),
                                             Err(_) => EngineInput::Data(Err(PayloadDecodeError::InvalidFormat))
                                         };
+                                        dbg!(&input);
                                         if let Err(_) =  tx.send((input,res.0)).await {
                                             break SessionCloseReason::Unknown;
                                         }
@@ -95,7 +97,11 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                                         if let Err(_) = res { break SessionCloseReason::TransportClose } 
                                     }
                                 } 
-                            }
+                            };
+                            // close transport out once engine has closed 
+                            tokio::spawn(session.close(Some(CloseReason { code: actix_ws::CloseCode::Normal, description: Option::None })));
+                            // return reason so can propagate up to session owner
+                            return reason
                         }
                     } );
                     service(session);
@@ -189,6 +195,9 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };
+                    if let Err(_) = polling.input(sid, EngineInput::Data(Ok(Payload::Close(EngineCloseReason::ClientClose)))).await {
+                        return (EngineError::MissingSession).error_response()
+                    }
                     match polling.delete(sid).await {
                         Ok(_) => HttpResponse::Ok().finish(),
                         Err(e) => e.error_response()

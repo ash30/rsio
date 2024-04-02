@@ -10,6 +10,7 @@ use crate::proto::TransportConfig;
 use crate::proto::Sid;
 use crate::transport::Transport;
 use crate::transport::PollingState;
+use crate::transport::Heartbeat;
 use crate::transport::Connection;
 
 pub (crate) struct EngineIOClient(EngineState, Option<Sid>);
@@ -22,7 +23,23 @@ impl EngineIOClient {
 
 impl EngineStateEntity for EngineIOClient {
     fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState> {
-        todo!()
+        match &self.0 {
+            EngineState::Connected(Connection(_,Heartbeat::Unknown { since,.. })) if now > *since + Duration::from_millis(config.ping_timeout) => Some(EngineState::Closed(EngineCloseReason::Timeout)),
+            EngineState::Connected(state) => {
+                Some(EngineState::Connected(state.clone().update(|transport,heartbeat| {
+                    if heartbeat.is_alive() && now >= heartbeat.last_beat() + Duration::from_millis(config.ping_interval){
+                        *heartbeat = heartbeat.to_unknown(now)
+                    }
+                    if let Transport::Polling(p@PollingState { active:Some(..), .. }) = transport {
+                        p.update_poll(now)
+                    }
+                })))
+            },
+            EngineState::New { start_time } if now > *start_time + Duration::from_secs(5) => Some(EngineState::Closed(EngineCloseReason::Timeout)),
+            EngineState::New { .. } => None,
+            EngineState::Closed(_) => None,
+            EngineState::Connecting { start_time } => None
+        }
     }
 
     fn send(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>,EngineError> {
@@ -55,7 +72,16 @@ impl EngineStateEntity for EngineIOClient {
     }
 
     fn recv(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError> {
-        todo!()
+        match input {
+            EngineInput::Control(EngineSignal::Close) => {
+                match &self.0 {
+                    EngineState::Connected(..) => Ok(Some(EngineState::Closed(EngineCloseReason::ServerClose))),
+                    _ => Err(EngineError::AlreadyClosed)
+                }
+            }
+            _ => Ok(None)
+
+        }
     }
 
     fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<IO>, config:&TransportConfig) -> &EngineState {
@@ -67,7 +93,14 @@ impl EngineStateEntity for EngineIOClient {
     }
 
     fn next_deadline(&self, config:&TransportConfig) -> Option<Instant> {
-        None
+        match &self.0 {
+            EngineState::New { start_time } => Some(*start_time + Duration::from_secs(5)),
+            EngineState::Connected(Connection(t,h)) => {
+                Some(Instant::now() + Duration::from_millis(config.ping_interval + config.ping_timeout))
+            },
+            EngineState::Closed(..) => None,
+            EngineState::Connecting { .. } => todo!()
+        }
     }
 
 }
