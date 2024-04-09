@@ -4,9 +4,8 @@ use actix_web::{guard, web, HttpResponse, Resource, ResponseError};
 use tokio_stream::StreamExt;
 use crate::io::{self, SessionCloseReason, create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
-use crate::server::EngineIOServer;
 use crate::transport::TransportKind;
-use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal, EngineCloseReason};
+use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal, EngineCloseReason, GenericTransport};
 
 pub use crate::proto::TransportConfig;
 pub type IOEngine = Session;
@@ -64,7 +63,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut engine = Engine::new(EngineIOServer::new(sid,Instant::now().into()));
+                    let mut engine = Engine::new(Instant::now().into(), GenericTransport{});
                     engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Continuous)), Instant::now().into(), &config);
 
                     let session = create_session_local(engine, config.clone(), |tx,mut rx| {

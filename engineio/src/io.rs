@@ -5,6 +5,7 @@ use futures_util::Stream;
 use futures_util::TryFutureExt;
 use tokio::select;
 use tokio::time::Instant;
+use crate::engine::Transport;
 use crate::proto::MessageData;
 use crate::proto::Payload;
 use crate::proto::Sid;
@@ -12,11 +13,10 @@ use crate::proto::TransportConfig;
 use crate::transport::TransportKind;
 use crate::engine::EngineInput;
 use crate::engine::Engine;
+use crate::engine::GenericTransport;
 use crate::engine::EngineError;
 use crate::engine::EngineSignal;
-use crate::engine::EngineStateEntity;
 use crate::engine::IO;
-use crate::server::EngineIOServer;
 use std::pin::Pin;
 use tokio::sync::oneshot;
 use tokio::sync::mpsc;
@@ -165,7 +165,7 @@ pub fn create_multiplex(config:TransportConfig) -> MultiPlex {
                 }
 
                 Some((sid,tx)) = input_new.1.recv() => {
-                    let mut engine = Engine::new(EngineIOServer::new(sid, Instant::now().into()));
+                    let mut engine = Engine::new(Instant::now().into(), GenericTransport{});
                     let _ = engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Poll)), now.into(), &config);
                     let session = create_session(engine, config, |tx,rx| {
                         let _ = &tx_map.insert(sid, tx);
@@ -251,7 +251,7 @@ pub fn create_session<T,Fut>(
     transport: impl FnOnce(mpsc::Sender<(EngineInput, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
 ) -> Session
 where Fut: Future<Output = SessionCloseReason> + Send + 'static,
-      T:EngineStateEntity + Send + Unpin + 'static,
+      T:Transport+ Send + Unpin + 'static,
 {
     let (up_req, up_res) = engine_channel();
     let (down_req, down_res) = engine_channel();
@@ -276,7 +276,7 @@ pub fn create_session_local<T,Fut>(
     transport: impl FnOnce(mpsc::Sender<(EngineInput, oneshot::Sender<Result<(),EngineError>>)>,mpsc::Receiver<Payload>) -> Fut
 ) -> Session
 where Fut: Future<Output = SessionCloseReason> + 'static,
-      T:EngineStateEntity + Send + Unpin + 'static,
+      T:Transport+ Send + Unpin + 'static,
 {
     let (up_req, up_res) = engine_channel();
     let (down_req, down_res) = engine_channel();
@@ -295,7 +295,7 @@ where Fut: Future<Output = SessionCloseReason> + 'static,
     return Session { handle, tx:up_req.0, rx:up_req.1 };
 }
 
-async fn bind_engine<T:EngineStateEntity>(
+async fn bind_engine<T:Transport>(
     mut engine:Engine<T>,
     mut config:TransportConfig,
     down_stream:EngineChannelRes<EngineInput,Payload,EngineError>,

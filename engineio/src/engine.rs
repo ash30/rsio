@@ -1,7 +1,6 @@
 use std::time::Duration;
 use std::time::Instant;
 use std::fmt;
-use crate::transport::Connection;
 use crate::transport::TransportError;
 use crate::transport::TransportKind;
 pub use crate::proto::*;
@@ -31,47 +30,30 @@ pub(crate) enum IO {
 
 // =====================
 
-#[derive(Debug)]
-pub(crate) enum EngineState {
-    New { start_time:Instant },
-    Connecting { start_time:Instant },
-    Connected(Connection),
-    Closed(EngineCloseReason),
+
+pub(crate) trait Transport {
+    fn process_input(&mut self, input:EngineSignal) -> Result<Option<EngineState>,TransportError>;
+    fn process_state_change(&self, state:EngineState, output: &mut VecDeque<IO>);
 }
 
-impl EngineState {
-    pub fn has_error(&self) -> Option<&EngineError> {
-        match self {
-            EngineState::Closed(EngineCloseReason::Error(e)) => Some(e),
-            _ => None
-        }
+pub struct GenericTransport {}
+impl Transport for GenericTransport {
+    fn process_input(&mut self, input:EngineSignal) -> Result<Option<EngineState>,TransportError> {
+        todo!()    
+    }
+
+    fn process_state_change(&self, state:EngineState, output: &mut VecDeque<IO>) {
+        todo!()    
     }
 }
 
-pub(crate) trait EngineStateEntity {
-    fn time(&self, now:Instant, config:&TransportConfig) -> Option<EngineState>;
-    fn send(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
-    fn recv(&self, input:&EngineInput, now:Instant, config:&TransportConfig) -> Result<Option<EngineState>, EngineError>;
-    fn update(&mut self, next_state:EngineState, out_buffer:&mut VecDeque<IO>, config:&TransportConfig) -> &EngineState;
-    fn next_deadline(&self, config:&TransportConfig) -> Option<Instant>;
-}
-
-// =====================
-
-
-trait Transport {
-    fn process_input(&mut self, input:EngineInput) -> Result<Option<EngineStateFOO>,TransportError>;
-    fn process_state_change(&self, state:EngineStateFOO, output: &mut VecDeque<IO>);
-
-}
-
-#[derive(Debug)]
-enum HeartbeatFoo {
+#[derive(Debug,Copy,Clone)]
+enum Heartbeat {
     Alive(Instant),
     Unknown(Instant)
 }
 
-impl HeartbeatFoo {
+impl Heartbeat {
     fn last_beat(&self) -> Instant {
         match self {
             Self::Alive(i) => *i,
@@ -80,18 +62,18 @@ impl HeartbeatFoo {
     }
 }
 
-#[derive(Debug)]
-enum EngineStateFOO {
+#[derive(Debug,Copy,Clone)]
+enum EngineState {
     New(Instant),
-    Connected(HeartbeatFoo),
+    Connected(Heartbeat),
     Closing(Instant, EngineCloseReason),
     Closed(EngineCloseReason)
 }
 
 #[derive(Debug)]
-struct EngineFOO<T> {
+pub(crate) struct Engine<T> {
     output: VecDeque<IO>,
-    state:EngineStateFOO,
+    state:EngineState,
     transport:T
 }
 
@@ -108,8 +90,12 @@ enum FOOBAR {
  * so statemachine holds specific polling validation to ensure input is valid.
  */
 
-impl <T> EngineFOO<T> where T: Transport 
+impl <T> Engine<T> where T: Transport 
 {
+    pub fn new(now:Instant, transport:T) -> Self {
+       Self { output: VecDeque::new(), state: EngineState::New(now), transport } 
+    }
+
     pub fn send(&mut self, input:EngineInput, now:Instant, config:&TransportConfig) -> Result<(),EngineError> {
         self.process(FOOBAR::Time(now), config);
         self.process(FOOBAR::Send(input), config)
@@ -124,42 +110,42 @@ impl <T> EngineFOO<T> where T: Transport
         self.output.pop_front().or_else(||{
             // Calculate next deadline
             match self.state {
-                EngineStateFOO::New(start) => Some(start + Duration::from_millis(5000)),
-                EngineStateFOO::Connected(heartbeat) => Some(heartbeat.last_beat() + Duration::from_millis(config.ping_timeout)),
-                EngineStateFOO::Closing(start,_) => Some(start + Duration::from_millis(5000)),
-                EngineStateFOO::Closed(r) => None
+                EngineState::New(start) => Some(start + Duration::from_millis(5000)),
+                EngineState::Connected(heartbeat) => Some(heartbeat.last_beat() + Duration::from_millis(config.ping_timeout)),
+                EngineState::Closing(start,_) => Some(start + Duration::from_millis(5000)),
+                EngineState::Closed(r) => None
             }
             .map(|t|IO::Wait(t))
         })       
     }
 
-
     fn process(&mut self, input:FOOBAR, config:&TransportConfig) ->Result<(),EngineError> {
         let next = match self.state {
-            EngineStateFOO::New(start) => {
+            EngineState::New(start) => {
                 match input { 
                     FOOBAR::Time(now) => {
                         if now > start + Duration::from_millis(5000) {
-                            Ok(Some(EngineStateFOO::Closed(EngineCloseReason::ServerClose)))
+                            Ok(Some(EngineState::Closed(EngineCloseReason::ServerClose)))
                         } else { Ok(None) } 
                     },
                     FOOBAR::Send(s) => Err(EngineError::Generic),
                     FOOBAR::Recv(r) => {
+                        Ok(None)
                         // Transports decides IF INPUTS move the state machine forward
-                        let n = self.transport.process_input(r)
-                            .map_err(|_| EngineError::Generic)?;
-                        Ok(n)
+                        //let n = self.transport.process_input(r)
+                        //    .map_err(|_| EngineError::Generic)?;
+                        //Ok(n)
                     }
                 }
             },
-            EngineStateFOO::Connected(heartbeat) => {
+            EngineState::Connected(heartbeat) => {
                 match input { 
                     FOOBAR::Time(now) => {
                         if now > heartbeat.last_beat() + Duration::from_millis(config.ping_interval) + Duration::from_millis(config.ping_timeout) {
-                            Ok(Some(EngineStateFOO::Closing(now,EngineCloseReason::Timeout)))
+                            Ok(Some(EngineState::Closing(now,EngineCloseReason::Timeout)))
                         }
                         else if now > heartbeat.last_beat() + Duration::from_millis(config.ping_interval) {
-                            Ok(Some(EngineStateFOO::Connected(HeartbeatFoo::Unknown(heartbeat.last_beat()))))
+                            Ok(Some(EngineState::Connected(Heartbeat::Unknown(heartbeat.last_beat()))))
                         }
                         else {
                             Ok(None)
@@ -175,7 +161,7 @@ impl <T> EngineFOO<T> where T: Transport
                                 todo!();
                             }
                             EngineInput::Control(c) => {
-                                let n = self.transport.process_input(i)
+                                let n = self.transport.process_input(c)
                                     .map_err(|_| EngineError::Generic)?;
                                 Ok(n)
                             }
@@ -191,7 +177,7 @@ impl <T> EngineFOO<T> where T: Transport
                                 Err(EngineError::UnknownPayload)
                             }
                             EngineInput::Control(c) => {
-                                let n = self.transport.process_input(i)
+                                let n = self.transport.process_input(c)
                                     .map_err(|_| EngineError::Generic)?;
                                 Ok(n)
                             }
@@ -199,10 +185,10 @@ impl <T> EngineFOO<T> where T: Transport
                     }
                 }
             },
-            EngineStateFOO::Closing(start,reason) => {
+            EngineState::Closing(start,reason) => {
                 match input { 
                     FOOBAR::Time(now) => {
-                        if now > start + Duration::from_millis(5000) { Ok(Some(EngineStateFOO::Closed(reason))) }
+                        if now > start + Duration::from_millis(5000) { Ok(Some(EngineState::Closed(reason))) }
                         else { Ok(None) }
                         // If N time passes, just close please
                     },
@@ -213,7 +199,7 @@ impl <T> EngineFOO<T> where T: Transport
                     }
                 }
             },
-            EngineStateFOO::Closed(r) => {
+            EngineState::Closed(r) => {
                 match input {
                     FOOBAR::Time(i) => Ok(None),
                     _ => Err(EngineError::AlreadyClosed)
@@ -225,7 +211,7 @@ impl <T> EngineFOO<T> where T: Transport
         // wether input was valid
         match next {
             Err(e) if e.is_terminal() => {
-                let s = EngineStateFOO::Closed(EngineCloseReason::Error(e));
+                let s = EngineState::Closed(EngineCloseReason::Error(e));
                 self.transport.process_state_change(s, &mut self.output);
                 self.state = s;
                 return Err(e)
@@ -239,69 +225,14 @@ impl <T> EngineFOO<T> where T: Transport
             Ok(None) => Ok(())
         }
     }
-
 }
 
 
 
-#[derive(Debug)]
-pub (crate) struct Engine<T> {
-    output: VecDeque<IO>,
-    state: T,
-}
-
-impl<T> Engine<T>
-where T:EngineStateEntity {
-    pub fn new(initial_state:T) -> Self {
-        return Self { 
-            output: VecDeque ::new(),
-            state: initial_state,
-        }
-    }
-    fn advance_time(&mut self, now:Instant, config:&TransportConfig) {
-        while let Some(d) = self.state.next_deadline(config) {
-            if now < d { break };
-            if let Some(s) = self.state.time(now, config) {
-                self.state.update(s, &mut self.output, config);
-            }
-        }
-    }
-    pub fn send(&mut self, input:EngineInput, now:Instant, config:&TransportConfig) -> Result<(), EngineError> {
-        self.advance_time(now, config);
-        match self.state.send(&input,now,config) { 
-            Err(e) => Err(e),
-            Ok(s) => { 
-                if let EngineInput::Data(Ok(p)) = input { self.output.push_back(IO::Send(p)) };
-                let e = s.and_then(|s| self.state.update(s, &mut self.output, config).has_error());
-                if let Some(e) = e { Err(e.clone()) } else { Ok(()) }
-            } 
-        }
-    }
-    pub fn recv(&mut self, input:EngineInput, now:Instant, config:&TransportConfig) -> Result<(), EngineError> {
-        self.advance_time(now, config);
-        match self.state.recv(&input,now,config){ 
-            Err(e) => Err(e),
-            Ok(s) => { 
-                if let EngineInput::Data(Ok(p)) = input { self.output.push_back(IO::Recv(p)) };
-                let e = s.and_then(|s| self.state.update(s, &mut self.output, config).has_error());
-                if let Some(e) = e { Err(e.clone()) } else { Ok(()) }
-            } 
-        }
-    }
-
-    pub fn poll(&mut self,now:Instant, config:&TransportConfig) -> Option<IO> {
-        self.advance_time(now, config);
-        self.output.pop_front().or_else(||{
-            self.state.next_deadline(config).map(|d| IO::Wait(d))
-        })
-
-    }
-
-}
 
 // =====================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum EngineCloseReason {
     Error(EngineError),
     Timeout,
@@ -309,7 +240,7 @@ pub enum EngineCloseReason {
     ClientClose
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy,Clone)]
 pub enum EngineError {
     Generic,
     MissingSession,
