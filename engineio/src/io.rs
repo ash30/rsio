@@ -13,7 +13,6 @@ use crate::proto::TransportConfig;
 use crate::transport::TransportKind;
 use crate::engine::EngineInput;
 use crate::engine::Engine;
-use crate::engine::GenericTransport;
 use crate::engine::EngineError;
 use crate::engine::EngineSignal;
 use crate::engine::IO;

@@ -5,7 +5,7 @@ use tokio_stream::StreamExt;
 use crate::io::{self, SessionCloseReason, create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::transport::TransportKind;
-use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal, EngineCloseReason, GenericTransport};
+use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal, EngineCloseReason};
 
 pub use crate::proto::TransportConfig;
 pub type IOEngine = Session;
