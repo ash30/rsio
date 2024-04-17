@@ -2,179 +2,138 @@ use std::time::Duration;
 use std::time::Instant;
 use std::fmt;
 use crate::transport::TransportError;
-use crate::transport::TransportKind;
 pub use crate::proto::*;
 use std::collections::VecDeque;
 
-// =======================
-
-#[derive(Debug)]
-pub enum EngineInput {
-    Control(EngineSignal),
-    Data(Result<Payload, PayloadDecodeError>),
+pub(crate) trait AsyncTransport {
+    async fn engine_state_update(&mut self, next_state:EngineState);
+    async fn recv(&mut self) -> Result<Payload,TransportError>;
+    async fn send(&mut self, data:Payload) -> Result<(),TransportError>;
 }
 
-#[derive(Debug, Clone)]
-pub enum EngineSignal {
-    New(TransportKind),
-    Poll,
-    Close,
+pub(crate) fn default_server_state_update(next_state:EngineState) -> Option<Payload>{
+    match next_state {
+        //EngineState::Connected(h) => Some(Payload::Open()),
+        EngineState::Closing(t,r) => Some(Payload::Close(EngineCloseReason::ServerClose)),
+        EngineState::Closed(r) => Some(Payload::Noop),
+        _ => None
+    }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum IO {
-    Recv(Payload),
+pub(crate) fn default_client_state_update(next_state:EngineState) -> Option<Payload> {
+    match next_state {
+        EngineState::Closing(t,r) => Some(Payload::Close(EngineCloseReason::ServerClose)),
+        EngineState::Closed(r) => Some(Payload::Noop),
+        _ => None
+    }
+}
+
+fn default_transport_observation(p:&Payload) -> Option<EngineState> {
+    match p {
+        Payload::Close(r) => Some(EngineState::Closed(*r)),
+        _ => None
+    }
+}
+
+struct TransportObserver(fn(&Payload) -> Option<EngineState>);
+
+pub(crate) fn create_server_engine(config:TransportConfig, now:Instant) -> Engine {
+    Engine::new(EngineState::Connected(Heartbeat::Alive(now), config), TransportObserver(|p|{
+        match p {
+            _ => default_transport_observation(p)
+        }
+    }))
+}
+
+
+pub(crate) struct Engine {
+    state: EngineState,
+    callback:TransportObserver,
+    output:VecDeque<Output>
+}
+
+pub(crate) enum Output {
     Send(Payload),
+    Recv(MessageData),
+    State(EngineState),
     Wait(Instant)
 }
 
-// =====================
-
-enum EngineInput2<T> {
-    Control(T),
-    Data(Result<Payload,PayloadDecodeError>)
-}
-
-struct Stop();
-
-enum IO_FOO<T>{
-    Data(Payload),
-    Signal(T),
-}
-
-pub(crate) trait Transport {
-    type Signal;
-    fn process_state_change(&mut self, next_state:EngineState, output: &mut VecDeque<IO>) -> Option<Stop>;
-
-    // You can receive data - and then change state e.g. close, open, ping
-    // You can receive signals ... POLL - this updates transport internal state
-    // You ONLY receive transport specific signals, not OPEN or CLOSE 
-    // You can send transport specific - Poll END etc 
-    //
-    // Engine specific open, close methods - sets state!
-    // Initial state as part of constructor 
-    // close, will need specific IO stuff 
-    //
-    fn process_recv(&mut self, input:IO_FOO<Self::Signal>, output: &mut VecDeque<Payload>) -> (Option<EngineState>, Option<Stop>) {
-        (None, None)
-    }
-    fn process_send(&mut self, input:Payload, output: &mut VecDeque<IO_FOO<Self::Signal>>) -> (Option<EngineState>, Option<Stop>) {
-        (None, None)
-    }
-}
-
-struct FOO<T:Transport,Default:Transport>(T,Default);
-impl <T:Transport,Default:Transport> Transport for FOO<T,Default> where Default:Transport<Signal = ()> {
-    fn process_state_change(&mut self, next_state:EngineState, output: &mut VecDeque<IO>) -> Option<Stop> {
-        self.0.process_state_change(next_state, output)
-            .and_then(|_| self.1.process_state_change(next_state, output))
-    }
-
-    fn process_recv(&mut self, input:IO_FOO<Self::Signal>, output: &mut VecDeque<Payload>) -> (Option<EngineState>, Option<Stop>) {
-        let (state, stop ) = self.0.process_recv(input, output);
-        stop.is_none()
-            .then(|_| if let IO_FOO::Data(p) = input { Some(IO_FOO::<()>::Data(p))} else { None })
-            .map(|i| self.1.process_recv(i, output))
-            .unwrap_or((state,stop))
-    }
-
-    fn process_send(&mut self, input:Payload, output: &mut VecDeque<IO_FOO<Self::Signal>>) -> (Option<EngineState>, Option<Stop>) {
-        let (state, stop ) = self.0.process_send(input, output);
-        stop.is_none()
-            .then(|_| if let IO_FOO::Data(p) = input { Some(IO_FOO::<()>::Data(p))} else { None })
-            .map(|i| self.1.process_send(i, output))
-            .unwrap_or((state,stop))
-    }
-}
-
-struct BaseServerTransport {}
-impl Transport for BaseServerTransport {
-    fn process_state_change(&mut self, next_state:EngineState, output: &mut VecDeque<IO>) -> Option<Stop> {
-        match next_state {
-            EngineState::New(s) => {},
-            EngineState::Connected(h) => {
-                // DISPATCH OPEN 
-            },
-            EngineState::Closing(t,r) => {
-                // DISPATCH CLOSE
-            }
-            _ => {}
+impl Engine {
+    pub fn new(initial_state:EngineState, callback:TransportObserver) -> Self {
+        Self {
+            state:initial_state,
+            callback,
+            output: VecDeque::new()
         }
     }
 
-    fn process_recv(&mut self, input:IO_FOO<Self::Signal>, output: &mut VecDeque<Payload>) -> (Option<EngineState>, Option<Stop>) {
-        output.push_back(input);
-        output.push_back(input);
-        let s = match input {
-            IO_FOO::Data(Payload::Close(b)) => {
-                Some(EngineState::Closing(Instant::now(), b))
-            },
-            _ => None
-        };
-        (None,None)
+    pub fn poll(&mut self, now:Instant) -> Option<Output> {
+        self.update_time(now);    
+        self.output.pop_front()
+            .or_else(|| self.next_deadline().map(|t|Output::Wait(t)))
     }
 
-    // Can you send CLOSE?
-    // NO!!
-    fn process_send(&mut self, input:Payload, output: &mut VecDeque<IO_FOO<Self::Signal>>) -> (Option<EngineState>, Option<Stop>) {
-        output.push_back(input);
-        (None, None)
+    pub fn send(&mut self, m:MessageData, now:Instant) -> Result<(),EngineError> {
+        self.update_time(now);
+        match self.state {
+            EngineState::Closing(..) => Err(EngineError::AlreadyClosed),
+            EngineState::Closed(..) => Err(EngineError::AlreadyClosed),
+            _ => Ok(())
+        }?;
+        self.output.push_back(Output::Send(Payload::Message(m)));
+        Ok(())
     }
-}
 
-struct BaseClientTransport {}
-impl Transport for BaseClientTransport {
-    fn process_state_change(&mut self, next_state:EngineState, output: &mut VecDeque<IO>) -> Option<Stop> {
-        match next_state {
-            EngineState::New(s) => {},
-            EngineState::Connected(h,c) => {
+    pub fn recv(&mut self, p:Payload, now:Instant) -> Result<(),EngineError> { 
+        self.update_time(now);
+        match self.state {
+            EngineState::Closed(_) => Err(EngineError::AlreadyClosed),
+            _ => Ok(())
+        }?;
+
+        let next = self.callback.0(&p);
+        match p {
+            Payload::Message(m) => { 
+                self.output.push_back(Output::Recv(m));
             },
-            EngineState::Closing(t,r) => {
-                // DISPATCH CLOSE
-            }
             _ => {}
+        }
+        if let Some(n) = next {
+            self.update_state(n)
+        }
+        Ok(())
+    }
+
+    fn update_time(&mut self, now:Instant) {
+        let deadline = self.next_deadline();
+        if now > deadline.unwrap_or(now) {
+            let next = match self.state {
+                EngineState::New(s) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
+                EngineState::Connected(Heartbeat::Alive(_),c) => Some(EngineState::Connected(Heartbeat::Unknown(now), c)),
+                EngineState::Connected(Heartbeat::Unknown(_),c) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
+                EngineState::Closing(start,r) => Some(EngineState::Closing(now, r)),
+                EngineState::Closed(r) => None
+            };
+            if let Some(n) = next { self.update_state(n) }
         }
     }
 
-    fn process_recv(&mut self, input:IO_FOO<Self::Signal>, output: &mut VecDeque<Payload>) -> (Option<EngineState>, Option<Stop>) {
-        // Session level filters...
-        // We need sperate buffers ...
-        output.push_back(input);
-        let s = match input {
-            IO_FOO::Data(Payload::Open(b)) => {
-                // TODO: FIX inits
-                Some(EngineState::Connected(Heartbeat::Alive(Instant::now()), TransportConfig::default()))
-            },
-            IO_FOO::Data(Payload::Close(b)) => {
-                Some(EngineState::Closing(Instant::now(), b))
-            },
-            _ => None
-        };
-        (None,None)
+    fn next_deadline(&self) -> Option<Instant> {
+        match self.state {
+            EngineState::New(start) => Some(start + Duration::from_millis(5000)),
+            EngineState::Connected(Heartbeat::Alive(s), config) => Some(s + Duration::from_millis(config.ping_interval)),
+            EngineState::Connected(Heartbeat::Unknown(s), config) => Some(s + Duration::from_millis(config.ping_timeout)),
+            EngineState::Closing(start,_) => Some(start + Duration::from_millis(5000)),
+            EngineState::Closed(r) => None
+        }
     }
 
-    fn process_send(&mut self, input:Payload, output: &mut VecDeque<IO_FOO<Self::Signal>>) -> (Option<EngineState>, Option<Stop>) {
-        output.push_back(input);
-        (None, None)
+    fn update_state(&mut self, s:EngineState) {
+        self.state = s;
+        self.output.push_back(Output::State(s))
     }
 }
-
-pub struct GenericTransport();
-impl Transport for GenericTransport {
-    type Signal = ();
-}
-
-type ServerTransport<T> = FOO<T, BaseServerTransport>;
-type ClientTransport<T> = FOO<T, BaseClientTransport>;
-
-pub fn create_server_transport<T>(transport:T) -> ServerTransport<T> {
-    FOO(transport, BaseServerTransport {  })
-}
-pub fn create_client_transport<T>(transport:T) -> ClientTransport<T> {
-    FOO(transport, BaseClientTransport {  })
-}
-
-
 
 #[derive(Debug,Copy,Clone)]
 enum Heartbeat {
@@ -192,88 +151,12 @@ impl Heartbeat {
 }
 
 #[derive(Debug,Copy,Clone)]
-enum EngineState {
+pub(crate) enum EngineState {
     New(Instant),
     Connected(Heartbeat, TransportConfig),
     Closing(Instant, EngineCloseReason),
     Closed(EngineCloseReason)
 }
-
-#[derive(Debug)]
-pub(crate) struct Engine<T:Transport> {
-    recv_buffer: VecDeque<Payload>,
-    send_buffer: VecDeque<IO_FOO<T::Signal>>,
-    state:EngineState,
-    transport:T
-}
-
-
-/* The engine is a state machine keeping track of connectivtiy
- * Transports map their ingress into Generalised `EngineInput`
- * but we still need a specialised part of the statemachine.
- * For example, Polling has rules around Poll attempts which requires state 
- * so statemachine holds specific polling validation to ensure input is valid.
- */
-
-impl <T> Engine<T> where T: Transport 
-{
-    pub fn new(now:Instant, transport:T, initial_state:EngineState) -> Self {
-        Self {
-            recv_buffer: VecDeque::new(),
-            send_buffer: VecDeque::new(),
-            state: initial_state,
-            transport
-        }
-    }
-
-    // TODO: We need to return result !!!
-    pub fn send(&mut self, input:Payload, now:Instant) -> Result<(),EngineError> {
-        self.advance_time(now);
-        self.transport.process_recv(input, &mut self.send_buffer)
-    }
-    pub fn recv(&mut self, input:IO_FOO<T::Signal>, now:Instant) -> Result<(),EngineError> {
-        self.advance_time(now);
-        self.transport.process_recv(input, &mut self.recv_buffer)
-    }
-
-    pub fn poll(&mut self, now:Instant, config:&TransportConfig) -> Option<IO> {
-        self.advance_time(now);
-        self.recv_buffer.pop_front()
-            .or(self.send_buffer.pop_front())
-            .or_else(|| self.next_deadline())
-            .map(|t|IO::Wait(t))
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        match self.state {
-            EngineState::New(start) => Some(start + Duration::from_millis(5000)),
-            EngineState::Connected(Heartbeat::Alive(s), config) => Some(s + Duration::from_millis(config.ping_interval)),
-            EngineState::Connected(Heartbeat::Unknown(s), config) => Some(s + Duration::from_millis(config.ping_timeout)),
-            EngineState::Closing(start,_) => Some(start + Duration::from_millis(5000)),
-            EngineState::Closed(r) => None
-        }
-    }
-
-    fn advance_time(&mut self, now:Instant) {
-        let deadline = self.next_deadline();
-        if now > deadline {
-            let next = match self.state {
-                EngineState::New(s) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
-                EngineState::Connected(Heartbeat::Alive(_),c) => Some(EngineState::Connected(Heartbeat::Unknown(now), c)),
-                EngineState::Connected(Heartbeat::Unknown(_),c) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
-                EngineState::Closing(start,r) => Some(EngineState::Closing(now, r)),
-                EngineState::Closed(r) => None
-            };
-
-            if let Some(s) = next {
-                self.transport.process_state_change(s, self.send_buffer);
-                self.state = s;
-            }
-        }
-    }
-}
-
-
 
 
 // =====================

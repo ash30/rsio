@@ -1,11 +1,14 @@
-use actix_ws::CloseReason;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use tokio::time::Instant;
 use actix_web::{guard, web, HttpResponse, Resource, ResponseError};
 use tokio_stream::StreamExt;
-use crate::io::{self, SessionCloseReason, create_session_local, Session};
+use crate::io::{create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
-use crate::transport::TransportKind;
-use crate::engine::{EngineError, self, Engine, EngineInput, EngineSignal, EngineCloseReason};
+use crate::transport::{TransportKind, TransportError};
+use crate::engine::{EngineError, self, Engine, EngineCloseReason, AsyncTransport, EngineState, default_server_state_update, create_server_engine};
 
 pub use crate::proto::TransportConfig;
 pub type IOEngine = Session;
@@ -42,15 +45,199 @@ impl actix_web::ResponseError for EngineError {
             _ => actix_web::http::StatusCode::BAD_REQUEST
         }
     }
-
     fn error_response(&self) -> HttpResponse<actix_web::body::BoxBody> {
         return HttpResponse::new(self.status_code())
     }
-
 }
 
+struct ActixWSAdapter {
+    session:actix_ws::Session,
+    msg_stream:actix_ws::MessageStream
+}
+
+impl AsyncTransport for ActixWSAdapter {
+    async fn send(&mut self, data:Payload) -> Result<(),crate::transport::TransportError> {
+        let d = data.encode(TransportKind::Continuous);
+        match data { 
+            Payload::Message(MessageData::Binary(_)) => {
+                self.session.binary(d).await
+                    .map_err(|_|TransportError::Generic)
+            }   
+            _ => {
+                self.session.text(String::from_utf8(d).unwrap()).await
+                    .map_err(|e|TransportError::Generic)
+            }
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Payload,crate::transport::TransportError> {
+        let next = self.msg_stream.next().await;
+        match next {
+            None => Err(TransportError::Generic),
+            Some(Err(e)) => Err(TransportError::Generic),
+            Some(Ok(m)) => { 
+                m.try_into().map_err(|e|TransportError::Generic)
+            }
+        }
+    }
+
+    async fn engine_state_update(&mut self, next_state:EngineState) {
+        if let Some(p) = default_server_state_update(next_state) {
+            // TODO: Should return error to caller...
+            self.send(p).await;
+        }
+       match next_state {
+            EngineState::Closed(..) => { self.session.clone().close(None); }
+            _ => {}
+       };
+    }
+}
+
+struct PollingTransport {
+    rx: mpsc::Receiver<PollingReqMessage>,
+    config:TransportConfig,
+    state: PollingState,
+    buffer:Vec<Payload>,
+}
+
+enum PollingState {
+    Active (mpsc::Sender<Result<Payload,EngineError>>),
+    Inactive
+}
+
+impl AsyncTransport for PollingTransport {
+    async fn recv(&mut self) -> Result<Payload,TransportError> {
+        loop {
+            let result = match self.rx.recv().await {
+                Some(PollingReqMessage::Poll(sender)) => {
+                    match &self.state {
+                        PollingState::Inactive => {
+                            self.state = PollingState::Active(sender);
+                        }
+                        PollingState::Active(..) => {
+                            sender.send(Err(EngineError::Generic)).await;
+                            self.state = PollingState::Inactive;
+                        }
+                    };
+                    None
+                }
+                Some(PollingReqMessage::Data(Ok(p))) => {
+                    Some(Ok(p))
+                },
+                Some(PollingReqMessage::Data(Err(e))) => {
+                    Some(Err(TransportError::Generic))
+                },
+                None => { 
+                    Some(Err(TransportError::Generic))
+                }
+            };
+            if let Some(s) = result { break s } 
+        }
+    }
+
+    async fn send(&mut self, data:Payload) -> Result<(),TransportError> {
+        match &self.state {
+            PollingState::Active(sender) => {
+                if let Err(e) = sender.send(Ok(data)).await {
+                    Err(TransportError::Generic)
+                }
+                else { 
+                    Ok(())
+                }
+            }
+            PollingState::Inactive => {
+                self.buffer.push(data);
+                Ok(())
+            }
+        }
+    }
+
+    async fn engine_state_update(&mut self, next_state:EngineState) {
+        if let Some(p) = default_server_state_update(next_state) {
+            let _ = self.send(p).await;
+        }
+        match next_state {
+            EngineState::Closed(e) => {
+                self.rx.close();
+            }
+            _ => {}
+        }
+    }
+}
+
+
+
+struct PollingTransportRouter {
+    txs: Mutex<HashMap<Sid, mpsc::Sender<PollingReqMessage>>>
+}
+
+enum PollingReqMessage {
+    Poll(mpsc::Sender<Result<Payload,EngineError>>),
+    Data(Result<Payload,PayloadDecodeError>)
+}
+
+impl PollingTransportRouter {
+    fn create(&self, sid:Sid, config:TransportConfig) -> PollingTransport {
+        let (tx,rx) = mpsc::channel(32);
+        self.txs.lock().unwrap().insert(sid.clone(), tx);
+
+        PollingTransport {
+            buffer: Vec::new(),
+            config,
+            rx,
+            state: PollingState::Inactive
+        }
+    }
+
+    fn delete(&self, sid:Sid) -> Result<(),EngineError> {
+       self.txs.lock().unwrap().remove(&sid).ok_or(EngineError::MissingSession).map(|_|())
+    }
+
+    async fn post<T:TryInto<Payload,Error=PayloadDecodeError>>(&self, sid:Sid, payload:T) -> Result<(),EngineError> {
+        let tx = self.txs.lock()
+            .unwrap()
+            .get(&sid)
+            .map(|t| t.clone())
+            .ok_or(EngineError::MissingSession)?;
+
+        Ok(())
+    }
+
+    async fn poll(&self, sid:Sid) -> Result<Vec<u8>,EngineError> {
+        let tx = self.txs.lock()
+            .unwrap()
+            .get(&sid)
+            .map(|t| t.clone())
+            .ok_or(EngineError::MissingSession)?;
+
+        let (res_tx, mut res_rx) = mpsc::channel(32);
+        tx.send(PollingReqMessage::Poll(res_tx)).await;
+        
+        match res_rx.recv().await {
+            Some(Ok(first)) => {
+                let mut buffer = vec![first];
+                let deadline = Instant::now() + Duration::from_millis(100);
+                loop {
+                    match tokio::time::timeout_at(deadline,res_rx.recv()).await {
+                        Err(_) => break, // Timeout 
+                        Ok(None) => break, // Transport Close, just return existing buffer...
+                        Ok(Some(Err(_))) => break, // Poll Error ? shouldnt receive this....
+                        Ok(Some(Ok(p))) => {
+                            buffer.push(p)
+                        }
+                    };
+                };
+                let data = Payload::encode_combined(&buffer, TransportKind::Poll);
+                Ok(data)
+            }
+            _ => Err(EngineError::Generic) // Transport closed ?
+        }
+    }
+}
+
+use tokio::sync::mpsc;
 pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IOEngine)) -> Resource {
-    let polling = io::create_multiplex(config.clone());
+    let poll_router = Arc::new(PollingTransportRouter { txs: HashMap::new().into() });
 
     let path = { 
         path.route(
@@ -63,46 +250,8 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut engine = Engine::new(Instant::now().into(), GenericTransport{});
-                    engine.recv(EngineInput::Control(EngineSignal::New(TransportKind::Continuous)), Instant::now().into(), &config);
-
-                    let session = create_session_local(engine, config.clone(), |tx,mut rx| {
-                        async move {
-                            let reason = loop {
-                                tokio::select! {
-                                    recv = msg_stream.next() => {
-                                        dbg!(&recv);
-                                        let Some(r) = recv else { break SessionCloseReason::TransportClose};
-                                        let res = tokio::sync::oneshot::channel();
-                                        let input  = match r {
-                                            Ok(m) => EngineInput::Data(m.try_into()),
-                                            Err(_) => EngineInput::Data(Err(PayloadDecodeError::InvalidFormat))
-                                        };
-                                        dbg!(&input);
-                                        if let Err(_) =  tx.send((input,res.0)).await {
-                                            break SessionCloseReason::Unknown;
-                                        }
-                                        if let Err(_) = res.1.await {
-                                            break SessionCloseReason::Unknown;
-                                        }
-                                    },
-                                    send = rx.recv() => {
-                                        let Some(s) = send else { break SessionCloseReason::Unknown } ;
-                                        let d = s.encode(TransportKind::Continuous);
-                                        let res = match s {
-                                            Payload::Message(MessageData::Binary(..)) => session.binary(d).await,
-                                            _ => session.text(String::from_utf8(d).unwrap()).await
-                                        };
-                                        if let Err(_) = res { break SessionCloseReason::TransportClose } 
-                                    }
-                                } 
-                            };
-                            // close transport out once engine has closed 
-                            tokio::spawn(session.close(Some(CloseReason { code: actix_ws::CloseCode::Normal, description: Option::None })));
-                            // return reason so can propagate up to session owner
-                            return reason
-                        }
-                    } );
+                    let mut engine = create_server_engine(config, Instant::now().into());
+                    let session = create_session_local(engine, ActixWSAdapter { session, msg_stream });
                     service(session);
                     return Ok::<HttpResponse, EngineError>(response);
                 }
@@ -112,7 +261,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
 
     // LONG POLL GET 
     let path = { 
-        let polling = polling.clone();
+        let polling_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Get())
@@ -120,16 +269,13 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                 ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
             }))
             .to(move |session: web::Query<SessionInfo>| { 
-                let polling = polling.clone();
+                let polling_router = poll_router.clone();
                 async move {
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };
-                    if let Err(_) = polling.input(sid, engine::EngineInput::Control(EngineSignal::Poll)).await {
-                        return (EngineError::MissingSession).error_response()
-                    }
-                    match polling.listen(sid).await {
-                        Ok(vec) => HttpResponse::Ok().body(Payload::encode_combined(&vec, TransportKind::Poll)),
+                    match poll_router.poll(sid).await {
+                        Ok(vec) => HttpResponse::Ok().body(vec),
                         Err(e) => e.error_response()
                     }
                 }
@@ -139,20 +285,20 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
 
     // LONG POLL CREATE
     let path = {
-        let polling = polling.clone();
+        let polling_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Get())
-            .to(move | _session: web::Query<SessionInfo>| {
-                let polling = polling.clone();
+            .to(|_session: web::Query<SessionInfo>| {
+                let polling_router = poll_router.clone();
+                let sid = uuid::Uuid::new_v4();
+                let mut engine = create_server_engine(config, Instant::now().into());
+                let transport = poll_router.create(sid, config);
+                let session = create_session_local(engine, transport);
+                service(session);
                 async move {
-                    let sid = Sid::new_v4();
-                    let Ok(session) = polling.create(sid).await else {
-                        return HttpResponse::InternalServerError().finish();
-                    };
-                    service(session);
-                    match polling.listen(sid).await {
-                        Ok(vec) => HttpResponse::Ok().body(Payload::encode_combined(&vec, TransportKind::Poll)),
+                    match poll_router.poll(sid).await {
+                        Ok(vec) => HttpResponse::Ok().body(vec),
                         Err(e) => e.error_response()
                     }
                 }
@@ -162,19 +308,19 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
 
     // POST MSG LONG POLL
     let path = { 
-        let polling = polling.clone();
+        let polling_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Post())
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
-                let polling = polling.clone();
+                let polling_router = poll_router.clone();
                 async move { 
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };
                     for p in Payload::decode_combined(body.as_ref(), TransportKind::Poll) {
                         // TODO: Handle errors please
-                        polling.input(sid, EngineInput::Data(p)).await;
+                        let _ = poll_router.post(sid, p).await;
                     }
                     HttpResponse::Ok().body("ok")
                 }
@@ -184,20 +330,18 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
     };
 
     let path = {
-        let polling = polling.clone();
+        let polling_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Delete())
             .to(move | session:web::Query<SessionInfo>| {
-                let polling = polling.clone();
+                let polling_router = poll_router.clone();
                 async move { 
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };
-                    if let Err(_) = polling.input(sid, EngineInput::Data(Ok(Payload::Close(EngineCloseReason::ClientClose)))).await {
-                        return (EngineError::MissingSession).error_response()
-                    }
-                    match polling.delete(sid).await {
+                    let res = poll_router.delete(sid);
+                    match res {
                         Ok(_) => HttpResponse::Ok().finish(),
                         Err(e) => e.error_response()
                     }
