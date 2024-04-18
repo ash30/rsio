@@ -8,7 +8,7 @@ use tokio_stream::StreamExt;
 use crate::io::{create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::transport::{TransportKind, TransportError};
-use crate::engine::{EngineError, self, Engine, EngineCloseReason, AsyncTransport, EngineState, default_server_state_update, create_server_engine};
+use crate::engine::{EngineError, EngineState, AsyncLocalTransport, default_server_state_update, create_server_engine};
 
 pub use crate::proto::TransportConfig;
 pub type IOEngine = Session;
@@ -55,7 +55,7 @@ struct ActixWSAdapter {
     msg_stream:actix_ws::MessageStream
 }
 
-impl AsyncTransport for ActixWSAdapter {
+impl AsyncLocalTransport for ActixWSAdapter {
     async fn send(&mut self, data:Payload) -> Result<(),crate::transport::TransportError> {
         let d = data.encode(TransportKind::Continuous);
         match data { 
@@ -82,7 +82,7 @@ impl AsyncTransport for ActixWSAdapter {
     }
 
     async fn engine_state_update(&mut self, next_state:EngineState) {
-        if let Some(p) = default_server_state_update(next_state) {
+        if let Some(p) = default_server_state_update(self, next_state) {
             // TODO: Should return error to caller...
             self.send(p).await;
         }
@@ -105,7 +105,7 @@ enum PollingState {
     Inactive
 }
 
-impl AsyncTransport for PollingTransport {
+impl AsyncLocalTransport for PollingTransport {
     async fn recv(&mut self) -> Result<Payload,TransportError> {
         loop {
             let result = match self.rx.recv().await {
@@ -121,11 +121,8 @@ impl AsyncTransport for PollingTransport {
                     };
                     None
                 }
-                Some(PollingReqMessage::Data(Ok(p))) => {
+                Some(PollingReqMessage::Data(p)) => {
                     Some(Ok(p))
-                },
-                Some(PollingReqMessage::Data(Err(e))) => {
-                    Some(Err(TransportError::Generic))
                 },
                 None => { 
                     Some(Err(TransportError::Generic))
@@ -153,7 +150,8 @@ impl AsyncTransport for PollingTransport {
     }
 
     async fn engine_state_update(&mut self, next_state:EngineState) {
-        if let Some(p) = default_server_state_update(next_state) {
+        dbg!("polling state change");
+        if let Some(p) = default_server_state_update(self, next_state) {
             let _ = self.send(p).await;
         }
         match next_state {
@@ -173,11 +171,12 @@ struct PollingTransportRouter {
 
 enum PollingReqMessage {
     Poll(mpsc::Sender<Result<Payload,EngineError>>),
-    Data(Result<Payload,PayloadDecodeError>)
+    Data(Payload)
 }
 
 impl PollingTransportRouter {
     fn create(&self, sid:Sid, config:TransportConfig) -> PollingTransport {
+        dbg!("create poll");
         let (tx,rx) = mpsc::channel(32);
         self.txs.lock().unwrap().insert(sid.clone(), tx);
 
@@ -193,17 +192,28 @@ impl PollingTransportRouter {
        self.txs.lock().unwrap().remove(&sid).ok_or(EngineError::MissingSession).map(|_|())
     }
 
-    async fn post<T:TryInto<Payload,Error=PayloadDecodeError>>(&self, sid:Sid, payload:T) -> Result<(),EngineError> {
+    async fn post(&self, sid:Sid, data:&[u8]) -> Result<(),EngineError> {
         let tx = self.txs.lock()
             .unwrap()
             .get(&sid)
             .map(|t| t.clone())
             .ok_or(EngineError::MissingSession)?;
 
+        let v = Payload::decode_combined(data, TransportKind::Poll);
+        if v.iter().any(|p|p.is_err()){
+            return Err(EngineError::UnknownPayload)
+        }
+        else {
+            for p in v.into_iter().filter(|p|p.is_ok()).map(|p|p.unwrap()) {
+               tx.send(PollingReqMessage::Data(p)).await;
+            }
+        }
+
         Ok(())
     }
 
     async fn poll(&self, sid:Sid) -> Result<Vec<u8>,EngineError> {
+        dbg!("poll");
         let tx = self.txs.lock()
             .unwrap()
             .get(&sid)
@@ -250,7 +260,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut engine = create_server_engine(config, Instant::now().into());
+                    let mut engine = create_server_engine(sid,config, Instant::now().into());
                     let session = create_session_local(engine, ActixWSAdapter { session, msg_stream });
                     service(session);
                     return Ok::<HttpResponse, EngineError>(response);
@@ -261,7 +271,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
 
     // LONG POLL GET 
     let path = { 
-        let polling_router = poll_router.clone();
+        let poll_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Get())
@@ -269,7 +279,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                 ctx.head().uri.query().is_some_and(|s| s.contains("sid"))
             }))
             .to(move |session: web::Query<SessionInfo>| { 
-                let polling_router = poll_router.clone();
+                let poll_router = poll_router.clone();
                 async move {
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
@@ -285,14 +295,14 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
 
     // LONG POLL CREATE
     let path = {
-        let polling_router = poll_router.clone();
+        let poll_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Get())
-            .to(|_session: web::Query<SessionInfo>| {
-                let polling_router = poll_router.clone();
+            .to(move |_session: web::Query<SessionInfo>| {
+                let poll_router = poll_router.clone();
                 let sid = uuid::Uuid::new_v4();
-                let mut engine = create_server_engine(config, Instant::now().into());
+                let engine = create_server_engine(sid, config, Instant::now().into());
                 let transport = poll_router.create(sid, config);
                 let session = create_session_local(engine, transport);
                 service(session);
@@ -308,21 +318,21 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
 
     // POST MSG LONG POLL
     let path = { 
-        let polling_router = poll_router.clone();
+        let poll_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Post())
             .to(move |session: web::Query<SessionInfo>, body:web::Bytes| { 
-                let polling_router = poll_router.clone();
+                let poll_router = poll_router.clone();
                 async move { 
+                    let poll_router = poll_router.clone();
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };
-                    for p in Payload::decode_combined(body.as_ref(), TransportKind::Poll) {
-                        // TODO: Handle errors please
-                        let _ = poll_router.post(sid, p).await;
+                    match poll_router.post(sid, body.as_ref()).await {
+                        Ok(_) => HttpResponse::Ok().body("ok"),
+                        Err(e) => e.error_response()
                     }
-                    HttpResponse::Ok().body("ok")
                 }
             }
             )
@@ -330,12 +340,12 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
     };
 
     let path = {
-        let polling_router = poll_router.clone();
+        let poll_router = poll_router.clone();
         path.route(
             web::route()
             .guard(guard::Delete())
             .to(move | session:web::Query<SessionInfo>| {
-                let polling_router = poll_router.clone();
+                let poll_router = poll_router.clone();
                 async move { 
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()

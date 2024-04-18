@@ -1,6 +1,7 @@
 use std::task::Poll;
 use futures_util::Stream;
 use tokio::select;
+use crate::engine::AsyncLocalTransport;
 use crate::engine::AsyncTransport;
 use crate::engine::Engine;
 use crate::engine::Output;
@@ -98,7 +99,7 @@ pub fn create_session_local<T>(
     transport: T
 ) -> Session
 where
-      T:AsyncTransport + Unpin + 'static,
+      T:AsyncLocalTransport + Unpin + 'static,
 {
     let (up_req, up_res) = engine_channel();
     let handle = tokio::task::spawn_local(async move {
@@ -109,7 +110,7 @@ where
     return Session { handle, tx:up_req.0, rx:up_req.1 };
 }
 
-async fn bind_engine<T:AsyncTransport>(
+async fn bind_engine<T:AsyncLocalTransport>(
     mut engine:Engine,
     mut transport:T,
     up_stream:EngineChannelRes<MessageData,MessageData,EngineError>) -> Engine {
@@ -128,6 +129,7 @@ async fn bind_engine<T:AsyncTransport>(
                     //TODO: ???
                 },
                 Some(Output::State(s)) => { 
+                    dbg!("Engine state change", &s);
                     transport.engine_state_update(s);
                 },
                 Some(Output::Wait(t)) => break Some(t),

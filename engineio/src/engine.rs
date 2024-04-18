@@ -5,15 +5,28 @@ use crate::transport::TransportError;
 pub use crate::proto::*;
 use std::collections::VecDeque;
 
-pub(crate) trait AsyncTransport {
+#[trait_variant::make(AsyncTransport: Send)]
+pub(crate) trait AsyncLocalTransport {
     async fn engine_state_update(&mut self, next_state:EngineState);
     async fn recv(&mut self) -> Result<Payload,TransportError>;
     async fn send(&mut self, data:Payload) -> Result<(),TransportError>;
+    fn upgrades() -> Vec<String> {
+        vec![]
+    }
 }
 
-pub(crate) fn default_server_state_update(next_state:EngineState) -> Option<Payload>{
+pub(crate) fn default_server_state_update<T:AsyncLocalTransport>(transport:&T, next_state:EngineState) -> Option<Payload>{
     match next_state {
-        //EngineState::Connected(h) => Some(Payload::Open()),
+        EngineState::Connected(_, config, sid) => { 
+            let data = serde_json::json!({
+                "upgrades": transport.upgrades(),
+                "maxPayload": config.max_payload,
+                "pingInterval": config.ping_interval,
+                "pingTimeout": config.ping_timeout,
+                "sid": sid
+            });
+            Some(Payload::Open(data))
+        },
         EngineState::Closing(t,r) => Some(Payload::Close(EngineCloseReason::ServerClose)),
         EngineState::Closed(r) => Some(Payload::Noop),
         _ => None
@@ -28,23 +41,29 @@ pub(crate) fn default_client_state_update(next_state:EngineState) -> Option<Payl
     }
 }
 
-fn default_transport_observation(p:&Payload) -> Option<EngineState> {
+fn default_transport_observer(p:&Payload) -> Option<EngineState> {
     match p {
         Payload::Close(r) => Some(EngineState::Closed(*r)),
         _ => None
     }
 }
 
-struct TransportObserver(fn(&Payload) -> Option<EngineState>);
+pub (crate) struct TransportObserver(fn(&Payload) -> Option<EngineState>);
 
-pub(crate) fn create_server_engine(config:TransportConfig, now:Instant) -> Engine {
-    Engine::new(EngineState::Connected(Heartbeat::Alive(now), config), TransportObserver(|p|{
+pub(crate) fn create_server_engine(sid:Sid, config:TransportConfig, now:Instant) -> Engine {
+    Engine::new(EngineState::Connected(Heartbeat::Alive(now), config, sid), TransportObserver(|p|{
         match p {
-            _ => default_transport_observation(p)
+            _ => default_transport_observer(p)
         }
     }))
 }
-
+pub(crate) fn create_client_engine(now:Instant) -> Engine {
+    Engine::new(EngineState::New(now), TransportObserver(|p|{
+        match p {
+            _ => default_transport_observer(p)
+        }
+    }))
+}
 
 pub(crate) struct Engine {
     state: EngineState,
@@ -61,10 +80,13 @@ pub(crate) enum Output {
 
 impl Engine {
     pub fn new(initial_state:EngineState, callback:TransportObserver) -> Self {
+        let mut buffer = VecDeque::new();
+        buffer.push_back(Output::State(initial_state));
+
         Self {
             state:initial_state,
             callback,
-            output: VecDeque::new()
+            output: buffer
         }
     }
 
@@ -110,9 +132,9 @@ impl Engine {
         if now > deadline.unwrap_or(now) {
             let next = match self.state {
                 EngineState::New(s) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
-                EngineState::Connected(Heartbeat::Alive(_),c) => Some(EngineState::Connected(Heartbeat::Unknown(now), c)),
-                EngineState::Connected(Heartbeat::Unknown(_),c) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
-                EngineState::Closing(start,r) => Some(EngineState::Closing(now, r)),
+                EngineState::Connected(Heartbeat::Alive(_),c,s) => Some(EngineState::Connected(Heartbeat::Unknown(now), c,s)),
+                EngineState::Connected(Heartbeat::Unknown(_),c,s) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
+                EngineState::Closing(start,r) => Some(EngineState::Closed(r)),
                 EngineState::Closed(r) => None
             };
             if let Some(n) = next { self.update_state(n) }
@@ -122,8 +144,8 @@ impl Engine {
     fn next_deadline(&self) -> Option<Instant> {
         match self.state {
             EngineState::New(start) => Some(start + Duration::from_millis(5000)),
-            EngineState::Connected(Heartbeat::Alive(s), config) => Some(s + Duration::from_millis(config.ping_interval)),
-            EngineState::Connected(Heartbeat::Unknown(s), config) => Some(s + Duration::from_millis(config.ping_timeout)),
+            EngineState::Connected(Heartbeat::Alive(s), config,_) => Some(s + Duration::from_millis(config.ping_interval)),
+            EngineState::Connected(Heartbeat::Unknown(s), config,_) => Some(s + Duration::from_millis(config.ping_timeout)),
             EngineState::Closing(start,_) => Some(start + Duration::from_millis(5000)),
             EngineState::Closed(r) => None
         }
@@ -153,7 +175,7 @@ impl Heartbeat {
 #[derive(Debug,Copy,Clone)]
 pub(crate) enum EngineState {
     New(Instant),
-    Connected(Heartbeat, TransportConfig),
+    Connected(Heartbeat, TransportConfig, Sid),
     Closing(Instant, EngineCloseReason),
     Closed(EngineCloseReason)
 }
