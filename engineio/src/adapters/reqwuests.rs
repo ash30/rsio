@@ -5,9 +5,10 @@ use crate::engine::{AsyncTransport, create_client_engine};
 use crate::io::create_session;
 use crate::proto::Payload;
 use crate::io::Session;
-use crate::engine::Engine;
+use crate::engine::BaseEngine;
 
 pub use crate::proto::TransportConfig;
+use crate::transport::TransportError;
 
 
 pub fn io(url:impl reqwest::IntoUrl ) -> reqwest::Result<Session> {
@@ -33,7 +34,7 @@ impl AsyncTransport for ClientPollingTransport {
         todo!()
     }
 
-    async fn engine_state_update(&mut self, next_state:crate::engine::EngineState) {
+    async fn engine_state_update(&mut self, next_state:crate::engine::EngineState) -> Result<(),TransportError>{
         todo!()
     }
 }

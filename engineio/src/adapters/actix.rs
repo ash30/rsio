@@ -8,7 +8,7 @@ use tokio_stream::StreamExt;
 use crate::io::{create_session_local, Session};
 use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
 use crate::transport::{TransportKind, TransportError};
-use crate::engine::{EngineError, EngineState, AsyncLocalTransport, default_server_state_update, create_server_engine};
+use crate::engine::{EngineError, EngineState, AsyncLocalTransport, default_server_state_update, create_server_engine, TransportType};
 
 pub use crate::proto::TransportConfig;
 pub type IOEngine = Session;
@@ -51,6 +51,8 @@ impl actix_web::ResponseError for EngineError {
 }
 
 struct ActixWSAdapter {
+    sid: Sid,
+    config: TransportConfig,
     session:actix_ws::Session,
     msg_stream:actix_ws::MessageStream
 }
@@ -81,8 +83,8 @@ impl AsyncLocalTransport for ActixWSAdapter {
         }
     }
 
-    async fn engine_state_update(&mut self, next_state:EngineState) {
-        if let Some(p) = default_server_state_update(self, next_state) {
+    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<(),TransportError> {
+        if let Some(p) = default_server_state_update(self, self.sid, self.config, next_state) {
             // TODO: Should return error to caller...
             self.send(p).await;
         }
@@ -90,10 +92,12 @@ impl AsyncLocalTransport for ActixWSAdapter {
             EngineState::Closed(..) => { self.session.clone().close(None); }
             _ => {}
        };
+       Ok(())
     }
 }
 
 struct PollingTransport {
+    sid:Sid,
     rx: mpsc::Receiver<PollingReqMessage>,
     config:TransportConfig,
     state: PollingState,
@@ -110,21 +114,28 @@ impl AsyncLocalTransport for PollingTransport {
         loop {
             let result = match self.rx.recv().await {
                 Some(PollingReqMessage::Poll(sender)) => {
+                    dbg!("Poll Transport - Poll");
                     match &self.state {
-                        PollingState::Inactive => {
-                            self.state = PollingState::Active(sender);
-                        }
-                        PollingState::Active(..) => {
-                            sender.send(Err(EngineError::Generic)).await;
+                        PollingState::Active(s) if !s.is_closed() => {
+                            let _  = sender.send(Err(EngineError::InvalidPoll)).await;
                             self.state = PollingState::Inactive;
                         }
+                        _ => {
+                            // TODO: Better error  please
+                            for x in self.buffer.drain(..) {
+                                let _ = sender.send(Ok(x)).await;
+                            }
+                            self.state = PollingState::Active(sender);
+                        }
                     };
-                    None
+                    Some(Ok(Payload::Pong))
                 }
                 Some(PollingReqMessage::Data(p)) => {
+                    dbg!("Poll Transport - data");
                     Some(Ok(p))
                 },
                 None => { 
+                    dbg!("Poll Transport - ???");
                     Some(Err(TransportError::Generic))
                 }
             };
@@ -133,25 +144,30 @@ impl AsyncLocalTransport for PollingTransport {
     }
 
     async fn send(&mut self, data:Payload) -> Result<(),TransportError> {
+        dbg!("Polling SENDING", &data);
         match &self.state {
             PollingState::Active(sender) => {
+                dbg!("Polling SENDING ACTIVE", &data);
                 if let Err(e) = sender.send(Ok(data)).await {
-                    Err(TransportError::Generic)
+                    self.state = PollingState::Inactive;
+                    self.buffer.push(e.0.unwrap());
+                    Ok(())
                 }
                 else { 
                     Ok(())
                 }
             }
             PollingState::Inactive => {
+                dbg!("Polling SENDING INACTIVE", &data);
                 self.buffer.push(data);
                 Ok(())
             }
         }
     }
 
-    async fn engine_state_update(&mut self, next_state:EngineState) {
+    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<(),TransportError>{
         dbg!("polling state change");
-        if let Some(p) = default_server_state_update(self, next_state) {
+        if let Some(p) = default_server_state_update(self, self.sid, self.config, next_state) {
             let _ = self.send(p).await;
         }
         match next_state {
@@ -159,7 +175,12 @@ impl AsyncLocalTransport for PollingTransport {
                 self.rx.close();
             }
             _ => {}
-        }
+        };
+        Ok(())
+    }
+
+    fn upgrades() -> Vec<String> {
+        vec![TransportType::Websocket.to_string()]
     }
 }
 
@@ -181,6 +202,7 @@ impl PollingTransportRouter {
         self.txs.lock().unwrap().insert(sid.clone(), tx);
 
         PollingTransport {
+            sid,
             buffer: Vec::new(),
             config,
             rx,
@@ -213,20 +235,22 @@ impl PollingTransportRouter {
     }
 
     async fn poll(&self, sid:Sid) -> Result<Vec<u8>,EngineError> {
-        dbg!("poll");
+        dbg!("poll router 1");
         let tx = self.txs.lock()
             .unwrap()
             .get(&sid)
             .map(|t| t.clone())
             .ok_or(EngineError::MissingSession)?;
 
+        dbg!("poll router 2");
         let (res_tx, mut res_rx) = mpsc::channel(32);
         tx.send(PollingReqMessage::Poll(res_tx)).await;
         
         match res_rx.recv().await {
             Some(Ok(first)) => {
+                dbg!("poll router first", &first);
                 let mut buffer = vec![first];
-                let deadline = Instant::now() + Duration::from_millis(100);
+                let deadline = Instant::now() + Duration::from_millis(10);
                 loop {
                     match tokio::time::timeout_at(deadline,res_rx.recv()).await {
                         Err(_) => break, // Timeout 
@@ -260,8 +284,8 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
                 let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body).unwrap();
                 async move {
                     let sid = uuid::Uuid::new_v4();
-                    let mut engine = create_server_engine(sid,config, Instant::now().into());
-                    let session = create_session_local(engine, ActixWSAdapter { session, msg_stream });
+                    let mut engine = create_server_engine(sid, config, Instant::now().into());
+                    let session = create_session_local(engine, ActixWSAdapter { sid, config, session, msg_stream });
                     service(session);
                     return Ok::<HttpResponse, EngineError>(response);
                 }
@@ -281,6 +305,7 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
             .to(move |session: web::Query<SessionInfo>| { 
                 let poll_router = poll_router.clone();
                 async move {
+                    dbg!("REST POLL Start");
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };

@@ -4,9 +4,11 @@ use tokio::select;
 use crate::engine::AsyncLocalTransport;
 use crate::engine::AsyncTransport;
 use crate::engine::Engine;
+use crate::engine::Input;
 use crate::engine::Output;
 use crate::proto::MessageData;
 use crate::engine::EngineError;
+use crate::proto::Payload;
 use std::pin::Pin;
 use tokio::sync::oneshot;
 use tokio::sync::mpsc;
@@ -80,7 +82,7 @@ impl Stream for Session {
 }
 
 pub fn create_session<T>(
-    engine: Engine, 
+    engine: impl Engine + Send + 'static, 
     transport: T
 ) -> Session
 where
@@ -95,7 +97,7 @@ where
     return Session { handle, tx:up_req.0, rx:up_req.1 };
 }
 pub fn create_session_local<T>(
-    engine: Engine, 
+    engine: impl Engine + 'static, 
     transport: T
 ) -> Session
 where
@@ -111,26 +113,24 @@ where
 }
 
 async fn bind_engine<T:AsyncLocalTransport>(
-    mut engine:Engine,
+    mut engine:impl Engine,
     mut transport:T,
-    up_stream:EngineChannelRes<MessageData,MessageData,EngineError>) -> Engine {
+    up_stream:EngineChannelRes<MessageData,MessageData,EngineError>) -> impl Engine{
 
     let (up_send, mut up_recv) = up_stream;
     loop {
         let now = tokio::time::Instant::now();        
         let next = loop {
             match engine.poll(now.into()) {
-                Some(Output::Recv(m)) => {
-                    let _ = up_send.send(m).await;
+                Some(Output::Data(m)) => {
                     // TODO: ERROR?
+                    let _ = up_send.send(m).await;
                 },
-                Some(Output::Send(m)) => {
-                    let _ = transport.send(m).await;
-                    //TODO: ???
-                },
-                Some(Output::State(s)) => { 
+                Some(Output::StateUpdate(s)) => { 
                     dbg!("Engine state change", &s);
-                    transport.engine_state_update(s);
+                    let _ = engine.process_input(
+                        Input::TransportUpdate(s, transport.engine_state_update(s).await), now.into()
+                    );
                 },
                 Some(Output::Wait(t)) => break Some(t),
                 None => {
@@ -138,18 +138,21 @@ async fn bind_engine<T:AsyncLocalTransport>(
                 }
             }
         };
-
         let Some(next_deadline) = next else { dbg!(); break engine};
         select! {
             _ = tokio::time::sleep_until(next_deadline.into()) => {},
             Some((up,tx)) = up_recv.recv() => {
                 dbg!(&up);
-                tx.send(engine.send(up, now.into()));
+                if engine.is_connected() {
+                    // TODO: handle error 
+                    let _ = transport.send(Payload::Message(up)).await;
+                    tx.send(Ok(()));
+                }
             }
             Ok(down) = transport.recv() =>  {
                 // TODO: What about errors ?
                 dbg!(&down);
-                engine.recv(down, now.into());
+                engine.process_input(Input::Recv(down), now.into());
             }
         };
     }
