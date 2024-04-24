@@ -136,6 +136,7 @@ impl AsyncLocalTransport for PollingTransport {
                 Ok(p)
             },
             None => { 
+                // Router has droped sender, consider transport to be closed
                 dbg!("Poll Transport - ???");
                 Err(TransportError::Generic)
             }
@@ -222,6 +223,9 @@ impl PollingTransportRouter {
 
         let v = Payload::decode_combined(data, TransportKind::Poll);
         if v.iter().any(|p|p.is_err()){
+            drop(tx);
+            // Close down transport
+            self.txs.lock().unwrap().remove(&sid);
             return Err(EngineError::UnknownPayload)
         }
         else {
@@ -229,7 +233,6 @@ impl PollingTransportRouter {
                tx.send(PollingReqMessage::Data(p)).await;
             }
         }
-
         Ok(())
     }
 
@@ -269,6 +272,11 @@ impl PollingTransportRouter {
                 };
                 res_rx.close();
                 let data = Payload::encode_combined(&buffer, TransportKind::Poll);
+                // TODO: DRYer please
+                if tx.is_closed() {
+                    dbg!("closed already!!!");
+                    let _ = self.delete(sid);
+                }
                 Ok(data)
             },
             Some(Err(e)) => Err(e),

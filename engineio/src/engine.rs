@@ -43,7 +43,12 @@ pub(crate) fn default_server_state_update<T:AsyncLocalTransport>(transport:&T, s
             Some(Payload::Open(serde_json::to_vec(&data).unwrap()))
         },
         EngineState::Connected(Heartbeat::Unknown(_),_) => Some(Payload::Ping),
-        EngineState::Closing(t,r) => Some(Payload::Close(EngineCloseReason::ServerClose)),
+        EngineState::Closing(t,r) => {
+            match r {
+                EngineCloseReason::ClientClose => Some(Payload::Noop),
+                _ => Some(Payload::Close(r))
+            }
+        },
         _ => None
     }
 }
@@ -180,7 +185,7 @@ impl <F> BaseEngine<F> {
             },
             Input::Recv(p) => {
                 match p {
-                    Payload::Close(r) => Ok(Some(EngineState::Closed(*r))),
+                    Payload::Close(r) => Ok(Some(EngineState::Closing(now,*r))),
                     _ => {
                         if let EngineState::Connected(_,c) = self.state {
                             Ok(Some(EngineState::Connected(Heartbeat::Alive(now),c)))
