@@ -111,35 +111,34 @@ enum PollingState {
 
 impl AsyncLocalTransport for PollingTransport {
     async fn recv(&mut self) -> Result<Payload,TransportError> {
-        loop {
-            let result = match self.rx.recv().await {
-                Some(PollingReqMessage::Poll(sender)) => {
-                    dbg!("Poll Transport - Poll");
-                    match &self.state {
-                        PollingState::Active(s) if !s.is_closed() => {
-                            let _  = sender.send(Err(EngineError::InvalidPoll)).await;
-                            self.state = PollingState::Inactive;
+        match self.rx.recv().await {
+            Some(PollingReqMessage::Poll(sender)) => {
+                dbg!("Poll Transport - Poll");
+                match &self.state {
+                    PollingState::Active(s) if !s.is_closed() => {
+                        dbg!("here1");
+                        let _  = sender.send(Err(EngineError::InvalidPoll)).await;
+                        Err(TransportError::Generic)
+                    }
+                    _ => {
+                        // TODO: Better error  please
+                        dbg!("here2");
+                        for x in self.buffer.drain(..) {
+                            let _ = sender.send(Ok(x)).await;
                         }
-                        _ => {
-                            // TODO: Better error  please
-                            for x in self.buffer.drain(..) {
-                                let _ = sender.send(Ok(x)).await;
-                            }
-                            self.state = PollingState::Active(sender);
-                        }
-                    };
-                    Some(Ok(Payload::Pong))
+                        self.state = PollingState::Active(sender);
+                        Ok(Payload::Pong)
+                    }
                 }
-                Some(PollingReqMessage::Data(p)) => {
-                    dbg!("Poll Transport - data");
-                    Some(Ok(p))
-                },
-                None => { 
-                    dbg!("Poll Transport - ???");
-                    Some(Err(TransportError::Generic))
-                }
-            };
-            if let Some(s) = result { break s } 
+            }
+            Some(PollingReqMessage::Data(p)) => {
+                dbg!("Poll Transport - data");
+                Ok(p)
+            },
+            None => { 
+                dbg!("Poll Transport - ???");
+                Err(TransportError::Generic)
+            }
         }
     }
 
@@ -243,6 +242,13 @@ impl PollingTransportRouter {
             .ok_or(EngineError::MissingSession)?;
 
         dbg!("poll router 2");
+
+        if tx.is_closed() {
+            dbg!("closed already!!!");
+            let _ = self.delete(sid);
+            return Err(EngineError::MissingSession);
+        }
+
         let (res_tx, mut res_rx) = mpsc::channel(32);
         tx.send(PollingReqMessage::Poll(res_tx)).await;
         
@@ -261,10 +267,15 @@ impl PollingTransportRouter {
                         }
                     };
                 };
+                res_rx.close();
                 let data = Payload::encode_combined(&buffer, TransportKind::Poll);
                 Ok(data)
+            },
+            Some(Err(e)) => Err(e),
+            None => {
+                dbg!("NONE???");
+                Err(EngineError::Generic) // Transport Closed?
             }
-            _ => Err(EngineError::Generic) // Transport closed ?
         }
     }
 }

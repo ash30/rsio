@@ -4,6 +4,7 @@ use tokio::select;
 use crate::engine::AsyncLocalTransport;
 use crate::engine::AsyncTransport;
 use crate::engine::Engine;
+use crate::engine::EngineCloseReason;
 use crate::engine::Input;
 use crate::engine::Output;
 use crate::proto::MessageData;
@@ -149,12 +150,21 @@ async fn bind_engine<T:AsyncLocalTransport>(
                     tx.send(Ok(()));
                 }
             }
-            Ok(down) = transport.recv() =>  {
-                // TODO: What about errors ?
-                dbg!(&down);
-                engine.process_input(Input::Recv(down), now.into());
+            down = transport.recv() =>  {
+                match down {
+                    Ok(down) => {
+                        // TODO: What about errors ?
+                        dbg!(&down);
+                        engine.process_input(Input::Recv(down), now.into());
+                    }
+                    Err(e) => {
+                        //Transport Erroe
+                        engine.close(EngineCloseReason::Error(EngineError::Transport(e)), now.into())
+                    }
+                }
             }
         };
+
     }
 }
 

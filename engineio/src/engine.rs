@@ -44,7 +44,6 @@ pub(crate) fn default_server_state_update<T:AsyncLocalTransport>(transport:&T, s
         },
         EngineState::Connected(Heartbeat::Unknown(_),_) => Some(Payload::Ping),
         EngineState::Closing(t,r) => Some(Payload::Close(EngineCloseReason::ServerClose)),
-        EngineState::Closed(r) => Some(Payload::Noop),
         _ => None
     }
 }
@@ -103,6 +102,7 @@ pub trait Engine {
     fn process_input(&mut self, i:Input, now:Instant) -> Result<(),EngineError>;
     fn poll(&mut self, now:Instant) -> Option<Output>;
     fn is_connected(&self) -> bool;
+    fn close(&mut self, reason:EngineCloseReason, now:Instant);
 }
 
 pub(crate) struct BaseEngine<F> {
@@ -114,6 +114,11 @@ pub(crate) struct BaseEngine<F> {
 impl<F> Engine for BaseEngine<F> 
 where F: Fn(&Input,EngineState,Instant) -> Overridable<Result<Option<EngineState>,EngineError>>
 {
+    fn close(&mut self, reason:EngineCloseReason, now:Instant) {
+        self.update_state(EngineState::Closing(now, reason))
+    }
+
+
     fn is_connected(&self) -> bool {
         match self.state {
             EngineState::Connected(_,_) => true,
@@ -184,6 +189,7 @@ impl <F> BaseEngine<F> {
                     }
                 }
             },
+            Input::TransportUpdate(EngineState::Closing(_,reason),_) => Ok(Some(EngineState::Closed(*reason))),
             _ => Ok(None)
         }
 
