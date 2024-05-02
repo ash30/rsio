@@ -124,37 +124,38 @@ async fn bind_engine<T:AsyncLocalTransport>(
         let next = loop {
             match engine.poll(now.into()) {
                 Some(Output::Data(m)) => {
+                    dbg!("Engine data recv", &m);
                     // TODO: ERROR?
                     let _ = up_send.send(m).await;
                 },
                 Some(Output::StateUpdate(s)) => { 
                     dbg!("Engine state change", &s);
+                    // We block loop until transport answers 
+                    // we can't poll it later, because it borrows mut transport
+                    // we should add deadline here...
                     let _ = engine.process_input(
                         Input::TransportUpdate(s, transport.engine_state_update(s).await), now.into()
                     );
                 },
-                Some(Output::Wait(t)) => break Some(t),
+                Some(Output::Wait(t)) => { dbg!("Engine wait", t) ;break Some(t) },
                 None => {
                     break(None)
                 }
             }
         };
-        let Some(next_deadline) = next else { dbg!(); break engine};
+        let Some(next_deadline) = next else { dbg!("END");break engine};
         select! {
             _ = tokio::time::sleep_until(next_deadline.into()) => {},
-            Some((up,tx)) = up_recv.recv() => {
-                dbg!(&up);
-                if engine.is_connected() {
-                    // TODO: handle error 
-                    let _ = transport.send(Payload::Message(up)).await;
-                    tx.send(Ok(()));
-                }
+            Some((up,tx)) = up_recv.recv(), if engine.is_connected() => {
+                // TODO: handle error 
+                let _ = transport.send(Payload::Message(up)).await;
+                tx.send(Ok(()));
             }
-            down = transport.recv() =>  {
+            //
+            down = transport.recv(), if engine.is_connected() =>  {
                 match down {
                     Ok(down) => {
                         // TODO: What about errors ?
-                        dbg!(&down);
                         engine.process_input(Input::Recv(down), now.into());
                     }
                     Err(e) => {

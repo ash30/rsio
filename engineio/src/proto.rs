@@ -1,6 +1,7 @@
 use std::u8;
 use std::vec;
 use crate::engine::EngineCloseReason;
+use crate::engine::OpenMessage;
 use crate::transport::TransportKind;
 pub type Sid = uuid::Uuid;
 use serde::{Deserialize, Serialize};
@@ -97,7 +98,7 @@ impl Payload{
 
     }
 
-    pub fn decode_combined(v:&[u8], t: TransportKind) -> Vec<Result<Payload,PayloadDecodeError>> {
+    pub fn decode_combined(v:&[u8], t: TransportKind) ->Result<Vec<Payload>,PayloadDecodeError> {
         v.split(|c| *c == b'\x1e').into_iter()
             .map(|d| Payload::decode(d, t))
             .collect()
@@ -110,6 +111,8 @@ impl Payload{
         return start.and_then(|mut n| rest.map(|r| {n.extend_from_slice(&r); n})).unwrap_or(vec![])
     }
 }
+
+
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct TransportConfig { 
@@ -128,3 +131,12 @@ impl Default for TransportConfig {
     }
 }
 
+impl From<OpenMessage> for TransportConfig {
+    fn from(value: OpenMessage) -> Self {
+        TransportConfig { 
+            ping_interval:value.ping_interval,
+            ping_timeout:value.ping_timeout,
+            max_payload:value.max_payload
+        }
+    }
+}

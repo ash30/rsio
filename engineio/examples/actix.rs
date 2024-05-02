@@ -23,8 +23,8 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
 
     let config = TransportConfig {
-        ping_interval:300,
-        ping_timeout:200,
+        ping_interval:3000,
+        ping_timeout:2000,
         ..TransportConfig::default()
     };
 

@@ -83,7 +83,7 @@ impl AsyncLocalTransport for ActixWSAdapter {
         }
     }
 
-    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<(),TransportError> {
+    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<Option<Vec<u8>>,TransportError> {
         if let Some(p) = default_server_state_update(self, self.sid, self.config, next_state) {
             // TODO: Should return error to caller...
             self.send(p).await;
@@ -92,7 +92,7 @@ impl AsyncLocalTransport for ActixWSAdapter {
             EngineState::Closed(..) => { self.session.clone().close(None); }
             _ => {}
        };
-       Ok(())
+       Ok(None)
     }
 }
 
@@ -113,16 +113,13 @@ impl AsyncLocalTransport for PollingTransport {
     async fn recv(&mut self) -> Result<Payload,TransportError> {
         match self.rx.recv().await {
             Some(PollingReqMessage::Poll(sender)) => {
-                dbg!("Poll Transport - Poll");
                 match &self.state {
                     PollingState::Active(s) if !s.is_closed() => {
-                        dbg!("here1");
                         let _  = sender.send(Err(EngineError::InvalidPoll)).await;
                         Err(TransportError::Generic)
                     }
                     _ => {
                         // TODO: Better error  please
-                        dbg!("here2");
                         for x in self.buffer.drain(..) {
                             let _ = sender.send(Ok(x)).await;
                         }
@@ -132,22 +129,18 @@ impl AsyncLocalTransport for PollingTransport {
                 }
             }
             Some(PollingReqMessage::Data(p)) => {
-                dbg!("Poll Transport - data");
                 Ok(p)
             },
             None => { 
                 // Router has droped sender, consider transport to be closed
-                dbg!("Poll Transport - ???");
                 Err(TransportError::Generic)
             }
         }
     }
 
     async fn send(&mut self, data:Payload) -> Result<(),TransportError> {
-        dbg!("Polling SENDING", &data);
         match &self.state {
             PollingState::Active(sender) => {
-                dbg!("Polling SENDING ACTIVE", &data);
                 if let Err(e) = sender.send(Ok(data)).await {
                     self.state = PollingState::Inactive;
                     self.buffer.push(e.0.unwrap());
@@ -158,15 +151,13 @@ impl AsyncLocalTransport for PollingTransport {
                 }
             }
             PollingState::Inactive => {
-                dbg!("Polling SENDING INACTIVE", &data);
                 self.buffer.push(data);
                 Ok(())
             }
         }
     }
 
-    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<(),TransportError>{
-        dbg!("polling state change");
+    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<Option<Vec<u8>>,TransportError> {
         if let Some(p) = default_server_state_update(self, self.sid, self.config, next_state) {
             let _ = self.send(p).await;
         }
@@ -176,7 +167,7 @@ impl AsyncLocalTransport for PollingTransport {
             }
             _ => {}
         };
-        Ok(())
+        Ok(None)
     }
 
     fn upgrades() -> Vec<String> {
@@ -197,7 +188,6 @@ enum PollingReqMessage {
 
 impl PollingTransportRouter {
     fn create(&self, sid:Sid, config:TransportConfig) -> PollingTransport {
-        dbg!("create poll");
         let (tx,rx) = mpsc::channel(32);
         self.txs.lock().unwrap().insert(sid.clone(), tx);
 
@@ -222,32 +212,30 @@ impl PollingTransportRouter {
             .ok_or(EngineError::MissingSession)?;
 
         let v = Payload::decode_combined(data, TransportKind::Poll);
-        if v.iter().any(|p|p.is_err()){
-            drop(tx);
-            // Close down transport
-            self.txs.lock().unwrap().remove(&sid);
-            return Err(EngineError::UnknownPayload)
-        }
-        else {
-            for p in v.into_iter().filter(|p|p.is_ok()).map(|p|p.unwrap()) {
-               tx.send(PollingReqMessage::Data(p)).await;
+        match v {
+            Err(_) => {
+                drop(tx);
+                self.txs.lock().unwrap().remove(&sid);
+                return Err(EngineError::UnknownPayload)
+            },
+            Ok(v) => {
+                for p in v {
+                    tx.send(PollingReqMessage::Data(p)).await;
+                }
             }
-        }
+        };
         Ok(())
     }
 
     async fn poll(&self, sid:Sid) -> Result<Vec<u8>,EngineError> {
-        dbg!("poll router 1");
         let tx = self.txs.lock()
             .unwrap()
             .get(&sid)
             .map(|t| t.clone())
             .ok_or(EngineError::MissingSession)?;
 
-        dbg!("poll router 2");
 
         if tx.is_closed() {
-            dbg!("closed already!!!");
             let _ = self.delete(sid);
             return Err(EngineError::MissingSession);
         }
@@ -257,7 +245,6 @@ impl PollingTransportRouter {
         
         match res_rx.recv().await {
             Some(Ok(first)) => {
-                dbg!("poll router first", &first);
                 let mut buffer = vec![first];
                 let deadline = Instant::now() + Duration::from_millis(10);
                 loop {
@@ -274,14 +261,12 @@ impl PollingTransportRouter {
                 let data = Payload::encode_combined(&buffer, TransportKind::Poll);
                 // TODO: DRYer please
                 if tx.is_closed() {
-                    dbg!("closed already!!!");
                     let _ = self.delete(sid);
                 }
                 Ok(data)
             },
             Some(Err(e)) => Err(e),
             None => {
-                dbg!("NONE???");
                 Err(EngineError::Generic) // Transport Closed?
             }
         }
@@ -324,7 +309,6 @@ pub fn engine_io(path:actix_web::Resource, config:TransportConfig, service:fn(IO
             .to(move |session: web::Query<SessionInfo>| { 
                 let poll_router = poll_router.clone();
                 async move {
-                    dbg!("REST POLL Start");
                     let Some(sid) = session.sid else {
                         return EngineError::MissingSession.error_response()
                     };

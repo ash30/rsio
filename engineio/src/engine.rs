@@ -3,6 +3,7 @@ use std::time::Instant;
 use std::fmt;
 use crate::transport::TransportError;
 pub use crate::proto::*;
+use crate::transport::TransportKind;
 use std::collections::VecDeque;
 
 pub(crate) enum TransportType {
@@ -22,7 +23,7 @@ impl fmt::Display for TransportType {
 
 #[trait_variant::make(AsyncTransport: Send)]
 pub(crate) trait AsyncLocalTransport {
-    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<(),TransportError>;
+    async fn engine_state_update(&mut self, next_state:EngineState) -> Result<Option<Vec<u8>>,TransportError>;
     async fn recv(&mut self) -> Result<Payload,TransportError>;
     async fn send(&mut self, data:Payload) -> Result<(),TransportError>;
     fn upgrades() -> Vec<String> {
@@ -30,19 +31,31 @@ pub(crate) trait AsyncLocalTransport {
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+pub(crate) struct OpenMessage {
+    pub sid:Sid,
+    pub upgrades: Vec<String>,
+    #[serde(rename = "maxPayload")]
+    pub max_payload:u64,
+    #[serde(rename = "pingInterval")]
+    pub ping_interval:u64,
+    #[serde(rename = "pingTimeout")]
+    pub ping_timeout:u64,
+}
+
 pub(crate) fn default_server_state_update<T:AsyncLocalTransport>(transport:&T, sid:Sid, config:TransportConfig, next_state:EngineState) -> Option<Payload>{
     match next_state {
         EngineState::Connecting(_) => { 
-            let data = serde_json::json!({
-                "upgrades": <T as AsyncLocalTransport>::upgrades(),
-                "maxPayload": config.max_payload,
-                "pingInterval": config.ping_interval,
-                "pingTimeout": config.ping_timeout,
-                "sid": sid
-            });
+            let data = OpenMessage {
+                sid,
+                upgrades: <T as AsyncLocalTransport>::upgrades(),
+                max_payload: config.max_payload,
+                ping_timeout: config.ping_timeout,
+                ping_interval: config.ping_interval
+            };
             Some(Payload::Open(serde_json::to_vec(&data).unwrap()))
         },
-        EngineState::Connected(Heartbeat::Unknown(_),_) => Some(Payload::Ping),
+        EngineState::Connected(Heartbeat::Unknown(_),_,_) => Some(Payload::Ping),
         EngineState::Closing(t,r) => {
             match r {
                 EngineCloseReason::ClientClose => Some(Payload::Noop),
@@ -65,22 +78,32 @@ pub(crate) fn create_server_engine(sid:Sid, config:TransportConfig, now:Instant)
    BaseEngine::new(EngineState::Connecting(now), move |i:&Input,s:EngineState,now:Instant| {
         match i {
             Input::TransportUpdate(EngineState::Connecting(_),Ok(_)) => {
-                Overridable::Override(Ok(Some(EngineState::Connected(Heartbeat::Alive(now), config))))
+                Overridable::Override(Ok(Some(EngineState::Connected(Heartbeat::Alive(now), config, sid))))
             },
             _ => Overridable::Default
         }
    })
 }
 pub(crate) fn create_client_engine(now:Instant) -> impl Engine {
-    BaseEngine::new(EngineState::New, move |i:&Input,s:EngineState,now:Instant| {
+    BaseEngine::new(EngineState::New, move |i:&Input,ss:EngineState,now:Instant| {
+
         return match i {
-            Input::Recv(Payload::Open(d)) => {
-                let t = TransportConfig::default(); 
-                match s {
-                    EngineState::Connecting(s) => Overridable::Override(Ok(Some(EngineState::Connected(Heartbeat::Alive(now), t)))),
-                    _ => Overridable::Override(Err(EngineError::Generic))
+            Input::TransportUpdate(EngineState::Connecting(_),Ok(data)) => {
+                let open_data = data
+                    .as_ref()
+                    .and_then(|a| Payload::decode(a, TransportKind::Poll).ok())
+                    .and_then(|a| if let Payload::Open(data) = a { Some(data) } else { None } )
+                    .map(|a| serde_json::from_slice::<OpenMessage>(a.as_ref()));
+
+                if let Some(Ok(d)) = open_data {
+                    let sid = d.sid;
+                    let config = TransportConfig::from(d);
+                    Overridable::Override(Ok(Some(EngineState::Connected(Heartbeat::Alive(now), config,sid))))
                 }
-            }
+                else {
+                    Overridable::Default
+                }
+            },
             _ => Overridable::Default
         }
     })
@@ -89,7 +112,7 @@ pub(crate) fn create_client_engine(now:Instant) -> impl Engine {
 pub(crate) enum Input {
     Time,
     Recv(Payload),
-    TransportUpdate(EngineState, Result<(),TransportError>)
+    TransportUpdate(EngineState, Result<Option<Vec<u8>>,TransportError>)
 }
 
 pub(crate) enum Output {
@@ -123,10 +146,9 @@ where F: Fn(&Input,EngineState,Instant) -> Overridable<Result<Option<EngineState
         self.update_state(EngineState::Closing(now, reason))
     }
 
-
     fn is_connected(&self) -> bool {
         match self.state {
-            EngineState::Connected(_,_) => true,
+            EngineState::Connected(_,_,_) => true,
             _ => false
         }
     }
@@ -154,6 +176,7 @@ where F: Fn(&Input,EngineState,Instant) -> Overridable<Result<Option<EngineState
 
 impl <F> BaseEngine<F> {
     fn new(initial_state:EngineState, custom:F) -> Self {
+        dbg!("ENGINE - NEW");
         let mut output = VecDeque::new();
         output.push_back(Output::StateUpdate(initial_state));
 
@@ -175,8 +198,8 @@ impl <F> BaseEngine<F> {
                 if now > self.next_deadline().unwrap_or(now) {
                     Ok(match self.state {
                         EngineState::Connecting(s) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
-                        EngineState::Connected(Heartbeat::Alive(_),c) => Some(EngineState::Connected(Heartbeat::Unknown(now),c)),
-                        EngineState::Connected(Heartbeat::Unknown(_),_) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
+                        EngineState::Connected(Heartbeat::Alive(_),c,s) => Some(EngineState::Connected(Heartbeat::Unknown(now),c,s)),
+                        EngineState::Connected(Heartbeat::Unknown(_),_,_) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
                         EngineState::Closing(start,r) => Some(EngineState::Closed(r)),
                         _ => None
                     })
@@ -187,13 +210,15 @@ impl <F> BaseEngine<F> {
                 match p {
                     Payload::Close(r) => Ok(Some(EngineState::Closing(now,*r))),
                     _ => {
-                        if let EngineState::Connected(_,c) = self.state {
-                            Ok(Some(EngineState::Connected(Heartbeat::Alive(now),c)))
+                        if let EngineState::Connected(_,c,s) = self.state {
+                            Ok(Some(EngineState::Connected(Heartbeat::Alive(now),c,s)))
                         }
                         else { Ok(None) }
                     }
                 }
             },
+            Input::TransportUpdate(_, Err(e)) => Ok(Some(EngineState::Closed(EngineCloseReason::Error(EngineError::Generic)))),
+            Input::TransportUpdate(EngineState::New,_) => Ok(Some(EngineState::Connecting(now))),
             Input::TransportUpdate(EngineState::Closing(_,reason),_) => Ok(Some(EngineState::Closed(*reason))),
             _ => Ok(None)
         }
@@ -204,8 +229,8 @@ impl <F> BaseEngine<F> {
         match self.state {
             EngineState::New => None,
             EngineState::Connecting(start) => Some(start + Duration::from_millis(5000)),
-            EngineState::Connected(Heartbeat::Alive(s), config) => Some(s + Duration::from_millis(config.ping_interval)),
-            EngineState::Connected(Heartbeat::Unknown(s), config) => Some(s + Duration::from_millis(config.ping_timeout)),
+            EngineState::Connected(Heartbeat::Alive(s), config,_) => Some(s + Duration::from_millis(config.ping_interval)),
+            EngineState::Connected(Heartbeat::Unknown(s), config,_) => Some(s + Duration::from_millis(config.ping_timeout)),
             EngineState::Closing(start,_) => Some(start + Duration::from_millis(5000)),
             EngineState::Closed(r) => None
         }
@@ -213,7 +238,7 @@ impl <F> BaseEngine<F> {
 }
 
 #[derive(Debug,Copy,Clone)]
-enum Heartbeat {
+pub enum Heartbeat {
     Alive(Instant),
     Unknown(Instant)
 }
@@ -231,7 +256,7 @@ impl Heartbeat {
 pub(crate) enum EngineState {
     New,
     Connecting(Instant),
-    Connected(Heartbeat, TransportConfig),
+    Connected(Heartbeat, TransportConfig, Sid),
     Closing(Instant, EngineCloseReason),
     Closed(EngineCloseReason)
 }
