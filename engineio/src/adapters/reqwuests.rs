@@ -52,7 +52,15 @@ impl AsyncTransport for ClientPollingTransport {
     }
 
     async fn send(&mut self, data:Payload) -> Result<(),crate::transport::TransportError> {
-        todo!()
+        let Some(sid) = self.sid else { return Err(TransportError::Generic) };
+        let mut url = self.url.clone();
+        let query = format!("transport=polling&EIO=4&sid={}", sid);
+        url.set_query(Some(&query));
+        let data = data.encode(TransportKind::Poll);
+        match self.client.post(url).body(data).send().await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(TransportError::Generic)
+        }
     }
 
     async fn engine_state_update(&mut self, next_state:crate::engine::EngineState) -> Result<Option<Vec<u8>>,TransportError>{

@@ -6,11 +6,10 @@ use tokio::time::Instant;
 use actix_web::{guard, web, HttpResponse, Resource, ResponseError};
 use tokio_stream::StreamExt;
 use crate::io::{create_session_local, Session};
-use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData };
+pub use crate::proto::{Sid, Payload, PayloadDecodeError, MessageData, TransportConfig };
 use crate::transport::{TransportKind, TransportError};
 use crate::engine::{EngineError, EngineState, AsyncLocalTransport, default_server_state_update, create_server_engine, TransportType};
 
-pub use crate::proto::TransportConfig;
 pub type IOEngine = Session;
 
 #[derive(serde::Deserialize)]

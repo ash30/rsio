@@ -1,5 +1,5 @@
 use actix_web::{middleware::Logger, App, HttpServer };
-use engineio::adapters::actix::{engine_io, IOEngine, TransportConfig};
+use engineio::adapters::actix::{engine_io, IOEngine, TransportConfig, MessageData};
 use futures_util::StreamExt;
 use futures_util::pin_mut;
 
@@ -10,6 +10,10 @@ fn on_connection(connection:IOEngine) {
             match connection.next().await {
                 None => break,
                 Some(data) => {
+                    match data.clone() {
+                        MessageData::String(s) => { dbg!("New Message",String::from_utf8(s).unwrap()); },
+                        MessageData::Binary(b) => { dbg!("binary"); }
+                    };
                     connection.send(data).await;
                 }
             };

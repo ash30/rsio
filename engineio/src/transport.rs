@@ -1,5 +1,5 @@
 #[derive(Debug, Copy, Clone)]
-pub (crate) enum TransportError { 
+pub enum TransportError { 
     Generic
 }
 
