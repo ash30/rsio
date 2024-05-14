@@ -1,6 +1,6 @@
 use std::task::Poll;
+use std::time::Instant;
 use futures_util::Stream;
-use tokio::select;
 use crate::engine::AsyncLocalTransport;
 use crate::engine::AsyncTransport;
 use crate::engine::Engine;
@@ -10,6 +10,7 @@ use crate::engine::Output;
 use crate::proto::MessageData;
 use crate::engine::EngineError;
 use crate::proto::Payload;
+use crate::transport::TransportError;
 use std::pin::Pin;
 use tokio::sync::oneshot;
 use tokio::sync::mpsc;
@@ -113,63 +114,70 @@ where
     return Session { handle, tx:up_req.0, rx:up_req.1 };
 }
 
-async fn bind_engine<T:AsyncLocalTransport>(
-    mut engine:impl Engine,
-    mut transport:T,
-    up_stream:EngineChannelRes<MessageData,MessageData,EngineError>) -> impl Engine{
-
+async fn bind_engine(
+    mut engine: impl Engine, 
+    mut transport: impl AsyncLocalTransport, 
+    up_stream:EngineChannelRes<MessageData,MessageData,EngineError>) -> impl Engine 
+{
     let (up_send, mut up_recv) = up_stream;
-    loop {
-        let now = tokio::time::Instant::now();        
-        let next = loop {
-            match engine.poll(now.into()) {
-                Some(Output::Data(m)) => {
-                    dbg!("Engine data recv", &m);
-                    // TODO: ERROR?
-                    let _ = up_send.send(m).await;
-                },
-                Some(Output::StateUpdate(s)) => { 
-                    dbg!("Engine state change", &s);
-                    // We block loop until transport answers 
-                    // we can't poll it later, because it borrows mut transport
-                    // we should add deadline here...
-                    let _ = engine.process_input(
-                        Input::TransportUpdate(s, transport.engine_state_update(s).await), now.into()
-                    );
-                },
-                Some(Output::Wait(t)) => { dbg!("Engine wait", t) ;break Some(t) },
-                None => {
-                    break(None)
-                }
-            }
-        };
-        let Some(next_deadline) = next else { dbg!("END");break engine};
-        select! {
-            _ = tokio::time::sleep_until(next_deadline.into()) => {},
-            Some((up,tx)) = up_recv.recv(), if engine.is_connected() => {
-                // TODO: handle error 
-                let _ = transport.send(Payload::Message(up)).await;
-                tx.send(Ok(()));
-            }
-            //
-            down = transport.recv(), if engine.is_connected() =>  {
-                match down {
-                    Ok(down) => {
-                        // TODO: What about errors ?
-                        engine.process_input(Input::Recv(down), now.into());
-                    }
-                    Err(e) => {
-                        //Transport Erroe
-                        engine.close(EngineCloseReason::Error(EngineError::Transport(e)), now.into())
-                    }
-                }
-            }
-        };
 
+    // drive engine state terminal state 
+    while engine.is_closed() == false {
+        if up_send.is_closed() { break }
+
+        match engine.poll(Instant::now()) {
+            Some(Output::StateUpdate(s)) => {
+                // On state update, drive transport towards state
+                let deadline = s.deadline();
+                tokio::select! {
+                   res = transport.engine_state_update(s) => {
+                        engine.process(Input::TransportUpdate(s,res), Instant::now());
+                   },
+                    _ = tokio::time::sleep_until(deadline.unwrap().into()), if deadline.is_some() => {},
+                    _ = up_send.closed() => {}
+                }
+            },
+            Some(Output::Wait(until)) => {
+                // Implicitly, we wait once we're connected..
+                // TODO: can we make this api nicer?
+                tokio::select! {
+                    Some((send,tx)) = up_recv.recv() => {
+                        if engine.is_connected() {
+                            let _ = transport.send(Payload::Message(send)).await;
+                            tx.send(Ok(()));
+                        }
+                        else {
+                            tx.send(Err(EngineError::Generic));
+                        }
+                    },
+                    recv = transport.recv() => {
+                        let now = Instant::now();
+                        match recv {
+                            Ok(r) => {
+                                // TODO: What about errors ?
+                                if let Ok(()) = engine.process(Input::Recv(&r), now.into()) {
+                                    if let Payload::Message(m) = r {
+                                        let _ = up_send.send(m).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                engine.close(now.into(), Some(EngineCloseReason::Error(EngineError::Transport(e))))
+                            }
+                        }
+                    },
+                    // check the engine after current deadline
+                    _ = tokio::time::sleep_until(until.into()) => {},
+                    // exit if session owner drops 
+                    _ = up_send.closed() => {}
+                };
+            }
+            None => break
+        }
     }
+    engine
+
 }
-
-
 
 
 

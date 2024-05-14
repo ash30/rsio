@@ -74,19 +74,67 @@ pub(crate) fn default_client_state_update(prev_state:EngineState, next_state:Eng
     }
 }
 
-pub(crate) fn create_server_engine(sid:Sid, config:TransportConfig, now:Instant) -> impl Engine{
-   BaseEngine::new(EngineState::Connecting(now), move |i:&Input,s:EngineState,now:Instant| {
-        match i {
-            Input::TransportUpdate(EngineState::Connecting(_),Ok(_)) => {
-                Overridable::Override(Ok(Some(EngineState::Connected(Heartbeat::Alive(now), config, sid))))
-            },
-            _ => Overridable::Default
+// ---------
+fn default_time_processor(s:EngineState, now:Instant) -> Override<StateTransition> {
+    let next_deadline = s.deadline()?;
+    if now > next_deadline {
+        match s {
+            EngineState::Connecting(s) => Override(Some(EngineState::Closing(now, EngineCloseReason::Timeout))),
+            EngineState::Connected(Heartbeat::Alive(_),c,s) => Override(Some(EngineState::Connected(Heartbeat::Unknown(now),c,s))),
+            EngineState::Connected(Heartbeat::Unknown(_),_,_) => Override(Some(EngineState::Closing(now, EngineCloseReason::Timeout))),
+            EngineState::Closing(start,r) => Override(Some(EngineState::Closed(r))),
+            _ => None
         }
-   })
+    }
+    else {
+        None
+    }
 }
+
+fn default_recv_processor(p:&Payload, s:EngineState, t:Instant) -> Override<StateTransition> {
+    match (p,s) {
+        (Payload::Close(_), EngineState::Closed(_)) => None,
+        (Payload::Close(_), EngineState::Closing(_,_)) => None,
+        (Payload::Close(r), _) => Override(Some(EngineState::Closing(t, *r))),
+        (_, EngineState::Connected(_,c,s)) => Override(Some(EngineState::Connected(Heartbeat::Alive(t),c,s))),
+        _ => None
+    }
+}
+
+fn default_transport_update_processor(r:&Result<Option<Vec<u8>>,TransportError>, s:EngineState, t:Instant) -> Override<StateTransition> {
+    match (s,r) {
+        (_, Err(e)) => Override(Some(EngineState::Closed(EngineCloseReason::Error(EngineError::Generic)))),
+        (EngineState::New,_) => Override(Some(EngineState::Connecting(t))),
+        (EngineState::Closing(_,reason),_) => Override(Some(EngineState::Closed(reason))),
+        _ => None
+    }
+}
+
+fn default_processor(i:&Input, s:EngineState, n:Instant) -> Override<StateTransition> {
+    match i {
+        Input::TransportUpdate(s,r) => default_transport_update_processor(&r,*s,n),
+        Input::Recv(p) => default_recv_processor(p,s,n),
+        Input::Time => default_time_processor(s,n),
+        _ => None
+    }
+}
+
+pub(crate) fn create_server_engine(sid:Sid, config:TransportConfig, now:Instant) -> impl Engine{
+    BaseEngine::new(EngineState::Connecting(now), move |i:&Input,s:EngineState,n:Instant| { match i {
+        Input::TransportUpdate(s, Ok(_)) => {
+                match s {
+                    EngineState::Connecting(_) => Override(Some(EngineState::Connected(Heartbeat::Alive(now), config, sid))),
+                    _ => None
+                }
+            },
+            _ => None
+        }
+        .or_else(|| default_processor(i, s, n))
+    })
+}
+
 pub(crate) fn create_client_engine(now:Instant) -> impl Engine {
     BaseEngine::new(EngineState::New, move |i:&Input,ss:EngineState,now:Instant| {
-
         return match i {
             Input::TransportUpdate(EngineState::Connecting(_),Ok(data)) => {
                 let open_data = data
@@ -98,142 +146,108 @@ pub(crate) fn create_client_engine(now:Instant) -> impl Engine {
                 if let Some(Ok(d)) = open_data {
                     let sid = d.sid;
                     let config = TransportConfig::from(d);
-                    Overridable::Override(Ok(Some(EngineState::Connected(Heartbeat::Alive(now), config,sid))))
+                    Override(Some(EngineState::Connected(Heartbeat::Alive(now), config,sid)))
                 }
-                else {
-                    Overridable::Default
-                }
+                else { None }
             },
-            _ => Overridable::Default
+            _ => None
         }
+        .or_else(|| default_processor(i, ss, now))
     })
 }
 
-pub(crate) enum Input {
+pub(crate) enum Input<'a> {
     Time,
-    Recv(Payload),
+    Recv(&'a Payload),
+    Send(&'a MessageData),
     TransportUpdate(EngineState, Result<Option<Vec<u8>>,TransportError>)
 }
 
 pub(crate) enum Output {
-    Data(MessageData),
     StateUpdate(EngineState),
     Wait(Instant)
 }
-enum Overridable<T> {
-    Default,
-    Override(T)
-}
-
+type Override<T> = Option<T>;
+type StateTransition = Option<EngineState>;
+fn Override<T>(a:T) -> Override<T> { Some(a) }
 
 pub trait Engine {
-    fn process_input(&mut self, i:Input, now:Instant) -> Result<(),EngineError>;
+    fn process(&mut self, i:Input, now:Instant) -> Result<(), EngineError>;
     fn poll(&mut self, now:Instant) -> Option<Output>;
+    fn close(&mut self, now:Instant, reason:Option<EngineCloseReason>);
+    fn is_closed(&self) -> bool;
     fn is_connected(&self) -> bool;
-    fn close(&mut self, reason:EngineCloseReason, now:Instant);
 }
 
 pub(crate) struct BaseEngine<F> {
     state: EngineState,
     output:VecDeque<Output>,
-    custom: F
+    input_processor: F
 }
 
 impl<F> Engine for BaseEngine<F> 
-where F: Fn(&Input,EngineState,Instant) -> Overridable<Result<Option<EngineState>,EngineError>>
+where F: Fn(&Input,EngineState,Instant) -> Override<StateTransition>
 {
-    fn close(&mut self, reason:EngineCloseReason, now:Instant) {
-        self.update_state(EngineState::Closing(now, reason))
-    }
-
-    fn is_connected(&self) -> bool {
+    fn close(&mut self, now:Instant, reason:Option<EngineCloseReason>) {
         match self.state {
-            EngineState::Connected(_,_,_) => true,
+            EngineState::Closing(_,_) => {},
+            EngineState::Closed(r) => {},
+            _ => {
+                self.update_state(EngineState::Closing(now, reason.unwrap_or(EngineCloseReason::ServerClose)))
+            }
+        }
+    }
+    fn is_closed(&self) -> bool {
+        match self.state {
+            EngineState::Closed(_) => true,
             _ => false
         }
     }
 
-    fn process_input(&mut self, i:Input, now:Instant) -> Result<(),EngineError> {
-        let result = if let Overridable::Override(r) = (self.custom)(&i,self.state,now) { r }
-        else { self.default_processing(&i, now) }?;
-
-        if let Input::Recv(Payload::Message(m)) = i  {
-            self.output.push_back(Output::Data(m))
+    fn is_connected(&self) -> bool {
+        match self.state {
+            EngineState::Connected(..) => true,
+            _ => false
         }
+    }
 
-        if let Some(next_state) = result {
-            self.update_state(next_state)
+    fn process(&mut self, i:Input, now:Instant) -> Result<(),EngineError> {
+        let _ = match (&i,self.state) {
+            (Input::Recv(_), EngineState::Connected(..))  => Ok(()),
+            (Input::Recv(_), _) => Err(EngineError::Generic),
+            (Input::Send(_), EngineState::Connected(..))  => Ok(()),
+            (Input::Send(_), _) => Err(EngineError::Generic),
+            _ => Ok(())
+        }?;
+
+        if let Some(Some(state)) = (self.input_processor)(&i,self.state, now) {
+            self.update_state(state);
         }
         Ok(())
     }
 
     fn poll(&mut self, now:Instant) -> Option<Output> {
-        let _ = self.process_input(Input::Time, now);
+        let _ = self.process(Input::Time, now);
         self.output.pop_front()
-            .or_else(|| self.next_deadline().map(|t|Output::Wait(t)))
+            .or_else(|| self.state.deadline().map(|t|Output::Wait(t)))
     }
 }
 
 impl <F> BaseEngine<F> {
-    fn new(initial_state:EngineState, custom:F) -> Self {
-        dbg!("ENGINE - NEW");
+    fn new(initial_state:EngineState, input_processor:F) -> Self {
         let mut output = VecDeque::new();
         output.push_back(Output::StateUpdate(initial_state));
 
         Self {
             state:initial_state,
             output,
-            custom
+            input_processor
         }
     }
 
     fn update_state(&mut self, s:EngineState) {
         self.state = s;
         self.output.push_back(Output::StateUpdate(s))
-    }
-
-    fn default_processing(&self, i:&Input, now:Instant) -> Result<Option<EngineState>,EngineError> {
-        match i {
-            Input::Time => {
-                if now > self.next_deadline().unwrap_or(now) {
-                    Ok(match self.state {
-                        EngineState::Connecting(s) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
-                        EngineState::Connected(Heartbeat::Alive(_),c,s) => Some(EngineState::Connected(Heartbeat::Unknown(now),c,s)),
-                        EngineState::Connected(Heartbeat::Unknown(_),_,_) => Some(EngineState::Closing(now, EngineCloseReason::Timeout)),
-                        EngineState::Closing(start,r) => Some(EngineState::Closed(r)),
-                        _ => None
-                    })
-                }
-                else { Ok(None) }
-            },
-            Input::Recv(p) => {
-                match p {
-                    Payload::Close(r) => Ok(Some(EngineState::Closing(now,*r))),
-                    _ => {
-                        if let EngineState::Connected(_,c,s) = self.state {
-                            Ok(Some(EngineState::Connected(Heartbeat::Alive(now),c,s)))
-                        }
-                        else { Ok(None) }
-                    }
-                }
-            },
-            Input::TransportUpdate(_, Err(e)) => Ok(Some(EngineState::Closed(EngineCloseReason::Error(EngineError::Generic)))),
-            Input::TransportUpdate(EngineState::New,_) => Ok(Some(EngineState::Connecting(now))),
-            Input::TransportUpdate(EngineState::Closing(_,reason),_) => Ok(Some(EngineState::Closed(*reason))),
-            _ => Ok(None)
-        }
-
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        match self.state {
-            EngineState::New => None,
-            EngineState::Connecting(start) => Some(start + Duration::from_millis(5000)),
-            EngineState::Connected(Heartbeat::Alive(s), config,_) => Some(s + Duration::from_millis(config.ping_interval)),
-            EngineState::Connected(Heartbeat::Unknown(s), config,_) => Some(s + Duration::from_millis(config.ping_timeout)),
-            EngineState::Closing(start,_) => Some(start + Duration::from_millis(5000)),
-            EngineState::Closed(r) => None
-        }
     }
 }
 
@@ -261,7 +275,18 @@ pub(crate) enum EngineState {
     Closed(EngineCloseReason)
 }
 
-
+impl EngineState {
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        match self {
+            EngineState::New => None,
+            EngineState::Connecting(start) => Some(*start + Duration::from_millis(5000)),
+            EngineState::Connected(Heartbeat::Alive(s), config,_) => Some(*s + Duration::from_millis(config.ping_interval)),
+            EngineState::Connected(Heartbeat::Unknown(s), config,_) => Some(*s + Duration::from_millis(config.ping_timeout)),
+            EngineState::Closing(start,_) => Some(*start + Duration::from_millis(5000)),
+            EngineState::Closed(r) => None
+        }
+    }
+}
 // =====================
 
 #[derive(Debug, Copy, Clone)]
