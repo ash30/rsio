@@ -1,10 +1,6 @@
 use std::u8;
 use std::vec;
-use crate::engine::EngineCloseReason;
-use crate::engine::OpenMessage;
-use crate::transport::TransportKind;
 pub type Sid = uuid::Uuid;
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone,Debug)]
 pub enum MessageData {
@@ -24,7 +20,7 @@ impl MessageData {
 #[derive(Clone,Debug)]
 pub enum Payload {
     Open(Vec<u8>),
-    Close(EngineCloseReason),
+    Close(Vec<u8>),
     Ping,
     Pong,
     Message(MessageData),
@@ -53,7 +49,7 @@ impl Payload{
         }
     }
 
-    pub fn encode(&self, transport: TransportKind) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let header:Option<u8> = match self {
             Payload::Open(..) => b'0'.into(),
             Payload::Close(..) => b'1'.into(),
@@ -61,10 +57,11 @@ impl Payload{
             Payload::Pong => b'3'.into(),
             Payload::Message(MessageData::String(..)) => b'4'.into(), 
             Payload::Message(MessageData::Binary(..)) => { 
-                match transport {
-                    TransportKind::Poll => b'b'.into(),
-                    TransportKind::Continuous => None,
-                }
+                None
+                //match transport {
+                //    TransportKind::Poll => b'b'.into(),
+                //    TransportKind::Continuous => None,
+                //}
             }, 
             Payload::Upgrade => b'5'.into(),
             Payload::Noop => b'6'.into()
@@ -76,7 +73,7 @@ impl Payload{
         return v
     }
 
-    pub fn decode(data:&[u8], transport: TransportKind) -> Result<Payload, PayloadDecodeError> {
+    pub fn decode(data:&[u8]) -> Result<Payload, PayloadDecodeError> {
         let t = data.first();
         match t {
             None => Err(PayloadDecodeError::InvalidFormat),
@@ -84,7 +81,7 @@ impl Payload{
                 let data = data.get(1..).and_then(|a| Some(a.to_vec())).unwrap_or(vec![]);
                 match n {
                     b'0' => Ok(Payload::Open(data)),
-                    b'1' => Ok(Payload::Close(EngineCloseReason::ClientClose)),
+                    b'1' => Ok(Payload::Close(data)),
                     b'2' => Ok(Payload::Ping),
                     b'3' => Ok(Payload::Pong),
                     b'4' => Ok(Payload::Message(MessageData::String(data))),
@@ -98,45 +95,18 @@ impl Payload{
 
     }
 
-    pub fn decode_combined(v:&[u8], t: TransportKind) ->Result<Vec<Payload>,PayloadDecodeError> {
+    pub fn decode_combined(v:&[u8]) ->Result<Vec<Payload>,PayloadDecodeError> {
         v.split(|c| *c == b'\x1e').into_iter()
-            .map(|d| Payload::decode(d, t))
+            .map(|d| Payload::decode(d))
             .collect()
     }
 
-    pub fn encode_combined(v:&[Payload], t:TransportKind) -> Vec<u8> {
+    pub fn encode_combined(v:&[Payload]) -> Vec<u8> {
         let seperator:u8 = b'\x1e';
-        let start = v.first().map(|p| p.encode(t));
-        let rest = v.get(1..).map(|s| s.iter().flat_map(|p| vec![vec![seperator], p.encode(t).to_vec()].concat()).collect::<Vec<u8>>());
+        let start = v.first().map(|p| p.encode());
+        let rest = v.get(1..).map(|s| s.iter().flat_map(|p| vec![vec![seperator], p.encode().to_vec()].concat()).collect::<Vec<u8>>());
         return start.and_then(|mut n| rest.map(|r| {n.extend_from_slice(&r); n})).unwrap_or(vec![])
     }
 }
 
 
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct TransportConfig { 
-    pub ping_interval: u64,
-    pub ping_timeout: u64,
-    pub max_payload: u64,
-}
-
-impl Default for TransportConfig {
-    fn default() -> Self {
-        Self {
-            ping_interval:25000,
-            ping_timeout: 20000,
-            max_payload: 1000000,
-        }
-    }
-}
-
-impl From<OpenMessage> for TransportConfig {
-    fn from(value: OpenMessage) -> Self {
-        TransportConfig { 
-            ping_interval:value.ping_interval,
-            ping_timeout:value.ping_timeout,
-            max_payload:value.max_payload
-        }
-    }
-}

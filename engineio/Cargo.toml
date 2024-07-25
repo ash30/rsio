@@ -41,12 +41,12 @@ actix = ["dep:actix-ws", "dep:actix-web", "dep:actix-rt", "async"]
 # TODO: can we just reimport url from requests ?
 reqwest = ["dep:reqwest", "async", "client"]
 
-[[example]]
-name = "actix"
-required-features = ["actix"]
-path = "examples/actix.rs"
-
-[[example]]
-name = "reqwest"
-required-features = ["reqwest"]
-path = "examples/client_reqwest.rs"
+#[[example]]
+#name = "actix"
+#required-features = ["actix"]
+#path = "examples/actix.rs"
+#
+#[[example]]
+#name = "reqwest"
+#required-features = ["reqwest"]
+#path = "examples/client_reqwest.rs"

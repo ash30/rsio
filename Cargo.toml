@@ -2,5 +2,7 @@
 
 members = [
     "engineio",
+    "engineio3", 
+    "engineio_wasm",
     "socketio"
 ]
