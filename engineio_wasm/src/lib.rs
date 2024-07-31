@@ -1,17 +1,16 @@
-use std::time;
+use web_time::Instant;
+use log::{Level, info};
 
 use engineio3::RawPayload;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
-use web_sys::{ErrorEvent, MessageEvent, WebSocket};
+use web_sys::{MessageEvent, WebSocket};
 use gloo_timers::future::TimeoutFuture;
-use futures::{FutureExt, channel::mpsc, channel::oneshot, StreamExt, select};
+use futures::{FutureExt, channel::mpsc, StreamExt, select};
 use engineio3::{Payload, Message};
 
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = JSON, catch)]
-    fn parse(s:JsValue) -> Result<JsValue,JsValue>;
 }
 
 // ==========================
@@ -61,9 +60,6 @@ impl Engine {
         todo!()
     }
 
-    // Send needs to transer ownership because we queue events 
-    // so cannot be stack based ref
-    // TODO: what does it mean to be mut self for export js?
     pub fn send(&mut self, msg:js_sys::JsString) -> Result<(),JsValue> {
         // TODO: ERROR please
         let m:Message::<JsValue> = Message::Text(msg.into());
@@ -76,25 +72,33 @@ impl Engine {
 // on msg should be an enum : connection || message 
 #[wasm_bindgen]
 pub async fn create_ws_engine(url:&str, on_msg:js_sys::Function) -> Result<Engine, JsValue> {
+    console_log::init_with_level(Level::Debug);
+
+    info!("foo 1");
     let (mut ingress_tx, ingress_rx) = mpsc::channel(64);
     let (egress_tx, egress_rx) = mpsc::channel(64);
 
     let ws = WebSocket::new(url)?;
     ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
     let e = Engine { tx: egress_tx };
+    info!("foo 2");
     wasm_bindgen_futures::spawn_local(async move {
         let f = Closure::wrap(Box::new(move |v:MessageEvent| {
             let _ = ingress_tx.try_send(v);
         }) as Box<dyn FnMut(MessageEvent)>);
+        info!("foo 3");
         ws.set_onmessage(Some(f.as_ref().unchecked_ref()));
 
-        let state = engineio3::Engine::<JsValue>::default();
+        info!("foo 4a");
+        let t = Instant::now();
+        info!("foo 4b");
+        let state = engineio3::Engine::<JsValue>::new(Instant::now());
+        info!("foo 5a");
         ws_poll(state, ingress_rx, egress_rx, &ws, on_msg).await;
+        info!("foo 5b");
         // close ws so callback is not called again
         let _ = ws.close();
     });
-
-    // TOOD: we should oneshot and let them know when ws_poll exits
     Ok(e)
 }
 
@@ -107,12 +111,15 @@ async fn ws_poll(
     callback:js_sys::Function
     )
 {
+    info!("loop start");
     loop {
-        let now = time::Instant::now();
+        let now = Instant::now();
 
         // Send out any pending payloads 
         // either messages or protocol specifics
-        while let Some(p) = e.poll(now) {
+        while let Some(p) = e.poll_output(now) {
+            info!("out 1");
+
             if ws.ready_state() != web_sys::WebSocket::OPEN {
                 break
             }
@@ -141,20 +148,22 @@ async fn ws_poll(
         }
 
         // receive new input + timeout
-        let Some(t) = e.next_timeout() else { 
+        let Some(t) = e.next_deadline() else { 
             break
         };
 
-        let mut timeout = TimeoutFuture::new(t.as_millis() as u32).fuse();
+        let d = t - Instant::now();
+        let mut timeout = TimeoutFuture::new(d.as_millis() as u32).fuse();
         let mut next_in = ingress_rx.next().fuse();
         let mut next_out = egress_rx.next().fuse();
 
+        info!("in 1");
         select! {
             m = next_out => {
                 // JS side has dropped sender... lets drop ? 
                 if m.is_none() { break } 
                 // Error if engine is closed etc
-                let Ok(_) = e.handle_input(&m.unwrap().into()) else {
+                let Ok(_) = e.handle_input(&m.unwrap().into(), Instant::now()) else {
                     // protocol broken! assume worse and close down engine
                     break
                 };
@@ -169,23 +178,25 @@ async fn ws_poll(
 
                 // We feed engine to update state 
                 // state being + socket connection + business logic 
-                let Ok(_) = e.handle_input(&p) else {
+                let Ok(_) = e.handle_input(&p, Instant::now()) else {
                     // protocol broken! assume worse and close down engine
                     break
                 };
 
                 match p {
                     Payload::Msg(Message::Text(v)) => {
-                        if let Ok(data) = parse(v) {
-                            // We pass reference back to JS... but what happens to ownership??
-                            // JS will see the real value assumedly ( the real value lives in JS!)
-                            // so normal js ref count on object
-                            // the handle stays Rust side ... and dies normally ( assumedly ... ) 
-                            let _ = callback.call1(&JsValue::NULL, &data);
-                        }
+                        // We pass reference back to JS... but what happens to ownership??
+                        // JS will see the real value assumedly ( the real value lives in JS!)
+                        // so normal js ref count on object
+                        // the handle stays Rust side ... and dies normally ( assumedly ... ) 
+                        info!("bar 1");
+                        let _ = callback.call1(&JsValue::NULL, &v);
+                        info!("bar 2");
                     }
                     Payload::Msg(Message::Binary(v)) => {
+                        info!("bar 3");
                         let _ = callback.call1(&JsValue::NULL,&v);
+                        info!("bar 4");
                     }
                     _ => {}
                 }

@@ -20,15 +20,14 @@ impl<T> Message<T> {
 
 pub trait RawPayload {
     type U;
-
     fn prefix(&self) -> u8;
     fn body(&self) -> Option<Self::U>;
     fn body_as_bytes(&self) -> Vec<u8>;
 }
 
 pub enum Payload<T> {
-    Open(OpenData),
-    Close(CloseData),
+    Open(SessionConfig),
+    Close(CloseReason),
     Ping,
     Pong,
     Msg(Message<T>),
@@ -36,13 +35,22 @@ pub enum Payload<T> {
     Noop
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct OpenData {
-    interval: time::Duration, timeout: time::Duration 
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct SessionConfig {
+    ping_interval: time::Duration,
+    ping_timeout: time::Duration,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct CloseData(CloseReason);
+#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Copy, Clone)]
+#[repr(u8)]
+pub enum CloseReason {
+    Unknown,
+    TransportTimeout,
+    TransportError,
+    ServerClose,
+    ClientClose,
+}
 
 // ===============================
 
@@ -110,119 +118,96 @@ impl <T> Payload<T> {
 }
 
 
-#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug)]
-#[repr(u8)]
-pub enum CloseReason {
-    Unknown,
-    TransportClose,
-    ServerClose,
-    ClientClose,
-}
-
 
 pub struct Engine<T> {
-    buffer: VecDeque<Payload<T>>
-}
-
-impl<T> Default for Engine<T> {
-    fn default() -> Self {
-        Self {
-            buffer:VecDeque::new()
-        }
-    }
+    buffer: VecDeque<Payload<T>>,
+    state: EngineState,
 }
 
 impl<T> Engine<T> {
-
+    pub fn new(now:Instant) -> Self {
+        Self {
+            buffer:VecDeque::new(),
+            state: EngineState::New(now),
+        }
+    }
 
     // We pass paylaod into engine 
     // to update state 
     // but engine doesn't own payload 
-    pub fn handle_input(&mut self, p:&Payload<T>) -> Result<(),Error>{
+    pub fn handle_input(&mut self, p:&Payload<T>, now:Instant) -> Result<(),Error>{
+        self.poll_next_state(now);
+        let n = match self.state {
+            EngineState::New(_) => {
+                match p {
+                    Payload::Open(config) => {
+                        EngineState::Opened(Heartbeat::new(now), *config)
+                    }
+                    Payload::Close(r) => EngineState::Closed(*r),
+                    _ => return Err(Error{})
+                }
+            }
+            EngineState::Opened(_,c) => {
+                match p {
+                    Payload::Open(_) => return Err(Error{}),
+                    Payload::Close(r) => EngineState::Closed(*r),
+                    Payload::Ping => {
+                        self.buffer.push_back(Payload::Pong);
+                        return Ok(())
+                    }
+                    _ => EngineState::Opened(Heartbeat::new(now), c)
+                }
+            },
+            EngineState::Closed(_) => return Err(Error{})
+        };
+        self.state = n;
         Ok(())
     }
 
-    pub fn poll(&mut self, now:Instant) -> Option<Payload<T>> {
-        None
+    pub fn poll_output(&mut self, now:Instant) -> Option<Payload<T>> {
+        self.poll_next_state(now);
+        self.buffer.pop_back()
+    }
+    
+    fn poll_next_state(&mut self, now:Instant) {
+        let Some(n) = self.next_deadline() else { return };
+        if now < n { return };
+        let new_state = match self.state {
+            EngineState::New(_) => EngineState::Closed(CloseReason::TransportTimeout),
+            EngineState::Opened(Heartbeat::Alive(i),c) => EngineState::Opened(Heartbeat::Unknown(i), c),
+            EngineState::Opened(Heartbeat::Unknown(_),_) => EngineState::Closed(CloseReason::TransportTimeout),
+            EngineState::Closed(_) => return 
+        };
+
+        self.state = new_state;
     }
 
-    pub fn next_timeout(&self) -> Option<Duration> {
-        None
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let d = match self.state { 
+            EngineState::New(s) => s + Duration::from_millis(5000),
+            EngineState::Opened(Heartbeat::Alive(i),c) => i + c.ping_interval,
+            EngineState::Opened(Heartbeat::Unknown(i),c) => i + c.ping_interval + c.ping_timeout,
+            EngineState::Closed(_) => return None
+        };
+        Some(d)
     }
-
-
 }
-
-/*
 
 #[derive(Clone, Copy)]
-pub enum EngineState {
-    New,
-    Opened(Heartbeat, Config),
-    Closed
+enum EngineState {
+    New(Instant),
+    Opened(Heartbeat, SessionConfig),
+    Closed(CloseReason)
 }
 
-#[derive(Clone, Copy)]
-pub struct Config {
-    ping_interval: time::Duration,
-    ping_timeout: time::Duration,
+#[derive(Copy, Clone, PartialEq)]
+pub enum Heartbeat {
+    Alive(Instant),
+    Unknown(Instant),
 }
 
-#[derive(Clone, Copy)]
-struct Heartbeat {}
-
-fn ClientEngine<U>(config:Config) -> Engine<U> {
-    let reducer = |e,s| {
-        return Ok(None)
-    };
-    return Engine::<U> {
-        buf: VecDeque::new(),
-        state: EngineState::New,
-        reducer
+impl Heartbeat {
+    fn new(now:Instant) -> Self {
+        Heartbeat::Alive(now)
     }
 }
-
-pub struct Engine<U> {
-    buf: VecDeque<Payload<U>>,
-    state: EngineState,
-    reducer: fn(Event, EngineState) -> Result<Option<EngineState>,Error>
-}
-
-impl <U> Engine<U> {
-    pub fn handle<'a,T,S>(&mut self, input:S) -> Result<Option<Payload<T>>,Error>
-        where 
-        T:ToOwned<Owned=U>, 
-        T:Into<&'a[u8]>, 
-        S:TryInto<Payload<T>>, 
-    {
-        todo!()
-        //let i = input.try_into().map_err(|_|Error {  })?;
-        //let e = match i {
-        //    PayloadType::Msg(b) => {
-        //        return Ok(Some(PayloadType::Msg(b)))
-        //    }
-        //    PayloadType::Open(d) =>  serde_json::from_slice(d.into()).map_err(|_|Error{})?,
-        //    _ => Event::Touch
-        //};
-        //let next = (self.reducer)(e, self.state)?;
-        //if let Some(n) = next {
-        //    self.state = n
-        //}
-        //Ok(None)
-    }
-
-    // Handle will sync return any data owning payloads 
-    // generally we will only store light payloads for dispatch
-    pub fn poll(&mut self, now:time::Instant) -> (Option<Payload<U>>, Option<time::Instant>) {
-        todo!()
-    }
-
-    pub fn is_closed(&self) -> bool {
-        match self.state {
-            EngineState::Closed => true,
-            _ => false
-        }
-    }
-}
-
-*/
