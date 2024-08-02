@@ -1,10 +1,18 @@
-use std::{collections::VecDeque, time::{self, Duration, Instant}};
+use std::{collections::VecDeque, ops::Add, time::{self, Duration, Instant}};
 use serde::{Serialize,Deserialize};
 use serde_repr::*;
 
-pub struct Error {}
+#[derive(thiserror::Error, Debug)]
+pub enum EngineError {
+    #[error("Bad Ingress Message")]
+    MessageDecodeError(#[source] serde_json::Error),
+
+    #[error("Unknown Error")]
+    Unknown
+}
 
 // ===============================
+#[derive(Debug)]
 pub enum Message<T>{
     Text(T),
     Binary(T)
@@ -25,8 +33,9 @@ pub trait RawPayload {
     fn body_as_bytes(&self) -> Vec<u8>;
 }
 
+#[derive(Debug)]
 pub enum Payload<T> {
-    Open(SessionConfig),
+    Open(OpenMessage),
     Close(CloseReason),
     Ping,
     Pong,
@@ -35,11 +44,25 @@ pub enum Payload<T> {
     Noop
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct OpenMessage {
+    ping_interval: u64,
+    ping_timeout: u64
+}
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct SessionConfig {
     ping_interval: time::Duration,
     ping_timeout: time::Duration,
+}
+
+impl From<OpenMessage> for SessionConfig {
+    fn from(value: OpenMessage) -> Self {
+        Self {
+            ping_timeout: Duration::from_millis(value.ping_timeout),
+            ping_interval: Duration::from_millis(value.ping_interval)
+        }
+    }
 }
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Copy, Clone)]
@@ -51,7 +74,7 @@ pub enum CloseReason {
     ServerClose,
     ClientClose,
 }
-
+//0{"ping_interval":15000, "ping_timeout":15000}
 // ===============================
 
 impl <T> From<Message<T>> for Payload<T> {
@@ -59,27 +82,27 @@ impl <T> From<Message<T>> for Payload<T> {
         Payload::Msg(value)
     }
 }
-pub fn decode<U>(data:impl RawPayload<U = U>) -> Result<Payload<U>,Error>{
+pub fn decode<U>(data:impl RawPayload<U = U>) -> Result<Payload<U>,EngineError>{
         match data.prefix() {
             b'0' => {
                 let v = data.body_as_bytes();
-                let e = serde_json::from_slice(v.as_slice()).map_err(|_|Error{})?;
+                let e = serde_json::from_slice(v.as_slice()).map_err(EngineError::MessageDecodeError)?;
                 Ok(Payload::Open(e))
             },
             b'1' => {
                 let v = data.body_as_bytes();
-                let e = serde_json::from_slice(v.as_slice()).map_err(|_|Error{})?;
+                let e = serde_json::from_slice(v.as_slice()).map_err(EngineError::MessageDecodeError)?;
                 Ok(Payload::Close(e))
             },
             b'2' => Ok(Payload::Ping),
             b'3' => Ok(Payload::Pong),
             b'4' => {
-                let body = data.body().ok_or(Error {})?;
+                let body = data.body().ok_or(EngineError::Unknown)?;
                 Ok(Payload::Msg(Message::Text(body)))
             },
             b'5' => Ok(Payload::Upgrade),
             b'6' => Ok(Payload::Noop),
-            _ => Err(Error {})
+            _ => Err(EngineError::Unknown)
         }
 }
 
@@ -119,13 +142,14 @@ impl <T> Payload<T> {
 
 
 
-pub struct Engine<T> {
-    buffer: VecDeque<Payload<T>>,
-    state: EngineState,
+#[derive(Debug)]
+pub struct Engine<D,T> {
+    buffer: VecDeque<Payload<D>>,
+    state: EngineState<T>,
 }
 
-impl<T> Engine<T> {
-    pub fn new(now:Instant) -> Self {
+impl<D,T> Engine<D,T> where T:PartialOrd+PartialEq+Add<Duration,Output = T>+Copy+Clone{
+    pub fn new(now:T) -> Self {
         Self {
             buffer:VecDeque::new(),
             state: EngineState::New(now),
@@ -135,21 +159,21 @@ impl<T> Engine<T> {
     // We pass paylaod into engine 
     // to update state 
     // but engine doesn't own payload 
-    pub fn handle_input(&mut self, p:&Payload<T>, now:Instant) -> Result<(),Error>{
+    pub fn handle_input(&mut self, p:&Payload<D>, now:T) -> Result<(),EngineError>{
         self.poll_next_state(now);
         let n = match self.state {
             EngineState::New(_) => {
                 match p {
                     Payload::Open(config) => {
-                        EngineState::Opened(Heartbeat::new(now), *config)
+                        EngineState::Opened(Heartbeat::new(now), (*config).into())
                     }
                     Payload::Close(r) => EngineState::Closed(*r),
-                    _ => return Err(Error{})
+                    _ => return Err(EngineError::Unknown)
                 }
             }
             EngineState::Opened(_,c) => {
                 match p {
-                    Payload::Open(_) => return Err(Error{}),
+                    Payload::Open(_) => return Err(EngineError::Unknown),
                     Payload::Close(r) => EngineState::Closed(*r),
                     Payload::Ping => {
                         self.buffer.push_back(Payload::Pong);
@@ -158,18 +182,18 @@ impl<T> Engine<T> {
                     _ => EngineState::Opened(Heartbeat::new(now), c)
                 }
             },
-            EngineState::Closed(_) => return Err(Error{})
+            EngineState::Closed(_) => return Err(EngineError::Unknown)
         };
         self.state = n;
         Ok(())
     }
 
-    pub fn poll_output(&mut self, now:Instant) -> Option<Payload<T>> {
+    pub fn poll_output(&mut self, now:T) -> Option<Payload<D>> {
         self.poll_next_state(now);
         self.buffer.pop_back()
     }
     
-    fn poll_next_state(&mut self, now:Instant) {
+    fn poll_next_state(&mut self, now:T) {
         let Some(n) = self.next_deadline() else { return };
         if now < n { return };
         let new_state = match self.state {
@@ -182,7 +206,7 @@ impl<T> Engine<T> {
         self.state = new_state;
     }
 
-    pub fn next_deadline(&self) -> Option<Instant> {
+    pub fn next_deadline(&self) -> Option<T> {
         let d = match self.state { 
             EngineState::New(s) => s + Duration::from_millis(5000),
             EngineState::Opened(Heartbeat::Alive(i),c) => i + c.ping_interval,
@@ -193,21 +217,21 @@ impl<T> Engine<T> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum EngineState {
-    New(Instant),
-    Opened(Heartbeat, SessionConfig),
+#[derive(Clone, Copy, Debug)]
+enum EngineState<TIME> {
+    New(TIME),
+    Opened(Heartbeat<TIME>, SessionConfig),
     Closed(CloseReason)
 }
 
-#[derive(Copy, Clone, PartialEq)]
-pub enum Heartbeat {
-    Alive(Instant),
-    Unknown(Instant),
+#[derive(Copy, Clone, PartialEq,Debug)]
+pub enum Heartbeat<TIME> {
+    Alive(TIME),
+    Unknown(TIME),
 }
 
-impl Heartbeat {
-    fn new(now:Instant) -> Self {
+impl<T> Heartbeat<T> {
+    fn new(now:T) -> Self {
         Heartbeat::Alive(now)
     }
 }

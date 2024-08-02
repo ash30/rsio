@@ -1,4 +1,6 @@
-use web_time::Instant;
+use std::ops::Add;
+
+use web_time::{Instant, Duration};
 use log::{Level, info};
 
 use engineio3::RawPayload;
@@ -11,6 +13,24 @@ use engineio3::{Payload, Message};
 
 #[wasm_bindgen]
 extern "C" {
+}
+
+#[derive(Clone, Copy, PartialEq, PartialOrd,Debug)]
+struct JsTime(Instant);
+
+impl Add<std::time::Duration> for JsTime {
+    type Output = Self;
+    fn add(self, rhs: std::time::Duration) -> Self::Output {
+        let d = Duration::from_millis(rhs.as_millis().try_into().unwrap());
+        JsTime(self.0 + d)
+        
+    }
+}
+
+impl JsTime {
+    fn now() -> Self {
+        JsTime(Instant::now())
+    }
 }
 
 // ==========================
@@ -34,10 +54,10 @@ impl RawPayload for WSTextMessage {
         }
     }
     fn body_as_bytes(&self) -> Vec<u8> {
-        self.0.iter().flat_map(|a|a.to_be_bytes()).collect()
+        self.0.iter().skip(1).map(|a|a.to_be_bytes()[1]).collect()
     }
     fn prefix(&self) -> u8 {
-        self.0.iter().next().map(|a|a.to_be_bytes()[0]).unwrap_or(99)
+        self.0.iter().next().map(|a|a.to_be_bytes()[1]).unwrap_or(99)
     }
 }
 
@@ -74,28 +94,19 @@ impl Engine {
 pub async fn create_ws_engine(url:&str, on_msg:js_sys::Function) -> Result<Engine, JsValue> {
     console_log::init_with_level(Level::Debug);
 
-    info!("foo 1");
     let (mut ingress_tx, ingress_rx) = mpsc::channel(64);
     let (egress_tx, egress_rx) = mpsc::channel(64);
 
     let ws = WebSocket::new(url)?;
     ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
     let e = Engine { tx: egress_tx };
-    info!("foo 2");
     wasm_bindgen_futures::spawn_local(async move {
         let f = Closure::wrap(Box::new(move |v:MessageEvent| {
             let _ = ingress_tx.try_send(v);
         }) as Box<dyn FnMut(MessageEvent)>);
-        info!("foo 3");
         ws.set_onmessage(Some(f.as_ref().unchecked_ref()));
-
-        info!("foo 4a");
-        let t = Instant::now();
-        info!("foo 4b");
-        let state = engineio3::Engine::<JsValue>::new(Instant::now());
-        info!("foo 5a");
+        let state = engineio3::Engine::<JsValue,JsTime>::new(JsTime::now());
         ws_poll(state, ingress_rx, egress_rx, &ws, on_msg).await;
-        info!("foo 5b");
         // close ws so callback is not called again
         let _ = ws.close();
     });
@@ -104,7 +115,7 @@ pub async fn create_ws_engine(url:&str, on_msg:js_sys::Function) -> Result<Engin
 
 // MAIN Event Loop
 async fn ws_poll(
-    mut e:engineio3::Engine<JsValue>,
+    mut e:engineio3::Engine<JsValue,JsTime>,
     mut ingress_rx:mpsc::Receiver<MessageEvent>, 
     mut egress_rx:mpsc::Receiver<Message<JsValue>>, 
     ws: &WebSocket,
@@ -117,7 +128,7 @@ async fn ws_poll(
 
         // Send out any pending payloads 
         // either messages or protocol specifics
-        while let Some(p) = e.poll_output(now) {
+        while let Some(p) = e.poll_output(JsTime::now()) {
             info!("out 1");
 
             if ws.ready_state() != web_sys::WebSocket::OPEN {
@@ -152,7 +163,7 @@ async fn ws_poll(
             break
         };
 
-        let d = t - Instant::now();
+        let d = t.0 - Instant::now();
         let mut timeout = TimeoutFuture::new(d.as_millis() as u32).fuse();
         let mut next_in = ingress_rx.next().fuse();
         let mut next_out = egress_rx.next().fuse();
@@ -163,7 +174,7 @@ async fn ws_poll(
                 // JS side has dropped sender... lets drop ? 
                 if m.is_none() { break } 
                 // Error if engine is closed etc
-                let Ok(_) = e.handle_input(&m.unwrap().into(), Instant::now()) else {
+                let Ok(_) = e.handle_input(&m.unwrap().into(), JsTime::now()) else {
                     // protocol broken! assume worse and close down engine
                     break
                 };
@@ -174,14 +185,18 @@ async fn ws_poll(
                 // TODO: what about binary
                 let Ok(txt) = v.unwrap().data().dyn_into::<js_sys::JsString>() else { continue };
                 //let Ok(p) = Payload::from_iter16(&mut txt.iter()) else { continue };
-                let Ok(p) = engineio3::decode(WSTextMessage(txt)) else { continue } ;
+                info!("INPUT {:?}", txt);
+                let r = engineio3::decode(WSTextMessage(txt.trim()));
+                let Ok(p) = r else { info!("decode error {:?}",r); continue } ;
 
                 // We feed engine to update state 
                 // state being + socket connection + business logic 
-                let Ok(_) = e.handle_input(&p, Instant::now()) else {
+                let Ok(_) = e.handle_input(&p, JsTime::now()) else {
                     // protocol broken! assume worse and close down engine
+                    info!("ERROR");
                     break
                 };
+                info!("engine state{:?}", e);
 
                 match p {
                     Payload::Msg(Message::Text(v)) => {
