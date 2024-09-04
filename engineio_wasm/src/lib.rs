@@ -3,8 +3,8 @@ use std::ops::Add;
 use log::{info, Level};
 use web_time::{Duration, Instant};
 
-use engineio3::RawPayload;
-use engineio3::{Message, Payload};
+use engineio::RawPayload;
+use engineio::{Message, Payload};
 use futures::{channel::mpsc, select, FutureExt, StreamExt};
 use gloo_timers::future::TimeoutFuture;
 use wasm_bindgen::prelude::*;
@@ -69,7 +69,7 @@ pub enum JSError {
 #[wasm_bindgen]
 pub struct Engine {
     // TODO: should we support full times of WS?
-    tx: mpsc::Sender<engineio3::Message<JsValue>>,
+    tx: mpsc::Sender<engineio::Message<JsValue>>,
 }
 
 #[wasm_bindgen]
@@ -103,7 +103,7 @@ pub async fn create_ws_engine(url: &str, on_msg: js_sys::Function) -> Result<Eng
             let _ = ingress_tx.try_send(v);
         }) as Box<dyn FnMut(MessageEvent)>);
         ws.set_onmessage(Some(f.as_ref().unchecked_ref()));
-        let state = engineio3::Engine::<JsValue, JsTime>::new(JsTime::now());
+        let state = engineio::Engine::<JsValue, JsTime>::new(JsTime::now());
         ws_poll(state, ingress_rx, egress_rx, &ws, on_msg).await;
         // close ws so callback is not called again
         let _ = ws.close();
@@ -113,7 +113,7 @@ pub async fn create_ws_engine(url: &str, on_msg: js_sys::Function) -> Result<Eng
 
 // MAIN Event Loop
 async fn ws_poll(
-    mut e: engineio3::Engine<JsValue, JsTime>,
+    mut e: engineio::Engine<JsValue, JsTime>,
     mut ingress_rx: mpsc::Receiver<MessageEvent>,
     mut egress_rx: mpsc::Receiver<Message<JsValue>>,
     ws: &WebSocket,
@@ -175,7 +175,7 @@ async fn ws_poll(
                 // TODO: what about binary
                 let Ok(txt) = v.unwrap().data().dyn_into::<js_sys::JsString>() else { continue };
                 //let Ok(p) = Payload::from_iter16(&mut txt.iter()) else { continue };
-                let r = engineio3::decode(WSTextMessage(txt.trim()));
+                let r = engineio::decode(WSTextMessage(txt.trim()));
                 let Ok(p) = r else { info!("decode error {:?}",r); continue } ;
 
                 // We feed engine to update state
