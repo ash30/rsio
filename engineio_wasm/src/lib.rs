@@ -11,9 +11,6 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use web_sys::{MessageEvent, WebSocket};
 
-#[wasm_bindgen]
-extern "C" {}
-
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
 struct JsTime(Instant);
 
@@ -122,23 +119,17 @@ async fn ws_poll(
     ws: &WebSocket,
     callback: js_sys::Function,
 ) {
-    info!("loop start");
     loop {
-        let now = Instant::now();
-
         // Send out any pending payloads
         // either messages or protocol specifics
         while let Some(p) = e.poll_output(JsTime::now()) {
-            info!("out 1");
-
             if ws.ready_state() != web_sys::WebSocket::OPEN {
                 break;
             }
             let err = match p {
                 Payload::Msg(Message::Text(m)) => {
-                    // TODO: HACK! yolo
+                    // TODO: HACK! yolo + add prefix
                     let o: js_sys::Object = m.unchecked_into();
-                    // TODO:Hpw to prefix...
                     ws.send_with_array_buffer_view(&o)
                         .map_err(|_| JSError::TransportError)
                 }
@@ -168,7 +159,6 @@ async fn ws_poll(
         let mut next_in = ingress_rx.next().fuse();
         let mut next_out = egress_rx.next().fuse();
 
-        info!("in 1");
         select! {
             m = next_out => {
                 // JS side has dropped sender... lets drop ?
@@ -185,7 +175,6 @@ async fn ws_poll(
                 // TODO: what about binary
                 let Ok(txt) = v.unwrap().data().dyn_into::<js_sys::JsString>() else { continue };
                 //let Ok(p) = Payload::from_iter16(&mut txt.iter()) else { continue };
-                info!("INPUT {:?}", txt);
                 let r = engineio3::decode(WSTextMessage(txt.trim()));
                 let Ok(p) = r else { info!("decode error {:?}",r); continue } ;
 
@@ -193,10 +182,8 @@ async fn ws_poll(
                 // state being + socket connection + business logic
                 let Ok(_) = e.handle_input(&p, JsTime::now()) else {
                     // protocol broken! assume worse and close down engine
-                    info!("ERROR");
                     break
                 };
-                info!("engine state{:?}", e);
 
                 match p {
                     Payload::Msg(Message::Text(v)) => {
@@ -204,14 +191,10 @@ async fn ws_poll(
                         // JS will see the real value assumedly ( the real value lives in JS!)
                         // so normal js ref count on object
                         // the handle stays Rust side ... and dies normally ( assumedly ... )
-                        info!("bar 1");
                         let _ = callback.call1(&JsValue::NULL, &v);
-                        info!("bar 2");
                     }
                     Payload::Msg(Message::Binary(v)) => {
-                        info!("bar 3");
                         let _ = callback.call1(&JsValue::NULL,&v);
-                        info!("bar 4");
                     }
                     _ => {}
                 }

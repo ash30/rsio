@@ -148,6 +148,7 @@ pub struct Engine<D,T> {
     state: EngineState<T>,
 }
 
+
 impl<D,T> Engine<D,T> where T:PartialOrd+PartialEq+Add<Duration,Output = T>+Copy+Clone{
     pub fn new(now:T) -> Self {
         Self {
